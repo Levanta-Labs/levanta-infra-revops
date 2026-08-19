@@ -9,6 +9,8 @@ import {
 const CURSOR_TABLE = "Attio_Integrations_Touchpoint_Cursors";
 const DEFAULT_LOOKBACK_MS = 10 * 60 * 1_000;
 
+//Interface=====================================================================================================
+
 export interface SyncCursor {
   readonly syncKey: string;
   readonly timestampMs: number;
@@ -25,6 +27,8 @@ interface CursorRow {
   readonly cursorValue: string | null;
   readonly cursorTimestamp: string;
 }
+
+//============================================================================================================
 
 function supabaseHeaders(): HeadersInit {
   const key = optionalEnv("SUPABASE_SECRET_KEY") ?? requiredEnv("SUPABASE_SERVICE_ROLE_KEY");

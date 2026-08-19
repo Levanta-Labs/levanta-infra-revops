@@ -11,6 +11,8 @@ const INSTANTLY_BASE = "https://api.instantly.ai/api/v2";
 
 export type InstantlyEmailType = "received" | "sent" | "scheduled" | "unknown";
 
+//Interfaces=======================================================================================
+
 export interface InstantlyEmail {
   readonly id: string;
   readonly timestampCreated: string;
@@ -22,6 +24,8 @@ export interface InstantlyEmail {
   readonly bodyText: string | null;
   readonly threadId: string | null;
 }
+
+//=================================================================================================
 
 function parseEmailType(value: unknown): InstantlyEmailType {
   if (value === 1 || value === 3) return "sent";

@@ -10,6 +10,8 @@ import {
 
 const HEYREACH_BASE = "https://api.heyreach.io/api/public";
 
+//Interface==================================================================
+
 export interface HeyReachMessage {
   readonly createdAt: string;
   readonly body: string;
@@ -38,6 +40,8 @@ export interface HeyReachConversationQuery {
   readonly toMs?: number;
   readonly profileUrl?: string;
 }
+
+//===========================================================================
 
 function headers(): HeadersInit {
   return {

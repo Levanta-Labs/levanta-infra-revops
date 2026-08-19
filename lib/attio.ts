@@ -31,6 +31,8 @@ export const LEAD_SOURCE_LABELS = {
 export type Provider = keyof typeof PERSON_COUNTER_SLUGS;
 export type AttioObject = "people" | "companies" | "deals";
 
+//Interfaces==============================================================================================
+
 export interface AttioRecordReference {
   readonly target_object?: string;
   readonly target_record_id: string;
@@ -63,6 +65,8 @@ export interface CreatePersonValues {
 export interface PatchPersonValues {
   readonly lead_source: string;
 }
+
+//============================================================================================================
 
 export class AttioApiError extends Error {
   constructor(
@@ -305,4 +309,5 @@ export function personCompanyId(person: AttioPerson): string | null {
 
 export function companyCounterSlug(provider: Provider): string {
   return requiredEnv(`ATTIO_COMPANY_${provider.toUpperCase()}_COUNTER_SLUG`);
+
 }

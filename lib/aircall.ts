@@ -10,6 +10,7 @@ import {
 
 const AIRCALL_BASE = "https://api.aircall.io/v1";
 
+//Interfaces===========================================================================================
 export interface AircallTag {
   readonly name: string;
 }
@@ -39,6 +40,7 @@ export interface AircallWebhook {
   readonly token: string;
   readonly call: AircallCall;
 }
+//====================================================================================================
 
 function parseTag(value: unknown): AircallTag | null {
   if (!isJsonObject(value)) return null;
