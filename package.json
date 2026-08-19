@@ -1,0 +1,18 @@
+{
+  "name": "levanta-crm-overhaul",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.13",
+  "scripts": {
+    "check": "bun run typecheck && bun run test:unit",
+    "test": "bun test",
+    "test:unit": "bun test tests/unit",
+    "test:live": "RUN_LIVE_TESTS=1 bun test tests/live",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.13",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "bunVersion": "1.x",
+  "crons": [
+    {
+      "path": "/api/cron/aircall-touchpoint-sync",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/instantly-touchpoint-sync",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/heyreach-touchpoint-sync",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
