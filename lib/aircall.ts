@@ -10,7 +10,10 @@ import {
 
 const AIRCALL_BASE = "https://api.aircall.io/v1";
 
-//Interfaces===========================================================================================
+//=====================================================================================================
+//Interfaces
+//=====================================================================================================
+
 export interface AircallTag {
   readonly name: string;
 }
@@ -40,7 +43,8 @@ export interface AircallWebhook {
   readonly token: string;
   readonly call: AircallCall;
 }
-//====================================================================================================
+
+
 
 function parseTag(value: unknown): AircallTag | null {
   if (!isJsonObject(value)) return null;
@@ -60,6 +64,10 @@ function contactEmail(contact: Record<string, unknown>): string | null {
   }
   return null;
 }
+
+//====================================================================================================
+//parce functions, turn aircall raw api pull into usable data
+//====================================================================================================
 
 function parseContact(value: unknown): AircallContact | null {
   if (!isJsonObject(value)) return null;
@@ -104,10 +112,18 @@ export function parseAircallWebhook(value: unknown): AircallWebhook {
   return { event, timestamp, token, call: parseAircallCall(value.data) };
 }
 
+//===============================================================================================================
+//Header
+//===============================================================================================================
+
 function authHeader(): string {
   const credentials = `${requiredEnv("AIRCALL_API_ID")}:${requiredEnv("AIRCALL_API_TOKEN")}`;
   return `Basic ${Buffer.from(credentials).toString("base64")}`;
 }
+
+//===============================================================================================================
+//
+//===============================================================================================================
 
 export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
   const calls: AircallCall[] = [];

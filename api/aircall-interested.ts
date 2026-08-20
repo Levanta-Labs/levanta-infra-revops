@@ -53,12 +53,14 @@ export function buildCallHistorySummary(fields: AircallInterestedFields): string
     .join("\n");
 }
 
-function personValues(fields: AircallInterestedFields): CreatePersonValues {
+function personValues(fields: AircallInterestedFields): CreatePersonValues { //takes in json from aircall webhook and creates CreatePersonValue object and return it
+  //declaring CreatePersonValues values
   const values: {
     email_addresses?: readonly string[];
     phone_numbers?: readonly string[];
     name?: readonly PersonNameInput[];
   } = {};
+  //initializing variables for CreatePersonValues values
   if (fields.email) values.email_addresses = [fields.email];
   if (fields.phone) values.phone_numbers = [fields.phone];
   if (fields.firstName || fields.lastName) {
@@ -66,10 +68,11 @@ function personValues(fields: AircallInterestedFields): CreatePersonValues {
     const lastName = fields.lastName ?? "";
     values.name = [{ first_name: firstName, last_name: lastName, full_name: `${firstName} ${lastName}`.trim() }];
   }
-  return values;
+  //-------------------
+  return values; //return values to be added to person record in attio
 }
 
-function dealName(fields: AircallInterestedFields): string {
+function dealName(fields: AircallInterestedFields): string { //creates title for attio deal card
   if (fields.companyName) return `${fields.companyName} - Interested`;
   return `${fields.firstName ?? ""} ${fields.lastName ?? ""}`.trim() || "New Interested Deal";
 }

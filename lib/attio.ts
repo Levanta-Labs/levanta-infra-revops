@@ -9,7 +9,7 @@ import {
   type JsonObject,
 } from "./json.ts";
 
-const ATTIO_BASE = "https://api.attio.com/v2";
+const ATTIO_BASE = "https://api.attio.com/v2"; //endpoint url base
 
 export const LISTS = {
   MASTER_TAM: "master_tam_list",
@@ -79,12 +79,16 @@ export class AttioApiError extends Error {
   }
 }
 
-function attioHeaders(): HeadersInit {
+//Headers for api auth ======================================================================================
+
+function attioHeaders(): HeadersInit { 
   return {
     Authorization: `Bearer ${requiredEnv("ATTIO_API_KEY")}`,
     "Content-Type": "application/json",
   };
 }
+
+//==========================================================================================================
 
 export async function attioFetch(path: string, options: RequestInit = {}): Promise<unknown> {
   const response = await fetch(`${ATTIO_BASE}${path}`, {
@@ -102,7 +106,12 @@ export async function attioFetch(path: string, options: RequestInit = {}): Promi
   return body;
 }
 
-function parseRecordReference(value: unknown): AttioRecordReference | null {
+//=============================================================================================================
+//parce functions, turns raw pull from attio (json) into usable data 
+//=============================================================================================================
+
+//#region helper functions
+function parseRecordReference(value: unknown): AttioRecordReference | null { 
   if (!isJsonObject(value)) return null;
   const recordId = stringValue(value.target_record_id);
   if (!recordId) return null;
@@ -118,6 +127,9 @@ function parseReferences(values: JsonObject, key: string): readonly AttioRecordR
     .filter((value): value is AttioRecordReference => value !== null);
 }
 
+//#endregion
+
+//#region master methode
 export function parseAttioPerson(value: unknown): AttioPerson {
   if (!isJsonObject(value)) throw new Error("Attio returned an invalid person record");
   const id = objectValue(value, "id");
@@ -141,6 +153,9 @@ export function parseAttioPerson(value: unknown): AttioPerson {
     },
   };
 }
+//#endregion
+
+//============================================================================================================
 
 function responseData(value: unknown): unknown {
   if (!isJsonObject(value) || !("data" in value)) {
@@ -148,6 +163,10 @@ function responseData(value: unknown): unknown {
   }
   return value.data;
 }
+
+//=============================================================================================================
+//          Match Data From Thrid Party Records To Record ID In Attio
+//=============================================================================================================
 
 async function findPerson(attribute: string, value: string | null): Promise<AttioPerson | null> {
   if (!value) return null;
@@ -172,9 +191,15 @@ export function findPersonByLinkedIn(profileUrl: string | null): Promise<AttioPe
   return findPerson("linkedin", profileUrl);
 }
 
+//=============================================================================================================
+
 export async function getPerson(personId: string): Promise<AttioPerson> {
   return parseAttioPerson(responseData(await attioFetch(`/objects/people/records/${personId}`)));
 }
+
+//============================================================================================================
+//push to attio
+//============================================================================================================
 
 export async function createPerson(values: CreatePersonValues): Promise<AttioPerson> {
   const response = await attioFetch("/objects/people/records", {
