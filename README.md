@@ -1,42 +1,47 @@
+<br />
+<p align="center">
+  <img src="assets/logo.svg" alt="Levanta Labs logo">
+</p>
+<br />
+
 # Levanta CRM Overhaul
 
-Typed Vercel functions that synchronize Aircall, Instantly, and HeyReach activity into Attio. Bun is used for dependency management, local scripts, tests, and the Vercel runtime.
+Levanta CRM Overhaul keeps Attio aligned with interested-lead and sales-touchpoint activity from Aircall, Instantly, and HeyReach.
 
-## Project layout
+## Quickstart
 
-```text
-api/
-  aircall-interested.ts
-  instantly-interested.ts
-  heyreach-interested.ts
-  cron/
-    aircall-touchpoint-sync.ts
-    instantly-touchpoint-sync.ts
-    heyreach-touchpoint-sync.ts
-lib/
-  attio.ts
-  aircall.ts
-  instantly.ts
-  heyreach.ts
-  cursors.ts
-tests/
-  unit/
-  live/
-```
-
-Each interested webhook creates or finds an Attio Person, ensures an Interested Deal exists, writes source history notes, sets Lead Source, and upserts the Person into the DNC list. Each cron sync only logs touchpoints for People on the Master TAM list, mirrors the note to the associated Company, and increments the configured counters.
-
-## Setup
-
-Install dependencies with Bun only:
+Install the Bun dependencies and run the strict compiler plus unit suite:
 
 ```sh
 bun install
+bun run check
 ```
 
-Copy `.env.example` to `.env.local` for local development. Configure the same values in Vercel for deployment.
+The project requires Bun `1.3.13`. Configure local integrations by copying `.env.example` to `.env.local` and supplying the required credentials before invoking a webhook or cron route.
 
-### Required environment variables
+## How CRM activity is synchronized
+
+The Vercel functions handle two workflows:
+
+1. Interested webhooks find or create an Attio Person, ensure an Interested Deal exists, write source-history notes, set Lead Source, and add the Person to the DNC list.
+2. Five-minute cron jobs poll each provider for new touchpoints. They process only People on the Master TAM list, mirror notes to associated Companies, increment the configured counters, and persist cursor progress in Supabase.
+
+## Webhook and cron routes
+
+| Route | Source | Expected request |
+| --- | --- | --- |
+| `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
+| `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
+| `/api/heyreach-interested` | Zapier relay | A lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
+| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+| `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+| `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+
+The HeyReach integration uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints. Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
+
+## Configuration
+
+Keep credentials in `.env.local` for local development and configure the same values in Vercel for deployment.
 
 | Variable | Purpose |
 | --- | --- |
@@ -58,34 +63,21 @@ Copy `.env.example` to `.env.local` for local development. Configure the same va
 
 Legacy Supabase JWT projects may use `SUPABASE_SERVICE_ROLE_KEY` instead of `SUPABASE_SECRET_KEY`.
 
-## Supabase cursors
+## Cursor persistence
 
-All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted by these stable keys:
+All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted with these stable keys:
 
 - `aircall-touchpoints`
 - `instantly-touchpoints`
 - `heyreach-touchpoints`
 
-`cursor_timestamp` is the completed high-water mark. `cursor_value` contains a JSON array of event IDs at that exact timestamp, preventing events with identical timestamps from being lost or replayed. A missing row starts with a ten-minute lookback and is created automatically. `last_updated_at` is explicitly refreshed on every upsert.
+`cursor_timestamp` is the completed high-water mark. `cursor_value` contains a JSON array of event IDs at that exact timestamp, preventing events with identical timestamps from being lost or replayed. A missing row starts with a ten-minute lookback and is created automatically. `last_updated_at` is refreshed on every upsert.
 
 The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the table. Keep it in Vercel server-side environment variables only.
 
-## Webhooks and cron routes
+## Verification
 
-| Route | Source | Expected request |
-| --- | --- | --- |
-| `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
-| `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
-| `/api/heyreach-interested` | Zapier relay | A lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
-| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
-| `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
-| `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
-
-The HeyReach implementation uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints. Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
-
-## Tests
-
-Run the strict compiler and unit suite:
+Run the compiler and isolated unit suite:
 
 ```sh
 bun run check
@@ -93,13 +85,13 @@ bun run check
 
 The unit suite mocks every external write and covers provider response validation, pagination, handlers, touchpoint event identity, Attio helpers, and Supabase cursor persistence.
 
-Run opt-in read-only smoke tests against configured live accounts:
+Run opt-in, read-only smoke tests against configured live accounts:
 
 ```sh
 bun run test:live
 ```
 
-Live tests only identify/read one small page from Supabase, Attio, Aircall, Instantly, and HeyReach. They do not create, update, stop, or delete anything, and they do not print returned account data.
+Live tests identify and read one small page from Supabase, Attio, Aircall, Instantly, and HeyReach. They do not create, update, stop, or delete anything, and they do not print returned account data.
 
 ## Deployment
 
