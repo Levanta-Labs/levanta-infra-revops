@@ -1,4 +1,4 @@
-import { requiredEnv } from "./env.ts";
+import { HEYREACH_BASE, heyreachHeaders } from "./endpoints.ts";
 import {
   arrayValue,
   booleanValue,
@@ -7,8 +7,6 @@ import {
   responseJson,
   stringValue,
 } from "./json.ts";
-
-const HEYREACH_BASE = "https://api.heyreach.io/api/public";
 
 //Interface==================================================================
 
@@ -42,14 +40,6 @@ export interface HeyReachConversationQuery {
 }
 
 //===========================================================================
-
-function headers(): HeadersInit {
-  return {
-    "X-API-KEY": requiredEnv("HEYREACH_API_KEY"),
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  };
-}
 
 function parseMessage(value: unknown): HeyReachMessage {
   if (!isJsonObject(value)) throw new Error("HeyReach returned an invalid message");
@@ -104,7 +94,7 @@ export async function fetchHeyReachConversations(
   do {
     const response = await fetch(`${HEYREACH_BASE}/inbox/GetConversationsV3`, {
       method: "POST",
-      headers: headers(),
+      headers: heyreachHeaders(),
       body: JSON.stringify({
         limit: 100,
         cursor,
@@ -175,7 +165,7 @@ export async function stopLeadInActiveCampaigns(
   if (!profileUrl) return 0;
   const response = await fetch(`${HEYREACH_BASE}/campaign/GetCampaignsForLead`, {
     method: "POST",
-    headers: headers(),
+    headers: heyreachHeaders(),
     body: JSON.stringify({ email, linkedinId: null, profileUrl, offset: 0, limit: 100 }),
   });
   const body = await responseJson(response);
@@ -196,7 +186,7 @@ export async function stopLeadInActiveCampaigns(
   for (const campaign of campaigns) {
     const stopResponse = await fetch(`${HEYREACH_BASE}/campaign/StopLeadInCampaign`, {
       method: "POST",
-      headers: headers(),
+      headers: heyreachHeaders(),
       body: JSON.stringify({ campaignId: campaign.campaignId, leadMemberId: null, leadUrl: profileUrl }),
     });
     if (!stopResponse.ok) {

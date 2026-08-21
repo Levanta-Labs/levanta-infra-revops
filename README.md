@@ -6,10 +6,10 @@ Typed Vercel functions that synchronize Aircall, Instantly, and HeyReach activit
 
 ```text
 api/
-  aircall-interested.ts
   instantly-interested.ts
   heyreach-interested.ts
   cron/
+    aircall-interested-sync.ts
     aircall-touchpoint-sync.ts
     instantly-touchpoint-sync.ts
     heyreach-touchpoint-sync.ts
@@ -24,7 +24,7 @@ tests/
   live/
 ```
 
-Each interested webhook creates or finds an Attio Person, ensures an Interested Deal exists, writes source history notes, sets Lead Source, and upserts the Person into the DNC list. Each cron sync only logs touchpoints for People on the Master TAM list, mirrors the note to the associated Company, and increments the configured counters.
+Each interested webhook (Instantly, HeyReach) creates or finds an Attio Person, ensures an Interested Deal exists, writes source history notes, sets Lead Source, and upserts the Person into the DNC list. Aircall's "interested" detection is a polling cron instead of a webhook — see below. Each touchpoint cron sync only logs touchpoints for People on the Master TAM list, mirrors the note to the associated Company, and increments the configured counters.
 
 ## Setup
 
@@ -46,8 +46,8 @@ Copy `.env.example` to `.env.local` for local development. Configure the same va
 | `ATTIO_COMPANY_INSTANTLY_COUNTER_SLUG` | Confirmed Company counter slug for Instantly emails |
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Confirmed Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
-| `AIRCALL_WEBHOOK_TOKEN` | Token Aircall includes in the webhook JSON payload |
-| `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
+| `AIRCALL_DIALER_USER_ID` | Aircall user ID whose Dialer Campaign is polled for outcomes |
+| `AIRCALL_INTERESTED_OUTCOMES` | Comma-separated Dialer Campaign outcome values that mean interested |
 | `INSTANTLY_API_KEY` | Instantly v2 API key with `emails:read` or broader scope |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key |
@@ -60,9 +60,10 @@ Legacy Supabase JWT projects may use `SUPABASE_SERVICE_ROLE_KEY` instead of `SUP
 
 ## Supabase cursors
 
-All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted by these stable keys:
+All syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted by these stable keys:
 
 - `aircall-touchpoints`
+- `aircall-interested`
 - `instantly-touchpoints`
 - `heyreach-touchpoints`
 
@@ -74,12 +75,14 @@ The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the
 
 | Route | Source | Expected request |
 | --- | --- | --- |
-| `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
 | `/api/heyreach-interested` | Zapier relay | A lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
+| `/api/cron/aircall-interested-sync` | Vercel Cron | Authorized GET every five minutes; polls Aircall's Dialer Campaign for outcomes matching `AIRCALL_INTERESTED_OUTCOMES` |
 | `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+
+**Note on `aircall-interested-sync`:** Aircall does not expose a webhook or a documented public schema for Dialer Campaign outcomes (`Interested`, `Not Interested`, `DNC`, `No Answer`, `Not ICP`, etc. — confirmed via the Aircall dashboard and a real `call.tagged` webhook payload, which only carries a generic `Outbound Campaign` tag, not the outcome). This sync polls `GET /v1/users/{AIRCALL_DIALER_USER_ID}/dialer_campaign/phone_numbers` instead. **The field names it parses (`lib/aircall.ts`'s `parseDialerCampaignEntry`) are provisional** — they're a best guess from the dashboard UI, not a confirmed response schema, and must be verified against a real API response before this is trusted in production.
 
 The HeyReach implementation uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints. Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
 

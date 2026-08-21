@@ -1,4 +1,4 @@
-import { requiredEnv } from "./env.ts";
+import { AIRCALL_BASE, aircallAuthHeader } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -7,8 +7,6 @@ import {
   responseJson,
   stringValue,
 } from "./json.ts";
-
-const AIRCALL_BASE = "https://api.aircall.io/v1";
 
 //=====================================================================================================
 //Interfaces
@@ -112,19 +110,6 @@ export function parseAircallWebhook(value: unknown): AircallWebhook {
   return { event, timestamp, token, call: parseAircallCall(value.data) };
 }
 
-//===============================================================================================================
-//Header
-//===============================================================================================================
-
-function authHeader(): string {
-  const credentials = `${requiredEnv("AIRCALL_API_ID")}:${requiredEnv("AIRCALL_API_TOKEN")}`;
-  return `Basic ${Buffer.from(credentials).toString("base64")}`;
-}
-
-//===============================================================================================================
-//
-//===============================================================================================================
-
 export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
   const calls: AircallCall[] = [];
   const first = new URL(`${AIRCALL_BASE}/calls`);
@@ -135,7 +120,7 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
   let nextUrl: string | null = first.toString();
 
   while (nextUrl) {
-    const response = await fetch(nextUrl, { headers: { Authorization: authHeader() } });
+    const response = await fetch(nextUrl, { headers: { Authorization: aircallAuthHeader() } });
     const body = await responseJson(response);
     if (!response.ok) {
       throw new Error(`Aircall API error ${response.status}: ${JSON.stringify(body)}`);
@@ -146,4 +131,64 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
     nextUrl = stringValue(meta?.next_page_link);
   }
   return calls.filter((call) => call.status === "done" && call.endedAt !== null);
+}
+
+//=====================================================================================================
+//Dialer Campaign (Power Dialer "Outcomes") — FIELD NAMES BELOW ARE UNCONFIRMED.
+//This endpoint is not covered by Aircall's public API/webhook docs. Confirm every key against a real
+//response from GET /v1/users/{user_id}/dialer_campaign/phone_numbers before relying on this in production.
+//=====================================================================================================
+
+export interface DialerCampaignEntry {
+  readonly id: string;
+  readonly phone: string | null;
+  readonly email: string | null;
+  readonly contactName: string | null;
+  readonly outcome: string | null;
+  readonly lastAttemptAt: number | null;
+}
+
+function parseDialerCampaignEntry(value: unknown): DialerCampaignEntry | null {
+  if (!isJsonObject(value)) return null;
+  const contact = objectValue(value, "contact");
+  const phone = stringValue(value.raw_digits) ?? stringValue(value.phone_number) ?? stringValue(value.number);
+  const id = stringValue(value.id) ?? phone;
+  if (!id) return null;
+
+  const joinedContactName = contact
+    ? [stringValue(contact.first_name), stringValue(contact.last_name)].filter(Boolean).join(" ")
+    : "";
+  const contactName = contact ? stringValue(contact.name) ?? (joinedContactName || null) : null;
+  const lastAttemptSeconds = numberValue(value.last_attempt_at);
+
+  return {
+    id,
+    phone,
+    email: contact ? stringValue(contact.email) : null,
+    contactName,
+    outcome: stringValue(value.outcome) ?? stringValue(value.status),
+    lastAttemptAt: lastAttemptSeconds !== null ? lastAttemptSeconds * 1_000 : null,
+  };
+}
+
+export async function fetchDialerCampaignEntries(userId: string): Promise<readonly DialerCampaignEntry[]> {
+  const entries: DialerCampaignEntry[] = [];
+  let nextUrl: string | null = `${AIRCALL_BASE}/users/${userId}/dialer_campaign/phone_numbers`;
+
+  while (nextUrl) {
+    const response = await fetch(nextUrl, { headers: { Authorization: aircallAuthHeader() } });
+    const body = await responseJson(response);
+    if (!response.ok) {
+      throw new Error(`Aircall dialer campaign API error ${response.status}: ${JSON.stringify(body)}`);
+    }
+    if (!isJsonObject(body)) throw new Error("Aircall dialer campaign response is invalid");
+    entries.push(
+      ...arrayValue(body, "phone_numbers")
+        .map(parseDialerCampaignEntry)
+        .filter((entry): entry is DialerCampaignEntry => entry !== null),
+    );
+    const meta = objectValue(body, "meta");
+    nextUrl = stringValue(meta?.next_page_link);
+  }
+  return entries;
 }

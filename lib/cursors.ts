@@ -1,4 +1,4 @@
-import { optionalEnv, requiredEnv } from "./env.ts";
+import { supabaseBaseUrl, supabaseHeaders } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -30,18 +30,8 @@ interface CursorRow {
 
 //============================================================================================================
 
-function supabaseHeaders(): HeadersInit {
-  const key = optionalEnv("SUPABASE_SECRET_KEY") ?? requiredEnv("SUPABASE_SERVICE_ROLE_KEY");
-  const headers: Record<string, string> = {
-    apikey: key,
-    "Content-Type": "application/json",
-  };
-  if (key.startsWith("eyJ")) headers.Authorization = `Bearer ${key}`;
-  return headers;
-}
-
 function cursorEndpoint(): URL {
-  return new URL(`/rest/v1/${CURSOR_TABLE}`, requiredEnv("SUPABASE_URL"));
+  return new URL(`/rest/v1/${CURSOR_TABLE}`, supabaseBaseUrl());
 }
 
 function parseBoundaryIds(cursorValue: string | null): ReadonlySet<string> {

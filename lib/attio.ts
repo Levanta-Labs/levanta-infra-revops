@@ -1,4 +1,5 @@
 import { requiredEnv } from "./env.ts";
+import { ATTIO_BASE, attioHeaders } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -8,8 +9,6 @@ import {
   stringValue,
   type JsonObject,
 } from "./json.ts";
-
-const ATTIO_BASE = "https://api.attio.com/v2"; //endpoint url base
 
 export const LISTS = {
   MASTER_TAM: "master_tam_list",
@@ -78,17 +77,6 @@ export class AttioApiError extends Error {
     this.name = "AttioApiError";
   }
 }
-
-//Headers for api auth ======================================================================================
-
-function attioHeaders(): HeadersInit { 
-  return {
-    Authorization: `Bearer ${requiredEnv("ATTIO_API_KEY")}`,
-    "Content-Type": "application/json",
-  };
-}
-
-//==========================================================================================================
 
 export async function attioFetch(path: string, options: RequestInit = {}): Promise<unknown> {
   const response = await fetch(`${ATTIO_BASE}${path}`, {

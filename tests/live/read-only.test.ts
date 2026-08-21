@@ -1,12 +1,18 @@
 import { expect, test } from "bun:test";
+import {
+  AIRCALL_BASE,
+  aircallAuthHeader,
+  ATTIO_BASE,
+  attioHeaders,
+  HEYREACH_BASE,
+  heyreachHeaders,
+  INSTANTLY_BASE,
+  instantlyAuthHeader,
+  supabaseBaseUrl,
+  supabaseHeaders,
+} from "../../lib/endpoints.ts";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
-
-function required(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`Live test requires ${name}`);
-  return value;
-}
 
 async function expectOk(label: string, response: Response): Promise<void> {
   if (!response.ok) {
@@ -16,35 +22,21 @@ async function expectOk(label: string, response: Response): Promise<void> {
 }
 
 liveTest("reads the Supabase cursor table", async () => {
-  const key = process.env.SUPABASE_SECRET_KEY?.trim() || required("SUPABASE_SERVICE_ROLE_KEY");
-  const url = new URL(
-    "/rest/v1/Attio_Integrations_Touchpoint_Cursors",
-    required("SUPABASE_URL"),
-  );
+  const url = new URL("/rest/v1/Attio_Integrations_Touchpoint_Cursors", supabaseBaseUrl());
   url.searchParams.set("select", "sync_key,cursor_timestamp");
   url.searchParams.set("limit", "1");
-  const headers: Record<string, string> = { apikey: key };
-  if (key.startsWith("eyJ")) headers.Authorization = `Bearer ${key}`;
-  await expectOk("Supabase", await fetch(url, { headers }));
+  await expectOk("Supabase", await fetch(url, { headers: supabaseHeaders() }));
 });
 
 liveTest("identifies the Attio token", async () => {
-  await expectOk(
-    "Attio",
-    await fetch("https://api.attio.com/v2/self", {
-      headers: { Authorization: `Bearer ${required("ATTIO_API_KEY")}` },
-    }),
-  );
+  await expectOk("Attio", await fetch(`${ATTIO_BASE}/self`, { headers: attioHeaders() }));
 });
 
 liveTest("reads one Aircall calls page", async () => {
-  const credentials = Buffer.from(
-    `${required("AIRCALL_API_ID")}:${required("AIRCALL_API_TOKEN")}`,
-  ).toString("base64");
   await expectOk(
     "Aircall",
-    await fetch("https://api.aircall.io/v1/calls?per_page=1&order=desc", {
-      headers: { Authorization: `Basic ${credentials}` },
+    await fetch(`${AIRCALL_BASE}/calls?per_page=1&order=desc`, {
+      headers: { Authorization: aircallAuthHeader() },
     }),
   );
 });
@@ -52,8 +44,8 @@ liveTest("reads one Aircall calls page", async () => {
 liveTest("reads one Instantly email preview", async () => {
   await expectOk(
     "Instantly",
-    await fetch("https://api.instantly.ai/api/v2/emails?limit=1&preview_only=true", {
-      headers: { Authorization: `Bearer ${required("INSTANTLY_API_KEY")}` },
+    await fetch(`${INSTANTLY_BASE}/emails?limit=1&preview_only=true`, {
+      headers: { Authorization: instantlyAuthHeader() },
     }),
   );
 });
@@ -61,12 +53,9 @@ liveTest("reads one Instantly email preview", async () => {
 liveTest("reads one HeyReach conversation page", async () => {
   await expectOk(
     "HeyReach",
-    await fetch("https://api.heyreach.io/api/public/inbox/GetConversationsV3", {
+    await fetch(`${HEYREACH_BASE}/inbox/GetConversationsV3`, {
       method: "POST",
-      headers: {
-        "X-API-KEY": required("HEYREACH_API_KEY"),
-        "Content-Type": "application/json",
-      },
+      headers: heyreachHeaders(),
       body: JSON.stringify({ limit: 1, cursor: null, filters: {} }),
     }),
   );

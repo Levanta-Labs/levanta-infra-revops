@@ -1,4 +1,4 @@
-import { requiredEnv } from "./env.ts";
+import { INSTANTLY_BASE, instantlyAuthHeader } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -6,8 +6,6 @@ import {
   responseJson,
   stringValue,
 } from "./json.ts";
-
-const INSTANTLY_BASE = "https://api.instantly.ai/api/v2";
 
 export type InstantlyEmailType = "received" | "sent" | "scheduled" | "unknown";
 
@@ -86,7 +84,7 @@ export async function fetchInstantlyEmails(
     if (startingAfter) url.searchParams.set("starting_after", startingAfter);
 
     const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${requiredEnv("INSTANTLY_API_KEY")}` },
+      headers: { Authorization: instantlyAuthHeader() },
     });
     const body = await responseJson(response);
     if (!response.ok) {
