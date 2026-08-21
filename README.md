@@ -8,8 +8,8 @@ Typed Vercel functions that synchronize Aircall, Instantly, and HeyReach activit
 api/
   instantly-interested.ts
   heyreach-interested.ts
+  aircall-interested.ts
   cron/
-    aircall-interested-sync.ts
     aircall-touchpoint-sync.ts
     instantly-touchpoint-sync.ts
     heyreach-touchpoint-sync.ts
