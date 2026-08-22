@@ -4,9 +4,9 @@
 </p>
 <br />
 
-# Levanta CRM Overhaul
+# Levanta RevOps Infrastructure
 
-Levanta CRM Overhaul keeps Attio aligned with interested-lead and sales-touchpoint activity from Aircall, Instantly, and HeyReach.
+Levanta RevOps infrastructure keeps Attio aligned with interested-lead and sales-touchpoint activity from Aircall, Instantly, and HeyReach.
 
 ## Quickstart
 
