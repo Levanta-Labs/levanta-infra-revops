@@ -6,9 +6,9 @@ Typed Vercel functions that synchronize Aircall, Instantly, and HeyReach activit
 
 ```text
 api/
+  aircall-interested.ts
   instantly-interested.ts
   heyreach-interested.ts
-  aircall-interested.ts
   cron/
     aircall-touchpoint-sync.ts
     instantly-touchpoint-sync.ts
@@ -19,12 +19,18 @@ lib/
   instantly.ts
   heyreach.ts
   cursors.ts
+  endpoints.ts
+  env.ts
+  http.ts
+  json.ts
 tests/
   unit/
   live/
 ```
 
-Each interested webhook (Instantly, HeyReach) creates or finds an Attio Person, ensures an Interested Deal exists, writes source history notes, sets Lead Source, and upserts the Person into the DNC list. Aircall's "interested" detection is a polling cron instead of a webhook — see below. Each touchpoint cron sync only logs touchpoints for People on the Master TAM list, mirrors the note to the associated Company, and increments the configured counters.
+`lib/endpoints.ts` is the single source for every provider base URL and auth header builder; the provider clients and the live smoke tests both import from it rather than constructing their own. API keys are still read from environment variables at call time, never hardcoded.
+
+Each interested webhook creates or finds an Attio Person, ensures an Interested Deal exists, writes source history notes, backfills Lead Source and any blank contact attributes, and upserts the Person into the DNC list. Attio is treated as the source of truth: third-party data only fills attributes that are currently empty on the Person, and never overwrites a value Attio already holds (see `blankPersonValues` in `lib/attio.ts`). An attribute counts as blank only when its Attio value array is empty, so a Person who already has one email keeps exactly that email. Each touchpoint cron sync only processes People on the Master TAM list and increments the configured counters; Instantly and HeyReach also write a note on the Person, while Aircall does not (that note is written by a separate integration) — all three mirror a note to the associated Company when one exists.
 
 ## Setup
 
@@ -46,12 +52,12 @@ Copy `.env.example` to `.env.local` for local development. Configure the same va
 | `ATTIO_COMPANY_INSTANTLY_COUNTER_SLUG` | Confirmed Company counter slug for Instantly emails |
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Confirmed Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
-| `AIRCALL_DIALER_USER_ID` | Aircall user ID whose Dialer Campaign is polled for outcomes |
-| `AIRCALL_INTERESTED_OUTCOMES` | Comma-separated Dialer Campaign outcome values that mean interested |
+| `AIRCALL_WEBHOOK_TOKEN` | Token Aircall includes in the webhook JSON payload |
+| `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
 | `INSTANTLY_API_KEY` | Instantly v2 API key with `emails:read` or broader scope |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key |
-| `HEYREACH_WEBHOOK_SECRET` | Secret configured by the Zapier relay as `x-webhook-secret` |
+| `HEYREACH_WEBHOOK_SECRET` | Secret configured in HeyReach's webhook settings as the `x-webhook-secret` header |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Server-side Supabase secret key; never expose it to a client |
 | `CRON_SECRET` | Vercel Cron authorization secret |
@@ -63,11 +69,12 @@ Legacy Supabase JWT projects may use `SUPABASE_SERVICE_ROLE_KEY` instead of `SUP
 All syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted by these stable keys:
 
 - `aircall-touchpoints`
-- `aircall-interested`
 - `instantly-touchpoints`
 - `heyreach-touchpoints`
 
 `cursor_timestamp` is the completed high-water mark. `cursor_value` contains a JSON array of event IDs at that exact timestamp, preventing events with identical timestamps from being lost or replayed. A missing row starts with a ten-minute lookback and is created automatically. `last_updated_at` is explicitly refreshed on every upsert.
+
+Because the syncs now run once daily but a missing cursor row only looks back ten minutes, the very first run against an empty table (or any run after the row is deleted) picks up ten minutes of history rather than a full day. Seed `cursor_timestamp` manually if a backfill is needed.
 
 The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the table. Keep it in Vercel server-side environment variables only.
 
@@ -75,14 +82,12 @@ The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the
 
 | Route | Source | Expected request |
 | --- | --- | --- |
+| `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
-| `/api/heyreach-interested` | Zapier relay | A lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
-| `/api/cron/aircall-interested-sync` | Vercel Cron | Authorized GET every five minutes; polls Aircall's Dialer Campaign for outcomes matching `AIRCALL_INTERESTED_OUTCOMES` |
-| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
-| `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
-| `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
-
-**Note on `aircall-interested-sync`:** Aircall does not expose a webhook or a documented public schema for Dialer Campaign outcomes (`Interested`, `Not Interested`, `DNC`, `No Answer`, `Not ICP`, etc. — confirmed via the Aircall dashboard and a real `call.tagged` webhook payload, which only carries a generic `Outbound Campaign` tag, not the outcome). This sync polls `GET /v1/users/{AIRCALL_DIALER_USER_ID}/dialer_campaign/phone_numbers` instead. **The field names it parses (`lib/aircall.ts`'s `parseDialerCampaignEntry`) are provisional** — they're a best guess from the dashboard UI, not a confirmed response schema, and must be verified against a real API response before this is trusted in production.
+| `/api/heyreach-interested` | HeyReach | A lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
+| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET, once daily at 06:00 UTC |
+| `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET, once daily at 06:00 UTC |
+| `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET, once daily at 06:00 UTC |
 
 The HeyReach implementation uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints. Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
 
@@ -94,7 +99,7 @@ Run the strict compiler and unit suite:
 bun run check
 ```
 
-The unit suite mocks every external write and covers provider response validation, pagination, handlers, touchpoint event identity, Attio helpers, and Supabase cursor persistence.
+The unit suite mocks every external write and covers provider response validation, pagination, interested-webhook and cron handlers, touchpoint event identity, Attio helpers, blank-only attribute backfill, and Supabase cursor persistence.
 
 Run opt-in read-only smoke tests against configured live accounts:
 
@@ -106,6 +111,6 @@ Live tests only identify/read one small page from Supabase, Attio, Aircall, Inst
 
 ## Deployment
 
-`vercel.json` selects Vercel's Bun `1.x` runtime and schedules all three syncs every five minutes. Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
+`vercel.json` selects Vercel's Bun `1.x` runtime and schedules the three touchpoint syncs once daily at 06:00 UTC. Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
 
 Attio counter updates remain read-then-write because Attio does not expose an atomic increment operation. The sync handlers process events sequentially and stop at the first failed event so the cursor never advances past unprocessed work. Avoid overlapping manual invocations of the same sync.

@@ -1,5 +1,6 @@
 import {
   addPersonToList,
+  blankPersonValues,
   createNote,
   createPerson,
   ensureInterestedDeal,
@@ -104,7 +105,10 @@ export async function POST(request: Request): Promise<Response> {
     const title = LEAD_SOURCE_LABELS.aircall;
     await createNote("people", personId, title, history);
     await createNote("deals", dealId, title, history);
-    await patchPerson(personId, { lead_source: title });
+    await patchPerson(
+      personId,
+      blankPersonValues(person, { ...personValues(fields), lead_source: title }),
+    );
     await addPersonToList(personId, LISTS.DNC);
 
     return json({ success: true, personId, dealId });

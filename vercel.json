@@ -4,15 +4,15 @@
   "crons": [
     {
       "path": "/api/cron/aircall-touchpoint-sync",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 6 * * *"
     },
     {
       "path": "/api/cron/instantly-touchpoint-sync",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 6 * * *"
     },
     {
       "path": "/api/cron/heyreach-touchpoint-sync",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 6 * * *"
     }
   ]
 }

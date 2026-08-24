@@ -72,7 +72,7 @@ describe("interested workflows", () => {
     );
   });
 
-  test("accepts both top-level and nested HeyReach relay payloads", () => {
+  test("accepts both top-level and nested HeyReach webhook payloads", () => {
     expect(parseHeyReachInterestedWebhook({ lead: { profileUrl: "https://linkedin.com/in/ada" } }).profileUrl)
       .toBe("https://linkedin.com/in/ada");
     expect(parseHeyReachInterestedWebhook({ linkedInUrl: "https://linkedin.com/in/grace" }).profileUrl)

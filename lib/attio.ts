@@ -46,6 +46,9 @@ export interface AttioPerson {
     readonly company: readonly AttioRecordReference[];
     readonly name: readonly { readonly full_name: string | null }[];
   };
+  // Attio returns every attribute as an array, so a non-empty array means "has a value"
+  // regardless of the attribute's type. Used to fill only blanks and never overwrite.
+  readonly populatedAttributes: ReadonlySet<string>;
 }
 
 export interface PersonNameInput {
@@ -61,8 +64,8 @@ export interface CreatePersonValues {
   readonly name?: readonly PersonNameInput[];
 }
 
-export interface PatchPersonValues {
-  readonly lead_source: string;
+export interface PatchPersonValues extends CreatePersonValues {
+  readonly lead_source?: string;
 }
 
 //============================================================================================================
@@ -132,6 +135,10 @@ export function parseAttioPerson(value: unknown): AttioPerson {
     })
     .filter((name): name is { readonly full_name: string | null } => name !== null);
 
+  const populatedAttributes = new Set(
+    Object.keys(values).filter((slug) => arrayValue(values, slug).length > 0),
+  );
+
   return {
     id: { record_id: recordId },
     values: {
@@ -139,7 +146,25 @@ export function parseAttioPerson(value: unknown): AttioPerson {
       company: parseReferences(values, "company"),
       name: names,
     },
+    populatedAttributes,
   };
+}
+
+/**
+ * Keeps only the candidate values whose attribute is currently blank on the person,
+ * so third-party data fills gaps without ever overwriting what Attio already holds.
+ */
+export function blankPersonValues(
+  person: AttioPerson,
+  candidate: PatchPersonValues,
+): PatchPersonValues {
+  const fillable: Record<string, unknown> = {};
+  for (const [slug, value] of Object.entries(candidate)) {
+    if (value === undefined) continue;
+    if (person.populatedAttributes.has(slug)) continue;
+    fillable[slug] = value;
+  }
+  return fillable as PatchPersonValues;
 }
 //#endregion
 
@@ -198,6 +223,7 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
 }
 
 export async function patchPerson(personId: string, values: PatchPersonValues): Promise<void> {
+  if (Object.keys(values).length === 0) return;
   await attioFetch(`/objects/people/records/${personId}`, {
     method: "PATCH",
     body: JSON.stringify({ data: { values } }),

@@ -1,5 +1,6 @@
 import {
   addPersonToList,
+  blankPersonValues,
   createNote,
   createPerson,
   ensureInterestedDeal,
@@ -29,7 +30,7 @@ export interface HeyReachInterestedFields {
 }
 
 export function parseHeyReachInterestedWebhook(value: unknown): HeyReachInterestedFields {
-  if (!isJsonObject(value)) throw new Error("HeyReach relay payload must be an object");
+  if (!isJsonObject(value)) throw new Error("HeyReach webhook payload must be an object");
   const lead = objectValue(value, "lead") ?? value;
   const fields = {
     profileUrl: stringValue(lead.profileUrl) ?? stringValue(lead.linkedInUrl),
@@ -39,7 +40,7 @@ export function parseHeyReachInterestedWebhook(value: unknown): HeyReachInterest
     companyName: stringValue(lead.companyName),
   };
   if (!fields.profileUrl && !fields.email) {
-    throw new Error("HeyReach relay payload is missing profileUrl and email");
+    throw new Error("HeyReach webhook payload is missing profileUrl and email");
   }
   return fields;
 }
@@ -97,7 +98,10 @@ export async function POST(request: Request): Promise<Response> {
     const title = LEAD_SOURCE_LABELS.heyreach;
     await createNote("people", personId, title, history);
     await createNote("deals", dealId, title, history);
-    await patchPerson(personId, { lead_source: title });
+    await patchPerson(
+      personId,
+      blankPersonValues(person, { ...personValues(fields), lead_source: title }),
+    );
     await addPersonToList(personId, LISTS.DNC);
     const campaignsStopped = await stopLeadInActiveCampaigns(fields.profileUrl, fields.email);
     return json({ success: true, personId, dealId, campaignsStopped });

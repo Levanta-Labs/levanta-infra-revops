@@ -42,7 +42,6 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
   const durationMinutes = Math.round(call.duration / 60);
   const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${durationMinutes} min`;
   const title = `Aircall Touchpoint — ${timestamp}`;
-  await createNote("people", personId, title, content);
   await incrementCounter("people", personId, PERSON_COUNTER_SLUGS.aircall);
 
   const companyId = personCompanyId(person);
@@ -63,9 +62,11 @@ export async function GET(request: Request): Promise<Response> {
   try {
     const upperBoundMs = Date.now();
     let cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
+
     const calls = [...(await fetchAircallCalls(cursor.timestampMs, upperBoundMs))].sort(
       (left, right) => aircallCursorEvent(left).timestampMs - aircallCursorEvent(right).timestampMs,
     );
+
     const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
     let processingError: string | null = null;
 
