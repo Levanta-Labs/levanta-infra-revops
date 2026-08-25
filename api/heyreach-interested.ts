@@ -80,6 +80,9 @@ export async function POST(request: Request): Promise<Response> {
   }
   try {
     const fields = parseHeyReachInterestedWebhook(await requestJson(request));
+    console.log(
+      `[route] heyreach-interested: handling ${fields.profileUrl ?? fields.email ?? "a lead with no identifier"}`,
+    );
     let person = await findPersonByLinkedIn(fields.profileUrl);
     if (!person) person = await findPersonByEmail(fields.email);
     if (!person) person = await createPerson(personValues(fields));
@@ -104,6 +107,9 @@ export async function POST(request: Request): Promise<Response> {
     );
     await addPersonToList(personId, LISTS.DNC);
     const campaignsStopped = await stopLeadInActiveCampaigns(fields.profileUrl, fields.email);
+    console.log(
+      `[route] heyreach-interested: completed - person ${personId}, deal ${dealId}, ${messages.length} message(s) summarised, ${campaignsStopped} campaign(s) stopped`,
+    );
     return json({ success: true, personId, dealId, campaignsStopped });
   } catch (error) {
     return serverError("HeyReach interested webhook error", error);

@@ -5,8 +5,8 @@ import {
   incrementCounter,
   isPersonInList,
   LISTS,
-  PERSON_COUNTER_SLUGS,
   personCompanyId,
+  personCounterSlug,
   personDisplayName,
 } from "../../lib/attio.js";
 import {
@@ -59,16 +59,26 @@ export async function processHeyReachTouchpoint(
   event: HeyReachTouchpointEvent,
 ): Promise<ProcessingOutcome> {
   const person = await findPersonByLinkedIn(event.conversation.profile.profileUrl);
-  if (!person) return "skipped";
+  if (!person) {
+    console.log(
+      `[event] heyreach message ${event.cursor.id}: skipped - no Attio person has ${event.conversation.profile.profileUrl}`,
+    );
+    return "skipped";
+  }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) return "not_tam";
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
+    console.log(
+      `[event] heyreach message ${event.cursor.id}: skipped - person ${personId} is not on the Master TAM list`,
+    );
+    return "not_tam";
+  }
 
   const profile = event.conversation.profile;
   const leadName = `${profile.firstName ?? ""} ${profile.lastName ?? ""}`.trim() || "HeyReach conversation";
   const title = `${event.message.subject ?? leadName} — ${event.message.createdAt}`;
   const body = event.message.body || "(no message content)";
   await createNote("people", personId, title, body);
-  await incrementCounter("people", personId, PERSON_COUNTER_SLUGS.heyreach);
+  await incrementCounter("people", personId, personCounterSlug("heyreach"));
 
   const companyId = personCompanyId(person);
   if (companyId) {
@@ -94,31 +104,39 @@ export async function GET(request: Request): Promise<Response> {
     });
     const events = await heyReachTouchpointEvents(conversations);
     const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
-    let processingError: string | null = null;
+    const failures: string[] = [];
 
     for (const event of events) {
       if (!isAfterCursor(cursor, event.cursor)) continue;
       try {
         const outcome = await processHeyReachTouchpoint(event);
         results[outcome] += 1;
-        cursor = advanceCursor(cursor, event.cursor);
       } catch (error) {
-        processingError = `Message ${event.cursor.id}: ${errorMessage(error)}`;
-        break;
+        failures.push(`Message ${event.cursor.id}: ${errorMessage(error)}`);
+        console.error(
+          `[event] heyreach message ${event.cursor.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
+        );
       }
+      //The cursor advances whether or not the touchpoint succeeded. A failed event is passed over after one
+      //attempt rather than blocking every later event on this and all future runs.
+      cursor = advanceCursor(cursor, event.cursor);
     }
 
-    if (!processingError) cursor = advanceCursorTo(cursor, upperBoundMs);
+    cursor = advanceCursorTo(cursor, upperBoundMs);
     await saveSyncCursor(cursor);
+    console.log(
+      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+    );
     const body = {
-      success: processingError === null,
+      success: failures.length === 0,
       conversationsScanned: conversations.length,
       messagesFound: events.length,
       ...results,
+      failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),
-      ...(processingError ? { error: processingError } : {}),
+      ...(failures.length > 0 ? { errors: failures } : {}),
     };
-    return json(body, processingError ? 500 : 200);
+    return json(body, failures.length > 0 ? 500 : 200);
   } catch (error) {
     return serverError("HeyReach touchpoint sync error", error);
   }

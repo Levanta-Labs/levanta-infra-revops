@@ -13,6 +13,9 @@ const envNames = [
   "HEYREACH_API_KEY",
   "CRON_SECRET",
   "ATTIO_API_KEY",
+  "ATTIO_PERSON_AIRCALL_COUNTER_SLUG",
+  "ATTIO_PERSON_INSTANTLY_COUNTER_SLUG",
+  "ATTIO_PERSON_HEYREACH_COUNTER_SLUG",
   "ATTIO_COMPANY_AIRCALL_COUNTER_SLUG",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
@@ -26,6 +29,9 @@ beforeEach(() => {
   process.env.HEYREACH_API_KEY = "heyreach-key";
   process.env.CRON_SECRET = "cron-secret";
   process.env.ATTIO_API_KEY = "attio-key";
+  process.env.ATTIO_PERSON_AIRCALL_COUNTER_SLUG = "number_of_calls";
+  process.env.ATTIO_PERSON_INSTANTLY_COUNTER_SLUG = "number_of_emails";
+  process.env.ATTIO_PERSON_HEYREACH_COUNTER_SLUG = "number_of_dms";
   process.env.ATTIO_COMPANY_AIRCALL_COUNTER_SLUG = "number_of_calls";
 });
 

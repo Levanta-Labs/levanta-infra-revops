@@ -8,7 +8,7 @@
     "check": "bun run typecheck && bun run test:unit",
     "test": "bun test",
     "test:unit": "bun test tests/unit",
-    "test:live": "RUN_LIVE_TESTS=1 bun test tests/live",
+    "test:live": "RUN_LIVE_TESTS=1 bun test --env-file=.env.local tests/live",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
