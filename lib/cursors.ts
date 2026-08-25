@@ -1,4 +1,4 @@
-import { supabaseBaseUrl, supabaseHeaders } from "./endpoints.js";
+import { credentialHint, supabaseBaseUrl, supabaseHeaders } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
@@ -108,7 +108,7 @@ export async function getSyncCursor(syncKey: string, nowMs = Date.now()): Promis
   const response = await fetch(url, { headers: supabaseHeaders() });
   const body = await responseJson(response);
   if (!response.ok) {
-    throw new Error(`Supabase cursor read failed (${response.status}): ${JSON.stringify(body)}`);
+    throw new Error(`Supabase cursor read failed (${response.status}): ${JSON.stringify(body)}${credentialHint("supabase", response.status)}`);
   }
   if (!isJsonObject(body) && !Array.isArray(body)) {
     throw new Error("Supabase returned an invalid cursor response");
@@ -144,6 +144,6 @@ export async function saveSyncCursor(cursor: SyncCursor): Promise<void> {
     }),
   });
   if (!response.ok) {
-    throw new Error(`Supabase cursor write failed (${response.status}): ${await response.text()}`);
+    throw new Error(`Supabase cursor write failed (${response.status}): ${await response.text()}${credentialHint("supabase", response.status)}`);
   }
 }

@@ -1,4 +1,4 @@
-import { optionalEnv, requiredEnv } from "./env.js";
+import { optionalEnv, reportConfigValue, requiredEnv } from "./env.js";
 
 //Base URLs====================================================================================
 
@@ -8,7 +8,9 @@ export const INSTANTLY_BASE = "https://api.instantly.ai/api/v2";
 export const HEYREACH_BASE = "https://api.heyreach.io/api/public";
 
 export function supabaseBaseUrl(): string {
-  return requiredEnv("SUPABASE_URL");
+  const url = requiredEnv("SUPABASE_URL");
+  reportConfigValue("SUPABASE_URL", url);
+  return url;
 }
 
 //==============================================================================================
@@ -40,13 +42,47 @@ export function heyreachHeaders(): HeadersInit {
 }
 
 export function supabaseHeaders(): HeadersInit {
-  const key = optionalEnv("SUPABASE_SECRET_KEY") ?? requiredEnv("SUPABASE_SERVICE_ROLE_KEY");
+  const modern = optionalEnv("SUPABASE_SECRET_KEY");
+  const key = modern ?? requiredEnv("SUPABASE_SERVICE_ROLE_KEY");
+  reportConfigValue(
+    "SUPABASE key source",
+    modern ? "SUPABASE_SECRET_KEY" : "SUPABASE_SERVICE_ROLE_KEY (legacy)",
+  );
   const headers: Record<string, string> = {
     apikey: key,
     "Content-Type": "application/json",
   };
   if (key.startsWith("eyJ")) headers.Authorization = `Bearer ${key}`;
   return headers;
+}
+
+//==============================================================================================
+
+//Credential diagnostics========================================================================
+//A provider can only tell us a key is wrong by rejecting the request, so translate its 401/403 into the name of
+//the environment variable that has to change. Anything else is a data or permission problem, not a credential.
+
+const CREDENTIAL_ENV_NAMES = {
+  attio: ["ATTIO_API_KEY"],
+  aircall: ["AIRCALL_API_ID", "AIRCALL_API_TOKEN"],
+  instantly: ["INSTANTLY_API_KEY"],
+  heyreach: ["HEYREACH_API_KEY"],
+  supabase: ["SUPABASE_URL", "SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY)"],
+} as const;
+
+export type CredentialScope = keyof typeof CREDENTIAL_ENV_NAMES;
+
+/**
+ * Logs and returns a pointer to the environment variables behind a rejected request. Returns "" for statuses that
+ * are not about credentials, so it can be appended to any error message unconditionally.
+ */
+export function credentialHint(scope: CredentialScope, status: number): string {
+  if (status !== 401 && status !== 403) return "";
+  const names = CREDENTIAL_ENV_NAMES[scope].join(" and ");
+  console.warn(
+    `[credential] ${scope} rejected our request with ${status} - the key is missing, wrong, or lacks scope. Check ${names}.`,
+  );
+  return ` - ${scope} rejected the credential, check ${names}`;
 }
 
 //==============================================================================================

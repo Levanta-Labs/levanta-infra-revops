@@ -1,5 +1,5 @@
-import { requiredEnv } from "./env.js";
-import { ATTIO_BASE, attioHeaders } from "./endpoints.js";
+import { reportConfigEmail, reportConfigValue, requiredEnv } from "./env.js";
+import { ATTIO_BASE, attioHeaders, credentialHint } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
@@ -89,7 +89,7 @@ export async function attioFetch(path: string, options: RequestInit = {}): Promi
   const body = await responseJson(response);
   if (!response.ok) {
     throw new AttioApiError(
-      `Attio API error ${response.status}: ${JSON.stringify(body)}`,
+      `Attio API error ${response.status}: ${JSON.stringify(body)}${credentialHint("attio", response.status)}`,
       response.status,
       body,
     );
@@ -288,14 +288,23 @@ export async function incrementCounter(
   recordId: string,
   attributeSlug: string,
 ): Promise<void> {
-  const current = parseCounterValue(
-    await attioFetch(`/objects/${objectType}/records/${recordId}`),
-    attributeSlug,
-  );
-  await attioFetch(`/objects/${objectType}/records/${recordId}`, {
-    method: "PATCH",
-    body: JSON.stringify({ data: { values: { [attributeSlug]: current + 1 } } }),
-  });
+  try {
+    const current = parseCounterValue(
+      await attioFetch(`/objects/${objectType}/records/${recordId}`),
+      attributeSlug,
+    );
+    await attioFetch(`/objects/${objectType}/records/${recordId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { values: { [attributeSlug]: current + 1 } } }),
+    });
+  } catch (error) {
+    if (error instanceof AttioApiError && (error.status === 400 || error.status === 404)) {
+      console.warn(
+        `[slug] Attio returned ${error.status} while incrementing ${JSON.stringify(attributeSlug)} on ${objectType} - either that record is gone or no such attribute exists on the ${objectType} object. Company counter slugs come from the ATTIO_COMPANY_*_COUNTER_SLUG values logged above.`,
+      );
+    }
+    throw error;
+  }
 }
 
 export async function ensureInterestedDeal(
@@ -347,6 +356,15 @@ export function personCompanyId(person: AttioPerson): string | null {
 }
 
 export function companyCounterSlug(provider: Provider): string {
-  return requiredEnv(`ATTIO_COMPANY_${provider.toUpperCase()}_COUNTER_SLUG`);
+  const envName = `ATTIO_COMPANY_${provider.toUpperCase()}_COUNTER_SLUG`;
+  const slug = requiredEnv(envName);
+  reportConfigValue(envName, slug);
+  return slug;
+}
 
+/** Single accessor for the deal owner so the configured address is reported once, by domain only. */
+export function defaultDealOwner(): string {
+  const owner = requiredEnv("ATTIO_DEFAULT_DEAL_OWNER");
+  reportConfigEmail("ATTIO_DEFAULT_DEAL_OWNER", owner);
+  return owner;
 }

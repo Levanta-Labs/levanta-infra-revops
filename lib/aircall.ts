@@ -1,4 +1,4 @@
-import { AIRCALL_BASE, aircallAuthHeader } from "./endpoints.js";
+import { AIRCALL_BASE, aircallAuthHeader, credentialHint } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
@@ -123,7 +123,7 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
     const response = await fetch(nextUrl, { headers: { Authorization: aircallAuthHeader() } });
     const body = await responseJson(response);
     if (!response.ok) {
-      throw new Error(`Aircall API error ${response.status}: ${JSON.stringify(body)}`);
+      throw new Error(`Aircall API error ${response.status}: ${JSON.stringify(body)}${credentialHint("aircall", response.status)}`);
     }
     if (!isJsonObject(body)) throw new Error("Aircall calls response is invalid");
     calls.push(...arrayValue(body, "calls").map(parseAircallCall));
