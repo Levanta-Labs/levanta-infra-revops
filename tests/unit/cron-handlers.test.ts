@@ -12,6 +12,8 @@ const envNames = [
   "INSTANTLY_API_KEY",
   "HEYREACH_API_KEY",
   "CRON_SECRET",
+  "ATTIO_API_KEY",
+  "ATTIO_COMPANY_AIRCALL_COUNTER_SLUG",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
@@ -23,6 +25,8 @@ beforeEach(() => {
   process.env.INSTANTLY_API_KEY = "instantly-key";
   process.env.HEYREACH_API_KEY = "heyreach-key";
   process.env.CRON_SECRET = "cron-secret";
+  process.env.ATTIO_API_KEY = "attio-key";
+  process.env.ATTIO_COMPANY_AIRCALL_COUNTER_SLUG = "number_of_calls";
 });
 
 afterEach(() => {
@@ -56,6 +60,74 @@ describe("cron handlers", () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ success: true, callsFound: 0 });
       expect(mock.calls.some((call) => call.input.includes("api.aircall.io"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall touchpoint sync increments counters and notes only the company, not the person", async () => {
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("objects/people/records/person-1/entries")) {
+        return jsonResponse({ data: [{ list_id: { slug: "master_tam_list" } }] });
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({
+          data: [
+            {
+              id: { record_id: "person-1" },
+              values: {
+                associated_deals: [],
+                company: [{ target_record_id: "company-1" }],
+                name: [{ full_name: "Ada Lovelace" }],
+              },
+            },
+          ],
+        });
+      }
+      if (url.includes("objects/people/records/person-1")) {
+        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { values: { number_of_calls: [] } } });
+      }
+      if (url.includes("objects/companies/records/company-1")) {
+        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { values: { number_of_calls: [] } } });
+      }
+      if (url.includes("/notes")) return jsonResponse({});
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+15555550123",
+              started_at: Math.floor(Date.now() / 1000) - 120,
+              ended_at: Math.floor(Date.now() / 1000) - 60,
+              duration: 42,
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await aircallSync(cronRequest());
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ success: true, callsFound: 1, processed: 1 });
+
+      const noteCalls = mock.calls.filter((call) => call.input.includes("/notes"));
+      expect(noteCalls).toHaveLength(1);
+      expect(String(noteCalls[0]?.init?.body)).toContain('"parent_object":"companies"');
+
+      const personPatchCalls = mock.calls.filter(
+        (call) => call.input.includes("objects/people/records/person-1") && call.init?.method === "PATCH",
+      );
+      expect(personPatchCalls).toHaveLength(1);
+      const companyPatchCalls = mock.calls.filter(
+        (call) => call.input.includes("objects/companies/records/company-1") && call.init?.method === "PATCH",
+      );
+      expect(companyPatchCalls).toHaveLength(1);
     } finally {
       mock.restore();
     }

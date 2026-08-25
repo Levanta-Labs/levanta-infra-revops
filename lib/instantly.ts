@@ -1,4 +1,4 @@
-import { requiredEnv } from "./env.ts";
+import { INSTANTLY_BASE, instantlyAuthHeader } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -7,9 +7,9 @@ import {
   stringValue,
 } from "./json.ts";
 
-const INSTANTLY_BASE = "https://api.instantly.ai/api/v2";
-
 export type InstantlyEmailType = "received" | "sent" | "scheduled" | "unknown";
+
+//Interfaces=======================================================================================
 
 export interface InstantlyEmail {
   readonly id: string;
@@ -22,6 +22,8 @@ export interface InstantlyEmail {
   readonly bodyText: string | null;
   readonly threadId: string | null;
 }
+
+//=================================================================================================
 
 function parseEmailType(value: unknown): InstantlyEmailType {
   if (value === 1 || value === 3) return "sent";
@@ -82,7 +84,7 @@ export async function fetchInstantlyEmails(
     if (startingAfter) url.searchParams.set("starting_after", startingAfter);
 
     const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${requiredEnv("INSTANTLY_API_KEY")}` },
+      headers: { Authorization: instantlyAuthHeader() },
     });
     const body = await responseJson(response);
     if (!response.ok) {

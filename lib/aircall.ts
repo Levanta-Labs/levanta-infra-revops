@@ -1,4 +1,4 @@
-import { requiredEnv } from "./env.ts";
+import { AIRCALL_BASE, aircallAuthHeader } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -8,7 +8,9 @@ import {
   stringValue,
 } from "./json.ts";
 
-const AIRCALL_BASE = "https://api.aircall.io/v1";
+//=====================================================================================================
+//Interfaces
+//=====================================================================================================
 
 export interface AircallTag {
   readonly name: string;
@@ -40,6 +42,8 @@ export interface AircallWebhook {
   readonly call: AircallCall;
 }
 
+
+
 function parseTag(value: unknown): AircallTag | null {
   if (!isJsonObject(value)) return null;
   const name = stringValue(value.name);
@@ -58,6 +62,10 @@ function contactEmail(contact: Record<string, unknown>): string | null {
   }
   return null;
 }
+
+//====================================================================================================
+//parce functions, turn aircall raw api pull into usable data
+//====================================================================================================
 
 function parseContact(value: unknown): AircallContact | null {
   if (!isJsonObject(value)) return null;
@@ -102,11 +110,6 @@ export function parseAircallWebhook(value: unknown): AircallWebhook {
   return { event, timestamp, token, call: parseAircallCall(value.data) };
 }
 
-function authHeader(): string {
-  const credentials = `${requiredEnv("AIRCALL_API_ID")}:${requiredEnv("AIRCALL_API_TOKEN")}`;
-  return `Basic ${Buffer.from(credentials).toString("base64")}`;
-}
-
 export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
   const calls: AircallCall[] = [];
   const first = new URL(`${AIRCALL_BASE}/calls`);
@@ -117,7 +120,7 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
   let nextUrl: string | null = first.toString();
 
   while (nextUrl) {
-    const response = await fetch(nextUrl, { headers: { Authorization: authHeader() } });
+    const response = await fetch(nextUrl, { headers: { Authorization: aircallAuthHeader() } });
     const body = await responseJson(response);
     if (!response.ok) {
       throw new Error(`Aircall API error ${response.status}: ${JSON.stringify(body)}`);

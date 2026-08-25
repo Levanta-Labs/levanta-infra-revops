@@ -1,4 +1,5 @@
 import { requiredEnv } from "./env.ts";
+import { ATTIO_BASE, attioHeaders } from "./endpoints.ts";
 import {
   arrayValue,
   isJsonObject,
@@ -8,8 +9,6 @@ import {
   stringValue,
   type JsonObject,
 } from "./json.ts";
-
-const ATTIO_BASE = "https://api.attio.com/v2";
 
 export const LISTS = {
   MASTER_TAM: "master_tam_list",
@@ -31,6 +30,8 @@ export const LEAD_SOURCE_LABELS = {
 export type Provider = keyof typeof PERSON_COUNTER_SLUGS;
 export type AttioObject = "people" | "companies" | "deals";
 
+//Interfaces==============================================================================================
+
 export interface AttioRecordReference {
   readonly target_object?: string;
   readonly target_record_id: string;
@@ -45,6 +46,9 @@ export interface AttioPerson {
     readonly company: readonly AttioRecordReference[];
     readonly name: readonly { readonly full_name: string | null }[];
   };
+  // Attio returns every attribute as an array, so a non-empty array means "has a value"
+  // regardless of the attribute's type. Used to fill only blanks and never overwrite.
+  readonly populatedAttributes: ReadonlySet<string>;
 }
 
 export interface PersonNameInput {
@@ -60,9 +64,11 @@ export interface CreatePersonValues {
   readonly name?: readonly PersonNameInput[];
 }
 
-export interface PatchPersonValues {
-  readonly lead_source: string;
+export interface PatchPersonValues extends CreatePersonValues {
+  readonly lead_source?: string;
 }
+
+//============================================================================================================
 
 export class AttioApiError extends Error {
   constructor(
@@ -73,13 +79,6 @@ export class AttioApiError extends Error {
     super(message);
     this.name = "AttioApiError";
   }
-}
-
-function attioHeaders(): HeadersInit {
-  return {
-    Authorization: `Bearer ${requiredEnv("ATTIO_API_KEY")}`,
-    "Content-Type": "application/json",
-  };
 }
 
 export async function attioFetch(path: string, options: RequestInit = {}): Promise<unknown> {
@@ -98,7 +97,12 @@ export async function attioFetch(path: string, options: RequestInit = {}): Promi
   return body;
 }
 
-function parseRecordReference(value: unknown): AttioRecordReference | null {
+//=============================================================================================================
+//parce functions, turns raw pull from attio (json) into usable data 
+//=============================================================================================================
+
+//#region helper functions
+function parseRecordReference(value: unknown): AttioRecordReference | null { 
   if (!isJsonObject(value)) return null;
   const recordId = stringValue(value.target_record_id);
   if (!recordId) return null;
@@ -114,6 +118,9 @@ function parseReferences(values: JsonObject, key: string): readonly AttioRecordR
     .filter((value): value is AttioRecordReference => value !== null);
 }
 
+//#endregion
+
+//#region master methode
 export function parseAttioPerson(value: unknown): AttioPerson {
   if (!isJsonObject(value)) throw new Error("Attio returned an invalid person record");
   const id = objectValue(value, "id");
@@ -128,6 +135,10 @@ export function parseAttioPerson(value: unknown): AttioPerson {
     })
     .filter((name): name is { readonly full_name: string | null } => name !== null);
 
+  const populatedAttributes = new Set(
+    Object.keys(values).filter((slug) => arrayValue(values, slug).length > 0),
+  );
+
   return {
     id: { record_id: recordId },
     values: {
@@ -135,8 +146,29 @@ export function parseAttioPerson(value: unknown): AttioPerson {
       company: parseReferences(values, "company"),
       name: names,
     },
+    populatedAttributes,
   };
 }
+
+/**
+ * Keeps only the candidate values whose attribute is currently blank on the person,
+ * so third-party data fills gaps without ever overwriting what Attio already holds.
+ */
+export function blankPersonValues(
+  person: AttioPerson,
+  candidate: PatchPersonValues,
+): PatchPersonValues {
+  const fillable: Record<string, unknown> = {};
+  for (const [slug, value] of Object.entries(candidate)) {
+    if (value === undefined) continue;
+    if (person.populatedAttributes.has(slug)) continue;
+    fillable[slug] = value;
+  }
+  return fillable as PatchPersonValues;
+}
+//#endregion
+
+//============================================================================================================
 
 function responseData(value: unknown): unknown {
   if (!isJsonObject(value) || !("data" in value)) {
@@ -144,6 +176,10 @@ function responseData(value: unknown): unknown {
   }
   return value.data;
 }
+
+//=============================================================================================================
+//          Match Data From Thrid Party Records To Record ID In Attio
+//=============================================================================================================
 
 async function findPerson(attribute: string, value: string | null): Promise<AttioPerson | null> {
   if (!value) return null;
@@ -168,9 +204,15 @@ export function findPersonByLinkedIn(profileUrl: string | null): Promise<AttioPe
   return findPerson("linkedin", profileUrl);
 }
 
+//=============================================================================================================
+
 export async function getPerson(personId: string): Promise<AttioPerson> {
   return parseAttioPerson(responseData(await attioFetch(`/objects/people/records/${personId}`)));
 }
+
+//============================================================================================================
+//push to attio
+//============================================================================================================
 
 export async function createPerson(values: CreatePersonValues): Promise<AttioPerson> {
   const response = await attioFetch("/objects/people/records", {
@@ -181,6 +223,7 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
 }
 
 export async function patchPerson(personId: string, values: PatchPersonValues): Promise<void> {
+  if (Object.keys(values).length === 0) return;
   await attioFetch(`/objects/people/records/${personId}`, {
     method: "PATCH",
     body: JSON.stringify({ data: { values } }),
@@ -305,4 +348,5 @@ export function personCompanyId(person: AttioPerson): string | null {
 
 export function companyCounterSlug(provider: Provider): string {
   return requiredEnv(`ATTIO_COMPANY_${provider.toUpperCase()}_COUNTER_SLUG`);
+
 }
