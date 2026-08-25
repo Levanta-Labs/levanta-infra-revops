@@ -107,7 +107,10 @@ A `401` from a cron route means the guard rejected the request, not that the fun
 states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in
 the project's environment variables, and adding it requires a redeploy before it reaches a running deployment.
 
-Secret confidentiality is enforced by a test: no diagnostic path may print a configured secret.
+Secret confidentiality is enforced by a test: no `[env]`, `[auth]`, or `[credential]` path may print a configured
+secret. Note that `[lookup]` and `[event]` lines do carry the business identifier being matched - an email address,
+a phone number, or a LinkedIn URL - because a miss is not actionable without it. Those are not credentials, but they
+are personal data in a retained log.
 
 ## Verification
 

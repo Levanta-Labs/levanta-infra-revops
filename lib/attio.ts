@@ -228,7 +228,7 @@ async function withAction<T>(action: string, run: () => Promise<T>): Promise<T> 
     console.log(`[action] ${action}`);
     return result;
   } catch (error) {
-    console.error(`[action] FAILED - ${action}: ${errorMessage(error)}`);
+    console.error(`[action] FAILED, did not happen - ${action}: ${errorMessage(error)}`);
     throw error;
   }
 }
@@ -251,7 +251,7 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
 export async function patchPerson(personId: string, values: PatchPersonValues): Promise<void> {
   const slugs = Object.keys(values);
   if (slugs.length === 0) {
-    console.log(`[action] person ${personId} not updated - every target attribute was already populated`);
+    console.log(`[action] person ${personId} not updated - no attributes needed writing`);
     return;
   }
   await withAction(`person ${personId} updated: ${slugs.join(", ")}`, () =>
@@ -278,9 +278,9 @@ export async function isPersonInList(personId: string, listSlug: string): Promis
 export async function addPersonToList(personId: string, listSlug: string): Promise<void> {
   await withAction(`person ${personId} added to list ${listSlug}`, () =>
     attioFetch(`/lists/${listSlug}/entries`, {
-    method: "PUT",
-    body: JSON.stringify({
-      data: { parent_record_id: personId, parent_object: "people", entry_values: {} },
+      method: "PUT",
+      body: JSON.stringify({
+        data: { parent_record_id: personId, parent_object: "people", entry_values: {} },
       }),
     }),
   );
@@ -344,7 +344,7 @@ export async function incrementCounter(
     );
     if (error instanceof AttioApiError && (error.status === 400 || error.status === 404)) {
       console.warn(
-        `[slug] Attio returned ${error.status} while incrementing ${JSON.stringify(attributeSlug)} on ${objectType} - either that record is gone or no such attribute exists on the ${objectType} object. Company counter slugs come from the ATTIO_COMPANY_*_COUNTER_SLUG values logged above.`,
+        `[slug] Attio returned ${error.status} while incrementing ${JSON.stringify(attributeSlug)} on ${objectType} - either that record is gone or no such attribute exists on the ${objectType} object. Counter slugs come from the ATTIO_PERSON_* and ATTIO_COMPANY_*_COUNTER_SLUG values logged above.`,
       );
     }
     throw error;
