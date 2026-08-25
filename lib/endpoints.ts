@@ -1,4 +1,4 @@
-import { optionalEnv, requiredEnv } from "./env.ts";
+import { optionalEnv, requiredEnv } from "./env.js";
 
 //Base URLs====================================================================================
 

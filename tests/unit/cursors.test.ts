@@ -6,8 +6,8 @@ import {
   initialCursor,
   isAfterCursor,
   saveSyncCursor,
-} from "../../lib/cursors.ts";
-import { installFetchMock, jsonResponse } from "./test-utils.ts";
+} from "../../lib/cursors.js";
+import { installFetchMock, jsonResponse } from "./test-utils.js";
 
 const originalUrl = process.env.SUPABASE_URL;
 const originalSecret = process.env.SUPABASE_SECRET_KEY;

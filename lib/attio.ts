@@ -1,5 +1,5 @@
-import { requiredEnv } from "./env.ts";
-import { ATTIO_BASE, attioHeaders } from "./endpoints.ts";
+import { requiredEnv } from "./env.js";
+import { ATTIO_BASE, attioHeaders } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
@@ -8,7 +8,7 @@ import {
   responseJson,
   stringValue,
   type JsonObject,
-} from "./json.ts";
+} from "./json.js";
 
 export const LISTS = {
   MASTER_TAM: "master_tam_list",

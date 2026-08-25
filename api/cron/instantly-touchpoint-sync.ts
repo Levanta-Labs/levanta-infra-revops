@@ -8,7 +8,7 @@ import {
   PERSON_COUNTER_SLUGS,
   personCompanyId,
   personDisplayName,
-} from "../../lib/attio.ts";
+} from "../../lib/attio.js";
 import {
   advanceCursor,
   advanceCursorTo,
@@ -16,10 +16,10 @@ import {
   isAfterCursor,
   saveSyncCursor,
   type CursorEvent,
-} from "../../lib/cursors.ts";
-import { isAuthorizedCron, json, serverError } from "../../lib/http.ts";
-import { fetchInstantlyEmails, type InstantlyEmail } from "../../lib/instantly.ts";
-import { errorMessage } from "../../lib/json.ts";
+} from "../../lib/cursors.js";
+import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
+import { fetchInstantlyEmails, type InstantlyEmail } from "../../lib/instantly.js";
+import { errorMessage } from "../../lib/json.js";
 
 const SYNC_KEY = "instantly-touchpoints";
 

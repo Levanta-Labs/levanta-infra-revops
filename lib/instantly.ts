@@ -1,11 +1,11 @@
-import { INSTANTLY_BASE, instantlyAuthHeader } from "./endpoints.ts";
+import { INSTANTLY_BASE, instantlyAuthHeader } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
   objectValue,
   responseJson,
   stringValue,
-} from "./json.ts";
+} from "./json.js";
 
 export type InstantlyEmailType = "received" | "sent" | "scheduled" | "unknown";
 

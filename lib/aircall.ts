@@ -1,4 +1,4 @@
-import { AIRCALL_BASE, aircallAuthHeader } from "./endpoints.ts";
+import { AIRCALL_BASE, aircallAuthHeader } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
@@ -6,7 +6,7 @@ import {
   objectValue,
   responseJson,
   stringValue,
-} from "./json.ts";
+} from "./json.js";
 
 //=====================================================================================================
 //Interfaces

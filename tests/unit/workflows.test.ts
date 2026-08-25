@@ -2,21 +2,21 @@ import { describe, expect, test } from "bun:test";
 import {
   buildCallHistorySummary,
   extractAircallFields,
-} from "../../api/aircall-interested.ts";
-import { aircallCursorEvent } from "../../api/cron/aircall-touchpoint-sync.ts";
-import { heyReachTouchpointEvents } from "../../api/cron/heyreach-touchpoint-sync.ts";
-import { instantlyCursorEvent } from "../../api/cron/instantly-touchpoint-sync.ts";
+} from "../../api/aircall-interested.js";
+import { aircallCursorEvent } from "../../api/cron/aircall-touchpoint-sync.js";
+import { heyReachTouchpointEvents } from "../../api/cron/heyreach-touchpoint-sync.js";
+import { instantlyCursorEvent } from "../../api/cron/instantly-touchpoint-sync.js";
 import {
   formatHeyReachThread,
   parseHeyReachInterestedWebhook,
-} from "../../api/heyreach-interested.ts";
+} from "../../api/heyreach-interested.js";
 import {
   formatInstantlyThread,
   parseInstantlyInterestedWebhook,
-} from "../../api/instantly-interested.ts";
-import { parseAircallCall } from "../../lib/aircall.ts";
-import { parseHeyReachConversation } from "../../lib/heyreach.ts";
-import { parseInstantlyEmail } from "../../lib/instantly.ts";
+} from "../../api/instantly-interested.js";
+import { parseAircallCall } from "../../lib/aircall.js";
+import { parseHeyReachConversation } from "../../lib/heyreach.js";
+import { parseInstantlyEmail } from "../../lib/instantly.js";
 
 describe("interested workflows", () => {
   test("extracts and formats an Aircall interaction deterministically", () => {

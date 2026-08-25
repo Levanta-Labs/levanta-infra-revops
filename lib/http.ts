@@ -1,5 +1,5 @@
-import { optionalEnv } from "./env.ts";
-import { errorMessage } from "./json.ts";
+import { optionalEnv } from "./env.js";
+import { errorMessage } from "./json.js";
 
 export function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });

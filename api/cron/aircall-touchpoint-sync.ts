@@ -1,4 +1,4 @@
-import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.ts";
+import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.js";
 import {
   companyCounterSlug,
   createNote,
@@ -9,7 +9,7 @@ import {
   PERSON_COUNTER_SLUGS,
   personCompanyId,
   personDisplayName,
-} from "../../lib/attio.ts";
+} from "../../lib/attio.js";
 import {
   advanceCursor,
   advanceCursorTo,
@@ -17,9 +17,9 @@ import {
   isAfterCursor,
   saveSyncCursor,
   type CursorEvent,
-} from "../../lib/cursors.ts";
-import { errorMessage } from "../../lib/json.ts";
-import { isAuthorizedCron, json, serverError } from "../../lib/http.ts";
+} from "../../lib/cursors.js";
+import { errorMessage } from "../../lib/json.js";
+import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
 
 const SYNC_KEY = "aircall-touchpoints";
 

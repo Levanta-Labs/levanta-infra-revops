@@ -11,10 +11,10 @@ import {
   patchPerson,
   type CreatePersonValues,
   type PersonNameInput,
-} from "../lib/attio.ts";
-import { parseAircallWebhook, type AircallCall } from "../lib/aircall.ts";
-import { requiredCsvEnv, requiredEnv } from "../lib/env.ts";
-import { json, requestJson, serverError } from "../lib/http.ts";
+} from "../lib/attio.js";
+import { parseAircallWebhook, type AircallCall } from "../lib/aircall.js";
+import { requiredCsvEnv, requiredEnv } from "../lib/env.js";
+import { json, requestJson, serverError } from "../lib/http.js";
 
 export interface AircallInterestedFields {
   readonly email: string | null;

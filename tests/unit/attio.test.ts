@@ -7,8 +7,8 @@ import {
   incrementCounter,
   parseAttioPerson,
   patchPerson,
-} from "../../lib/attio.ts";
-import { installFetchMock, jsonResponse } from "./test-utils.ts";
+} from "../../lib/attio.js";
+import { installFetchMock, jsonResponse } from "./test-utils.js";
 
 const originalKey = process.env.ATTIO_API_KEY;
 
