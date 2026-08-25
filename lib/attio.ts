@@ -15,19 +15,13 @@ export const LISTS = {
   DNC: "dnc",
 } as const;
 
-export const PERSON_COUNTER_SLUGS = {
-  aircall: "number_of_calls",
-  instantly: "number_of_emails",
-  heyreach: "number_of_dms",
-} as const;
+export type Provider = "aircall" | "instantly" | "heyreach";
 
-export const LEAD_SOURCE_LABELS = {
+export const LEAD_SOURCE_LABELS: Record<Provider, string> = {
   aircall: "Aircall Cold Outreach",
   instantly: "Instantly Cold Outreach",
   heyreach: "HeyReach Cold Outreach",
-} as const;
-
-export type Provider = keyof typeof PERSON_COUNTER_SLUGS;
+};
 export type AttioObject = "people" | "companies" | "deals";
 
 //Interfaces==============================================================================================
@@ -355,11 +349,24 @@ export function personCompanyId(person: AttioPerson): string | null {
   return person.values.company[0]?.target_record_id ?? null;
 }
 
-export function companyCounterSlug(provider: Provider): string {
-  const envName = `ATTIO_COMPANY_${provider.toUpperCase()}_COUNTER_SLUG`;
+//Counter attribute slugs. Both scopes are configured rather than hardcoded: the Attio attribute names have already
+//diverged once (the Company HeyReach counter is not the same slug as the Person one), and renaming an attribute in
+//Attio should not require a redeploy. A missing value throws rather than defaulting, because a wrong slug would
+//silently write a counter nobody reads.
+
+function counterSlug(scope: "PERSON" | "COMPANY", provider: Provider): string {
+  const envName = `ATTIO_${scope}_${provider.toUpperCase()}_COUNTER_SLUG`;
   const slug = requiredEnv(envName);
   reportConfigValue(envName, slug);
   return slug;
+}
+
+export function personCounterSlug(provider: Provider): string {
+  return counterSlug("PERSON", provider);
+}
+
+export function companyCounterSlug(provider: Provider): string {
+  return counterSlug("COMPANY", provider);
 }
 
 /** Single accessor for the deal owner so the configured address is reported once, by domain only. */

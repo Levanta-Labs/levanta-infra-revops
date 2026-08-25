@@ -5,8 +5,8 @@ import {
   incrementCounter,
   isPersonInList,
   LISTS,
-  PERSON_COUNTER_SLUGS,
   personCompanyId,
+  personCounterSlug,
   personDisplayName,
 } from "../../lib/attio.js";
 import {
@@ -68,7 +68,7 @@ export async function processHeyReachTouchpoint(
   const title = `${event.message.subject ?? leadName} — ${event.message.createdAt}`;
   const body = event.message.body || "(no message content)";
   await createNote("people", personId, title, body);
-  await incrementCounter("people", personId, PERSON_COUNTER_SLUGS.heyreach);
+  await incrementCounter("people", personId, personCounterSlug("heyreach"));
 
   const companyId = personCompanyId(person);
   if (companyId) {

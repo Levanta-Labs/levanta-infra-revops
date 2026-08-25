@@ -5,8 +5,8 @@ import {
   incrementCounter,
   isPersonInList,
   LISTS,
-  PERSON_COUNTER_SLUGS,
   personCompanyId,
+  personCounterSlug,
   personDisplayName,
 } from "../../lib/attio.js";
 import {
@@ -40,7 +40,7 @@ export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise
   const body = email.bodyText ?? "(no content)";
   const title = `${subject} — ${email.timestampEmail}`;
   await createNote("people", personId, title, body);
-  await incrementCounter("people", personId, PERSON_COUNTER_SLUGS.instantly);
+  await incrementCounter("people", personId, personCounterSlug("instantly"));
 
   const companyId = personCompanyId(person);
   if (companyId) {

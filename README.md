@@ -32,10 +32,16 @@ The Vercel functions handle two workflows:
 | --- | --- | --- |
 | `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
-| `/api/heyreach-interested` | Zapier relay | A lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
+| `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
 | `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+
+All three interested webhooks are configured directly in the provider, pointed at the production host
+`https://levanta-crm-overhaul.vercel.app`. Instantly and HeyReach authenticate with an `x-webhook-secret` custom
+header whose value must match the corresponding environment variable. Aircall instead sends its own issued token
+inside the payload, so it needs no custom header. Point providers at the production hostname, never at a
+deployment-specific URL, which is pinned to a single deployment.
 
 The HeyReach integration uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints. Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
 
@@ -47,16 +53,19 @@ Keep credentials in `.env.local` for local development and configure the same va
 | --- | --- |
 | `ATTIO_API_KEY` | Attio API token with record, list-entry, and note permissions |
 | `ATTIO_DEFAULT_DEAL_OWNER` | Workspace member email used when creating a Deal |
-| `ATTIO_COMPANY_AIRCALL_COUNTER_SLUG` | Confirmed Company counter slug for Aircall calls |
-| `ATTIO_COMPANY_INSTANTLY_COUNTER_SLUG` | Confirmed Company counter slug for Instantly emails |
-| `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Confirmed Company counter slug for HeyReach DMs |
+| `ATTIO_PERSON_AIRCALL_COUNTER_SLUG` | Person counter slug for Aircall calls |
+| `ATTIO_PERSON_INSTANTLY_COUNTER_SLUG` | Person counter slug for Instantly emails |
+| `ATTIO_PERSON_HEYREACH_COUNTER_SLUG` | Person counter slug for HeyReach DMs |
+| `ATTIO_COMPANY_AIRCALL_COUNTER_SLUG` | Company counter slug for Aircall calls |
+| `ATTIO_COMPANY_INSTANTLY_COUNTER_SLUG` | Company counter slug for Instantly emails |
+| `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
-| `AIRCALL_WEBHOOK_TOKEN` | Token Aircall includes in the webhook JSON payload |
+| `AIRCALL_WEBHOOK_TOKEN` | Token Aircall issues and includes in the webhook JSON payload; copy it from Aircall rather than choosing a value |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
 | `INSTANTLY_API_KEY` | Instantly v2 API key with `emails:read` or broader scope |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key |
-| `HEYREACH_WEBHOOK_SECRET` | Secret configured by the Zapier relay as `x-webhook-secret` |
+| `HEYREACH_WEBHOOK_SECRET` | Secret configured on the HeyReach webhook as the `x-webhook-secret` custom header |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Server-side Supabase secret key; never expose it to a client |
 | `CRON_SECRET` | Vercel Cron authorization secret |
@@ -86,7 +95,7 @@ identified from the Vercel runtime logs without redeploying instrumented code. S
 | `[config]` | The full value of a non-secret identifier: attribute slugs, `SUPABASE_URL`, the parsed `AIRCALL_INTERESTED_TAGS` list, and which Supabase key variable was used. `ATTIO_DEFAULT_DEAL_OWNER` is reported by domain only |
 | `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
 | `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
-| `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
+| `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_PERSON_*` or `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
 
 A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line
 states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in

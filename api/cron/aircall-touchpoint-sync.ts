@@ -6,8 +6,8 @@ import {
   incrementCounter,
   isPersonInList,
   LISTS,
-  PERSON_COUNTER_SLUGS,
   personCompanyId,
+  personCounterSlug,
   personDisplayName,
 } from "../../lib/attio.js";
 import {
@@ -42,7 +42,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
   const durationMinutes = Math.round(call.duration / 60);
   const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${durationMinutes} min`;
   const title = `Aircall Touchpoint — ${timestamp}`;
-  await incrementCounter("people", personId, PERSON_COUNTER_SLUGS.aircall);
+  await incrementCounter("people", personId, personCounterSlug("aircall"));
 
   const companyId = personCompanyId(person);
   if (companyId) {
