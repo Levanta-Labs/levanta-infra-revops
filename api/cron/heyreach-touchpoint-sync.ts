@@ -59,9 +59,19 @@ export async function processHeyReachTouchpoint(
   event: HeyReachTouchpointEvent,
 ): Promise<ProcessingOutcome> {
   const person = await findPersonByLinkedIn(event.conversation.profile.profileUrl);
-  if (!person) return "skipped";
+  if (!person) {
+    console.log(
+      `[event] heyreach message ${event.cursor.id}: skipped - no Attio person has ${event.conversation.profile.profileUrl}`,
+    );
+    return "skipped";
+  }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) return "not_tam";
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
+    console.log(
+      `[event] heyreach message ${event.cursor.id}: skipped - person ${personId} is not on the Master TAM list`,
+    );
+    return "not_tam";
+  }
 
   const profile = event.conversation.profile;
   const leadName = `${profile.firstName ?? ""} ${profile.lastName ?? ""}`.trim() || "HeyReach conversation";
@@ -110,6 +120,9 @@ export async function GET(request: Request): Promise<Response> {
 
     if (!processingError) cursor = advanceCursorTo(cursor, upperBoundMs);
     await saveSyncCursor(cursor);
+    console.log(
+      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, cursor now ${new Date(cursor.timestampMs).toISOString()}${processingError ? ` - STOPPED at ${processingError}` : ""}`,
+    );
     const body = {
       success: processingError === null,
       conversationsScanned: conversations.length,

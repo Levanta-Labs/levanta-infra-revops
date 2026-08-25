@@ -83,8 +83,12 @@ export async function POST(request: Request): Promise<Response> {
   try {
     const fields = parseInstantlyInterestedWebhook(await requestJson(request));
     if (fields.eventType !== "lead_interested") {
+      console.log(
+        `[route] instantly-interested: skipped - event ${JSON.stringify(fields.eventType)} is not "lead_interested"`,
+      );
       return json({ skipped: true, reason: "event not tracked" });
     }
+    console.log(`[route] instantly-interested: handling lead_interested for ${fields.email ?? "an unknown address"}`);
 
     let person = await findPersonByEmail(fields.email);
     if (!person) person = await createPerson(personValues(fields));
@@ -104,6 +108,9 @@ export async function POST(request: Request): Promise<Response> {
       blankPersonValues(person, { ...personValues(fields), lead_source: title }),
     );
     await addPersonToList(personId, LISTS.DNC);
+    console.log(
+      `[route] instantly-interested: completed - person ${personId}, deal ${dealId}, ${emails.length} email(s) summarised`,
+    );
     return json({ success: true, personId, dealId });
   } catch (error) {
     return serverError("Instantly interested webhook error", error);

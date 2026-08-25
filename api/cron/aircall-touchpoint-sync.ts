@@ -31,12 +31,21 @@ export function aircallCursorEvent(call: AircallCall): CursorEvent {
 
 export async function processAircallTouchpoint(call: AircallCall): Promise<ProcessingOutcome> {
   const phone = call.rawDigits;
-  if (!phone) return "skipped";
+  if (!phone) {
+    console.log(`[event] aircall call ${call.id}: skipped - the call carried no phone number`);
+    return "skipped";
+  }
 
   const person = await findPersonByPhone(phone);
-  if (!person) return "skipped";
+  if (!person) {
+    console.log(`[event] aircall call ${call.id}: skipped - no Attio person has phone ${phone}`);
+    return "skipped";
+  }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) return "not_tam";
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
+    console.log(`[event] aircall call ${call.id}: skipped - person ${personId} is not on the Master TAM list`);
+    return "not_tam";
+  }
 
   const timestamp = new Date((call.endedAt ?? call.startedAt) * 1_000).toISOString();
   const durationMinutes = Math.round(call.duration / 60);
@@ -85,6 +94,9 @@ export async function GET(request: Request): Promise<Response> {
 
     if (!processingError) cursor = advanceCursorTo(cursor, upperBoundMs);
     await saveSyncCursor(cursor);
+    console.log(
+      `[run] aircall sync: ${calls.length} call(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, cursor now ${new Date(cursor.timestampMs).toISOString()}${processingError ? ` - STOPPED at ${processingError}` : ""}`,
+    );
     const body = {
       success: processingError === null,
       callsFound: calls.length,

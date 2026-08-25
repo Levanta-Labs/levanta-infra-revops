@@ -84,11 +84,30 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const interestedTags = requiredCsvEnv("AIRCALL_INTERESTED_TAGS").map((tag) => tag.toLowerCase());
-    const tracked = webhook.call.tags.some((tag) => interestedTags.includes(tag.name.toLowerCase()));
-    if (!tracked) return json({ skipped: true, reason: "tag not tracked" });
+    const callTags = webhook.call.tags.map((tag) => tag.name);
+    const matched = callTags.filter((tag) => interestedTags.includes(tag.toLowerCase()));
+
+    if (callTags.length === 0) {
+      console.log(
+        `[route] aircall-interested: skipped call ${webhook.call.id} - no tags found on the call (interested tags: ${JSON.stringify(interestedTags)})`,
+      );
+      return json({ skipped: true, reason: "tag not found" });
+    }
+    if (matched.length === 0) {
+      console.log(
+        `[route] aircall-interested: skipped call ${webhook.call.id} - tags not interested: ${JSON.stringify(callTags)} (interested tags: ${JSON.stringify(interestedTags)})`,
+      );
+      return json({ skipped: true, reason: "tag not tracked", tags: callTags });
+    }
+    console.log(
+      `[route] aircall-interested: call ${webhook.call.id} matched interested tag(s) ${JSON.stringify(matched)}`,
+    );
 
     const fields = extractAircallFields(webhook.call, webhook.timestamp);
     if (!fields.email && !fields.phone) {
+      console.warn(
+        `[route] aircall-interested: rejected call ${webhook.call.id} - payload carried neither an email nor a phone number, so no person can be matched or created`,
+      );
       return json({ error: "No email or phone in payload" }, 422);
     }
 
@@ -112,6 +131,7 @@ export async function POST(request: Request): Promise<Response> {
     );
     await addPersonToList(personId, LISTS.DNC);
 
+    console.log(`[route] aircall-interested: completed - person ${personId}, deal ${dealId}`);
     return json({ success: true, personId, dealId });
   } catch (error) {
     return serverError("Aircall interested webhook error", error);

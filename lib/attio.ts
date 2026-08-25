@@ -2,6 +2,7 @@ import { reportConfigEmail, reportConfigValue, requiredEnv } from "./env.js";
 import { ATTIO_BASE, attioHeaders, credentialHint } from "./endpoints.js";
 import {
   arrayValue,
+  errorMessage,
   isJsonObject,
   numberValue,
   objectValue,
@@ -176,14 +177,23 @@ function responseData(value: unknown): unknown {
 //=============================================================================================================
 
 async function findPerson(attribute: string, value: string | null): Promise<AttioPerson | null> {
-  if (!value) return null;
+  if (!value) {
+    console.log(`[lookup] person by ${attribute}: skipped - no value to search for`);
+    return null;
+  }
   const response = await attioFetch("/objects/people/records/query", {
     method: "POST",
     body: JSON.stringify({ filter: { [attribute]: value }, limit: 1 }),
   });
   const data = responseData(response);
   if (!Array.isArray(data)) throw new Error("Attio person query returned invalid data");
-  return data[0] === undefined ? null : parseAttioPerson(data[0]);
+  if (data[0] === undefined) {
+    console.log(`[lookup] person by ${attribute} ${JSON.stringify(value)}: no match`);
+    return null;
+  }
+  const person = parseAttioPerson(data[0]);
+  console.log(`[lookup] person by ${attribute} ${JSON.stringify(value)}: matched ${person.id.record_id}`);
+  return person;
 }
 
 export function findPersonByEmail(email: string | null): Promise<AttioPerson | null> {
@@ -206,42 +216,74 @@ export async function getPerson(personId: string): Promise<AttioPerson> {
 
 //============================================================================================================
 //push to attio
+//
+//Every write reports what it did, so a run can be read back action by action from the logs. A failure names the
+//action before the error propagates, which is the difference between "the sync broke" and "the note on person X
+//could not be created". Record ids are logged; record contents are not.
 //============================================================================================================
 
+async function withAction<T>(action: string, run: () => Promise<T>): Promise<T> {
+  try {
+    const result = await run();
+    console.log(`[action] ${action}`);
+    return result;
+  } catch (error) {
+    console.error(`[action] FAILED - ${action}: ${errorMessage(error)}`);
+    throw error;
+  }
+}
+
 export async function createPerson(values: CreatePersonValues): Promise<AttioPerson> {
-  const response = await attioFetch("/objects/people/records", {
-    method: "POST",
-    body: JSON.stringify({ data: { values } }),
-  });
-  return parseAttioPerson(responseData(response));
+  try {
+    const response = await attioFetch("/objects/people/records", {
+      method: "POST",
+      body: JSON.stringify({ data: { values } }),
+    });
+    const person = parseAttioPerson(responseData(response));
+    console.log(`[action] person created: ${person.id.record_id}`);
+    return person;
+  } catch (error) {
+    console.error(`[action] FAILED - person could not be created: ${errorMessage(error)}`);
+    throw error;
+  }
 }
 
 export async function patchPerson(personId: string, values: PatchPersonValues): Promise<void> {
-  if (Object.keys(values).length === 0) return;
-  await attioFetch(`/objects/people/records/${personId}`, {
-    method: "PATCH",
-    body: JSON.stringify({ data: { values } }),
-  });
+  const slugs = Object.keys(values);
+  if (slugs.length === 0) {
+    console.log(`[action] person ${personId} not updated - every target attribute was already populated`);
+    return;
+  }
+  await withAction(`person ${personId} updated: ${slugs.join(", ")}`, () =>
+    attioFetch(`/objects/people/records/${personId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { values } }),
+    }),
+  );
 }
 
 export async function isPersonInList(personId: string, listSlug: string): Promise<boolean> {
   const response = await attioFetch(`/objects/people/records/${personId}/entries`);
   const data = responseData(response);
   if (!Array.isArray(data)) throw new Error("Attio list entries response is invalid");
-  return data.some((entry) => {
+  const member = data.some((entry) => {
     if (!isJsonObject(entry)) return false;
     const listId = objectValue(entry, "list_id");
     return stringValue(listId?.slug) === listSlug || stringValue(entry.list_api_slug) === listSlug;
   });
+  console.log(`[lookup] person ${personId} ${member ? "is" : "is NOT"} on list ${listSlug}`);
+  return member;
 }
 
 export async function addPersonToList(personId: string, listSlug: string): Promise<void> {
-  await attioFetch(`/lists/${listSlug}/entries`, {
+  await withAction(`person ${personId} added to list ${listSlug}`, () =>
+    attioFetch(`/lists/${listSlug}/entries`, {
     method: "PUT",
     body: JSON.stringify({
       data: { parent_record_id: personId, parent_object: "people", entry_values: {} },
+      }),
     }),
-  });
+  );
 }
 
 export async function createNote(
@@ -250,18 +292,20 @@ export async function createNote(
   title: string,
   content: string,
 ): Promise<void> {
-  await attioFetch("/notes", {
-    method: "POST",
-    body: JSON.stringify({
-      data: {
-        parent_object: parentObject,
-        parent_record_id: parentRecordId,
-        title,
-        format: "markdown",
-        content,
-      },
+  await withAction(`note added to ${parentObject} ${parentRecordId} (${JSON.stringify(title)})`, () =>
+    attioFetch("/notes", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          parent_object: parentObject,
+          parent_record_id: parentRecordId,
+          title,
+          format: "markdown",
+          content,
+        },
+      }),
     }),
-  });
+  );
 }
 
 function parseCounterValue(value: unknown, attributeSlug: string): number {
@@ -291,7 +335,13 @@ export async function incrementCounter(
       method: "PATCH",
       body: JSON.stringify({ data: { values: { [attributeSlug]: current + 1 } } }),
     });
+    console.log(
+      `[action] counter ${attributeSlug} on ${objectType} ${recordId}: ${current} -> ${current + 1}`,
+    );
   } catch (error) {
+    console.error(
+      `[action] FAILED - counter ${attributeSlug} on ${objectType} ${recordId}: ${errorMessage(error)}`,
+    );
     if (error instanceof AttioApiError && (error.status === 400 || error.status === 404)) {
       console.warn(
         `[slug] Attio returned ${error.status} while incrementing ${JSON.stringify(attributeSlug)} on ${objectType} - either that record is gone or no such attribute exists on the ${objectType} object. Company counter slugs come from the ATTIO_COMPANY_*_COUNTER_SLUG values logged above.`,
@@ -307,38 +357,51 @@ export async function ensureInterestedDeal(
   ownerEmail: string,
 ): Promise<string> {
   const existing = person.values.associated_deals[0]?.target_record_id;
-  if (existing) return existing;
+  if (existing) {
+    console.log(`[action] deal reused: ${existing} already associated with person ${person.id.record_id}`);
+    return existing;
+  }
 
   const companyId = person.values.company[0]?.target_record_id;
-  const response = await attioFetch("/objects/deals/records", {
-    method: "POST",
-    body: JSON.stringify({
-      data: {
-        values: {
-          name: dealNameHint || "New Interested Deal",
-          stage: "Interested",
-          owner: ownerEmail,
-          associated_people: [
-            { target_object: "people", target_record_id: person.id.record_id },
-          ],
-          ...(companyId
-            ? {
-                associated_company: {
-                  target_object: "companies",
-                  target_record_id: companyId,
-                },
-              }
-            : {}),
+  try {
+    const response = await attioFetch("/objects/deals/records", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          values: {
+            name: dealNameHint || "New Interested Deal",
+            stage: "Interested",
+            owner: ownerEmail,
+            associated_people: [
+              { target_object: "people", target_record_id: person.id.record_id },
+            ],
+            ...(companyId
+              ? {
+                  associated_company: {
+                    target_object: "companies",
+                    target_record_id: companyId,
+                  },
+                }
+              : {}),
+          },
         },
-      },
-    }),
-  });
-  const data = responseData(response);
-  if (!isJsonObject(data)) throw new Error("Attio deal response is invalid");
-  const id = objectValue(data, "id");
-  const dealId = stringValue(id?.record_id);
-  if (!dealId) throw new Error("Attio deal response is missing record_id");
-  return dealId;
+      }),
+    });
+    const data = responseData(response);
+    if (!isJsonObject(data)) throw new Error("Attio deal response is invalid");
+    const id = objectValue(data, "id");
+    const dealId = stringValue(id?.record_id);
+    if (!dealId) throw new Error("Attio deal response is missing record_id");
+    console.log(
+      `[action] deal created: ${dealId} for person ${person.id.record_id}${companyId ? ` and company ${companyId}` : " with no associated company"}`,
+    );
+    return dealId;
+  } catch (error) {
+    console.error(
+      `[action] FAILED - deal could not be created for person ${person.id.record_id}: ${errorMessage(error)}`,
+    );
+    throw error;
+  }
 }
 
 export function personDisplayName(person: AttioPerson): string | null {

@@ -30,11 +30,20 @@ export function instantlyCursorEvent(email: InstantlyEmail): CursorEvent {
 }
 
 export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise<ProcessingOutcome> {
-  if (!email.leadEmail) return "skipped";
+  if (!email.leadEmail) {
+    console.log(`[event] instantly email ${email.id}: skipped - no lead email on the record`);
+    return "skipped";
+  }
   const person = await findPersonByEmail(email.leadEmail);
-  if (!person) return "skipped";
+  if (!person) {
+    console.log(`[event] instantly email ${email.id}: skipped - no Attio person has ${email.leadEmail}`);
+    return "skipped";
+  }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) return "not_tam";
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
+    console.log(`[event] instantly email ${email.id}: skipped - person ${personId} is not on the Master TAM list`);
+    return "not_tam";
+  }
 
   const subject = email.subject ?? "(no subject)";
   const body = email.bodyText ?? "(no content)";
@@ -87,6 +96,9 @@ export async function GET(request: Request): Promise<Response> {
 
     if (!processingError) cursor = advanceCursorTo(cursor, upperBoundMs);
     await saveSyncCursor(cursor);
+    console.log(
+      `[run] instantly sync: ${emails.length} email(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, cursor now ${new Date(cursor.timestampMs).toISOString()}${processingError ? ` - STOPPED at ${processingError}` : ""}`,
+    );
     const body = {
       success: processingError === null,
       emailsFound: emails.length,

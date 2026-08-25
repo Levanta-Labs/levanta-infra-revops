@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { POST as aircallInterested } from "../../api/aircall-interested.js";
 import { POST as instantlyInterested } from "../../api/instantly-interested.js";
 import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
@@ -7,6 +8,8 @@ const envNames = [
   "ATTIO_DEFAULT_DEAL_OWNER",
   "INSTANTLY_API_KEY",
   "INSTANTLY_WEBHOOK_SECRET",
+  "AIRCALL_WEBHOOK_TOKEN",
+  "AIRCALL_INTERESTED_TAGS",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
@@ -15,6 +18,8 @@ beforeEach(() => {
   process.env.ATTIO_DEFAULT_DEAL_OWNER = "owner@example.com";
   process.env.INSTANTLY_API_KEY = "instantly-key";
   process.env.INSTANTLY_WEBHOOK_SECRET = "hook-secret";
+  process.env.AIRCALL_WEBHOOK_TOKEN = "aircall-token";
+  process.env.AIRCALL_INTERESTED_TAGS = "Interested, Booked";
 });
 
 afterEach(() => {
@@ -137,6 +142,56 @@ describe("interested webhook handlers", () => {
     } finally {
       mock.restore();
     }
+  });
+
+  test("separates a call with no tags from a call whose tags are not interested", async () => {
+    const call = (tags: readonly string[]) => ({
+      event: "call.tagged",
+      timestamp: 1_700_000_000,
+      token: "aircall-token",
+      data: {
+        id: 4242,
+        status: "done",
+        direction: "inbound",
+        raw_digits: "+15551234567",
+        started_at: 1_700_000_000,
+        ended_at: 1_700_000_060,
+        duration: 60,
+        tags: tags.map((name) => ({ name })),
+      },
+    });
+    const request = (body: unknown) =>
+      new Request("https://example.com/api/aircall-interested", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    const untagged = await aircallInterested(request(call([])));
+    expect(await untagged.json()).toEqual({ skipped: true, reason: "tag not found" });
+
+    const wrongTags = await aircallInterested(request(call(["Voicemail", "Follow up"])));
+    expect(await wrongTags.json()).toEqual({
+      skipped: true,
+      reason: "tag not tracked",
+      tags: ["Voicemail", "Follow up"],
+    });
+  });
+
+  test("rejects an Aircall payload carrying a bad token before reading any tag", async () => {
+    const response = await aircallInterested(
+      new Request("https://example.com/api/aircall-interested", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          event: "call.tagged",
+          timestamp: 1,
+          token: "wrong-token",
+          data: { id: 1, status: "done", started_at: 1, duration: 0, tags: [] },
+        }),
+      }),
+    );
+    expect(response.status).toBe(401);
   });
 
   test("adds the person to the DNC list", async () => {

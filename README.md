@@ -84,10 +84,11 @@ All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process m
 
 The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the table. Keep it in Vercel server-side environment variables only.
 
-## Diagnosing configuration from the logs
+## Reading a run from the logs
 
-Every environment read is reported to the console once per invocation, so a misconfigured deployment can be
-identified from the Vercel runtime logs without redeploying instrumented code. Secret values are never logged.
+Every environment read and every write is reported to the console, so a misconfigured deployment can be identified,
+and a completed run replayed action by action, from the Vercel runtime logs without redeploying instrumented code.
+Secret values are never logged.
 
 | Prefix | Meaning |
 | --- | --- |
@@ -96,6 +97,11 @@ identified from the Vercel runtime logs without redeploying instrumented code. S
 | `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
 | `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
 | `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_PERSON_*` or `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
+| `[route]` | The decision a webhook made before touching Attio: which Aircall tag matched, that a call carried no tags at all, that the tags present were not interested ones, that an Instantly event was not `lead_interested`, or that a payload had no email and no phone. Ends with a completion line naming the person and deal |
+| `[lookup]` | Each person search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list |
+| `[action]` | Each write and its outcome: person created, person updated with the attribute list, person left untouched because every target attribute was already populated, deal created, deal reused, note added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
+| `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list |
+| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, or off-TAM, the new cursor, and the event it stopped at if it stopped early |
 
 A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line
 states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in
@@ -119,7 +125,20 @@ Run opt-in, read-only smoke tests against configured live accounts:
 bun run test:live
 ```
 
-Live tests identify and read one small page from Supabase, Attio, Aircall, Instantly, and HeyReach. They do not create, update, stop, or delete anything, and they do not print returned account data.
+`bun test` sets `NODE_ENV=test`, and Bun skips `.env.local` in that environment, so the script passes
+`--env-file=.env.local` explicitly. Without it every live test fails on a missing variable rather than on anything
+it was meant to check.
+
+Live tests do not create, update, stop, or delete anything, and they do not print returned account data. They cover
+two kinds of failure:
+
+- **Credentials.** One small page is read from Supabase, Attio, Aircall, Instantly, and HeyReach, which proves each
+  key is accepted.
+- **Schema and configuration.** All six counter slugs are checked against the live Attio attribute list for the
+  people and companies objects, both list slugs against the workspace's lists, and `ATTIO_DEFAULT_DEAL_OWNER`
+  against the workspace members. A wrong slug or a renamed list is caught here rather than on the first touchpoint
+  that happens to reach it in production. `CRON_SECRET` and the three webhook secrets are checked for presence,
+  which is all that can be verified without a caller.
 
 ## Deployment
 
