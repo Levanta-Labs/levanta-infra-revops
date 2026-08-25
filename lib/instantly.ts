@@ -1,4 +1,4 @@
-import { INSTANTLY_BASE, instantlyAuthHeader } from "./endpoints.js";
+import { credentialHint, INSTANTLY_BASE, instantlyAuthHeader } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
@@ -88,7 +88,7 @@ export async function fetchInstantlyEmails(
     });
     const body = await responseJson(response);
     if (!response.ok) {
-      throw new Error(`Instantly API error ${response.status}: ${JSON.stringify(body)}`);
+      throw new Error(`Instantly API error ${response.status}: ${JSON.stringify(body)}${credentialHint("instantly", response.status)}`);
     }
     if (!isJsonObject(body)) throw new Error("Instantly emails response is invalid");
     emails.push(...arrayValue(body, "items").map(parseInstantlyEmail));

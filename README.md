@@ -75,6 +75,25 @@ All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process m
 
 The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the table. Keep it in Vercel server-side environment variables only.
 
+## Diagnosing configuration from the logs
+
+Every environment read is reported to the console once per invocation, so a misconfigured deployment can be
+identified from the Vercel runtime logs without redeploying instrumented code. Secret values are never logged.
+
+| Prefix | Meaning |
+| --- | --- |
+| `[env]` | Whether a variable is set, its length in characters, and whether stored surrounding whitespace had to be trimmed |
+| `[config]` | The full value of a non-secret identifier: attribute slugs, `SUPABASE_URL`, the parsed `AIRCALL_INTERESTED_TAGS` list, and which Supabase key variable was used. `ATTIO_DEFAULT_DEAL_OWNER` is reported by domain only |
+| `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
+| `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
+| `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
+
+A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line
+states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in
+the project's environment variables, and adding it requires a redeploy before it reaches a running deployment.
+
+Secret confidentiality is enforced by a test: no diagnostic path may print a configured secret.
+
 ## Verification
 
 Run the compiler and isolated unit suite:

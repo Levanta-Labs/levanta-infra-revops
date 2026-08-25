@@ -3,6 +3,7 @@ import {
   blankPersonValues,
   createNote,
   createPerson,
+  defaultDealOwner,
   ensureInterestedDeal,
   findPersonByEmail,
   findPersonByLinkedIn,
@@ -12,7 +13,6 @@ import {
   type CreatePersonValues,
   type PersonNameInput,
 } from "../lib/attio.js";
-import { requiredEnv } from "../lib/env.js";
 import {
   fetchHeyReachConversations,
   stopLeadInActiveCampaigns,
@@ -88,7 +88,7 @@ export async function POST(request: Request): Promise<Response> {
     const dealId = await ensureInterestedDeal(
       person,
       dealName(fields),
-      requiredEnv("ATTIO_DEFAULT_DEAL_OWNER"),
+      defaultDealOwner(),
     );
     const conversations = fields.profileUrl
       ? await fetchHeyReachConversations({ profileUrl: fields.profileUrl })

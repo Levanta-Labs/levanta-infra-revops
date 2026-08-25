@@ -1,4 +1,4 @@
-import { HEYREACH_BASE, heyreachHeaders } from "./endpoints.js";
+import { credentialHint, HEYREACH_BASE, heyreachHeaders } from "./endpoints.js";
 import {
   arrayValue,
   booleanValue,
@@ -114,7 +114,7 @@ export async function fetchHeyReachConversations(
     });
     const body = await responseJson(response);
     if (!response.ok) {
-      throw new Error(`HeyReach API error ${response.status}: ${JSON.stringify(body)}`);
+      throw new Error(`HeyReach API error ${response.status}: ${JSON.stringify(body)}${credentialHint("heyreach", response.status)}`);
     }
     if (!isJsonObject(body)) throw new Error("HeyReach conversations response is invalid");
     conversations.push(...arrayValue(body, "items").map(parseHeyReachConversation));
@@ -170,7 +170,7 @@ export async function stopLeadInActiveCampaigns(
   });
   const body = await responseJson(response);
   if (!response.ok) {
-    throw new Error(`HeyReach campaign lookup failed ${response.status}: ${JSON.stringify(body)}`);
+    throw new Error(`HeyReach campaign lookup failed ${response.status}: ${JSON.stringify(body)}${credentialHint("heyreach", response.status)}`);
   }
   if (!isJsonObject(body)) throw new Error("HeyReach campaigns response is invalid");
   const activeCampaignStatuses = new Set(["IN_PROGRESS", "PAUSED", "STARTING"]);
@@ -191,7 +191,7 @@ export async function stopLeadInActiveCampaigns(
     });
     if (!stopResponse.ok) {
       throw new Error(
-        `HeyReach failed to stop lead in campaign ${campaign.campaignId} (${stopResponse.status}): ${await stopResponse.text()}`,
+        `HeyReach failed to stop lead in campaign ${campaign.campaignId} (${stopResponse.status}): ${await stopResponse.text()}${credentialHint("heyreach", stopResponse.status)}`,
       );
     }
   }

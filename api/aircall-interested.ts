@@ -3,6 +3,7 @@ import {
   blankPersonValues,
   createNote,
   createPerson,
+  defaultDealOwner,
   ensureInterestedDeal,
   findPersonByEmail,
   findPersonByPhone,
@@ -99,7 +100,7 @@ export async function POST(request: Request): Promise<Response> {
     const dealId = await ensureInterestedDeal(
       person,
       dealName(fields),
-      requiredEnv("ATTIO_DEFAULT_DEAL_OWNER"),
+      defaultDealOwner(),
     );
     const history = buildCallHistorySummary(fields);
     const title = LEAD_SOURCE_LABELS.aircall;

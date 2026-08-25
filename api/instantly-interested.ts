@@ -3,6 +3,7 @@ import {
   blankPersonValues,
   createNote,
   createPerson,
+  defaultDealOwner,
   ensureInterestedDeal,
   findPersonByEmail,
   LEAD_SOURCE_LABELS,
@@ -11,7 +12,6 @@ import {
   type CreatePersonValues,
   type PersonNameInput,
 } from "../lib/attio.js";
-import { requiredEnv } from "../lib/env.js";
 import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.js";
 import { fetchInstantlyEmails, type InstantlyEmail } from "../lib/instantly.js";
 import { isJsonObject, stringValue } from "../lib/json.js";
@@ -92,7 +92,7 @@ export async function POST(request: Request): Promise<Response> {
     const dealId = await ensureInterestedDeal(
       person,
       dealName(fields),
-      requiredEnv("ATTIO_DEFAULT_DEAL_OWNER"),
+      defaultDealOwner(),
     );
     const emails = await fetchInstantlyEmails({ leadEmail: fields.email });
     const history = formatInstantlyThread(emails, fields.campaignName);
