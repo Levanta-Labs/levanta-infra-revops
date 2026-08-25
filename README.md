@@ -24,7 +24,19 @@ The project requires Bun `1.3.13`. Configure local integrations by copying `.env
 The Vercel functions handle two workflows:
 
 1. Interested webhooks find or create an Attio Person, ensure an Interested Deal exists, write source-history notes, set Lead Source, and add the Person to the DNC list.
-2. Five-minute cron jobs poll each provider for new touchpoints. They process only People on the Master TAM list, mirror notes to associated Companies, increment the configured counters, and persist cursor progress in Supabase.
+2. Five-minute cron jobs poll each provider for new touchpoints. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
+
+The three syncs do not write the same records, by design:
+
+| Sync | Person note | Person counter | Company note | Company counter |
+| --- | --- | --- | --- | --- |
+| Instantly | yes | yes | yes | yes |
+| HeyReach | yes | yes | yes | yes |
+| Aircall | **no** | yes | yes | yes |
+
+An Aircall touchpoint deliberately writes no Person note, because the call and its recording already live in Aircall
+and the Person only needs the count. The note exists on the Company as the roll-up view. A consequence worth knowing:
+an Aircall touchpoint for a Person with no associated Company records only the counter increment.
 
 ## Webhook and cron routes
 
@@ -82,6 +94,23 @@ All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process m
 
 `cursor_timestamp` is the completed high-water mark. `cursor_value` contains a JSON array of event IDs at that exact timestamp, preventing events with identical timestamps from being lost or replayed. A missing row starts with a ten-minute lookback and is created automatically. `last_updated_at` is refreshed on every upsert.
 
+### A touchpoint that fails partway through
+
+One touchpoint is three or four separate Attio writes, and Attio offers neither a transaction nor an atomic
+increment, so a failure can leave some of them committed. The cursor advances past a failed event anyway, and the run
+carries on with the rest of the window.
+
+That is deliberate. Retrying the event would replay the writes that already succeeded, duplicating a note and
+double-counting a counter, and an event that fails for a permanent reason would block every later touchpoint on every
+future run. Passing over it costs one attempt.
+
+The trade-off is that a failed touchpoint is recorded partially or not at all, and nothing will pick it up later. Each
+one is reported so it can be reconciled by hand:
+
+- an `[event] ... FAILED and passed over` line naming the event and the error
+- a count in the `[run]` summary
+- `failed` and `errors` in the response body, and a `500` status for the run
+
 The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the table. Keep it in Vercel server-side environment variables only.
 
 ## Reading a run from the logs
@@ -101,7 +130,7 @@ Secret values are never logged.
 | `[lookup]` | Each person search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list |
 | `[action]` | Each write and its outcome: person created, person updated with the attribute list, person left untouched because every target attribute was already populated, deal created, deal reused, note added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
 | `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list |
-| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, or off-TAM, the new cursor, and the event it stopped at if it stopped early |
+| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor |
 
 A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line
 states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in
@@ -147,4 +176,7 @@ two kinds of failure:
 
 `vercel.json` selects Vercel's Bun `1.x` runtime and schedules all three syncs every five minutes. Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
 
-Attio counter updates remain read-then-write because Attio does not expose an atomic increment operation. The sync handlers process events sequentially and stop at the first failed event so the cursor never advances past unprocessed work. Avoid overlapping manual invocations of the same sync.
+Attio counter updates remain read-then-write because Attio does not expose an atomic increment operation. The sync
+handlers process events sequentially, and a failed event is passed over rather than retried, as described under
+[A touchpoint that fails partway through](#a-touchpoint-that-fails-partway-through). Nothing guards against two
+invocations of the same sync running at once, so avoid overlapping manual runs.
