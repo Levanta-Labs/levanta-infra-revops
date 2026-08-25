@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { optionalEnv, requiredCsvEnv, requiredEnv } from "../../lib/env.ts";
-import { errorMessage, isJsonObject, responseJson } from "../../lib/json.ts";
+import { optionalEnv, requiredCsvEnv, requiredEnv } from "../../lib/env.js";
+import { errorMessage, isJsonObject, responseJson } from "../../lib/json.js";
 
 const originalValue = process.env.TEST_ENV_VALUE;
 

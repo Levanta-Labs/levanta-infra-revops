@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { fetchAircallCalls, parseAircallWebhook } from "../../lib/aircall.ts";
+import { fetchAircallCalls, parseAircallWebhook } from "../../lib/aircall.js";
 import {
   fetchHeyReachConversations,
   heyReachMessageId,
   parseHeyReachConversation,
   stopLeadInActiveCampaigns,
-} from "../../lib/heyreach.ts";
-import { fetchInstantlyEmails, parseInstantlyEmail } from "../../lib/instantly.ts";
-import { installFetchMock, jsonResponse } from "./test-utils.ts";
+} from "../../lib/heyreach.js";
+import { fetchInstantlyEmails, parseInstantlyEmail } from "../../lib/instantly.js";
+import { installFetchMock, jsonResponse } from "./test-utils.js";
 
 const originalEnv = { ...process.env };
 

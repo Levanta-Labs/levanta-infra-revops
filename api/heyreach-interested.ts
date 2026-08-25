@@ -11,15 +11,15 @@ import {
   patchPerson,
   type CreatePersonValues,
   type PersonNameInput,
-} from "../lib/attio.ts";
-import { requiredEnv } from "../lib/env.ts";
+} from "../lib/attio.js";
+import { requiredEnv } from "../lib/env.js";
 import {
   fetchHeyReachConversations,
   stopLeadInActiveCampaigns,
   type HeyReachMessage,
-} from "../lib/heyreach.ts";
-import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.ts";
-import { isJsonObject, objectValue, stringValue } from "../lib/json.ts";
+} from "../lib/heyreach.js";
+import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.js";
+import { isJsonObject, objectValue, stringValue } from "../lib/json.js";
 
 export interface HeyReachInterestedFields {
   readonly profileUrl: string | null;

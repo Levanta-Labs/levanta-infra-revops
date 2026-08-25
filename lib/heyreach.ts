@@ -1,4 +1,4 @@
-import { HEYREACH_BASE, heyreachHeaders } from "./endpoints.ts";
+import { HEYREACH_BASE, heyreachHeaders } from "./endpoints.js";
 import {
   arrayValue,
   booleanValue,
@@ -6,7 +6,7 @@ import {
   numberValue,
   responseJson,
   stringValue,
-} from "./json.ts";
+} from "./json.js";
 
 //Interface==================================================================
 

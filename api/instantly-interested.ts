@@ -10,11 +10,11 @@ import {
   patchPerson,
   type CreatePersonValues,
   type PersonNameInput,
-} from "../lib/attio.ts";
-import { requiredEnv } from "../lib/env.ts";
-import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.ts";
-import { fetchInstantlyEmails, type InstantlyEmail } from "../lib/instantly.ts";
-import { isJsonObject, stringValue } from "../lib/json.ts";
+} from "../lib/attio.js";
+import { requiredEnv } from "../lib/env.js";
+import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.js";
+import { fetchInstantlyEmails, type InstantlyEmail } from "../lib/instantly.js";
+import { isJsonObject, stringValue } from "../lib/json.js";
 
 export interface InstantlyInterestedFields {
   readonly eventType: string;

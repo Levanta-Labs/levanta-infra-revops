@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { POST as instantlyInterested } from "../../api/instantly-interested.ts";
-import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.ts";
+import { POST as instantlyInterested } from "../../api/instantly-interested.js";
+import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
 const envNames = [
   "ATTIO_API_KEY",

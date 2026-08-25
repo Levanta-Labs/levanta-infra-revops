@@ -8,7 +8,7 @@ import {
   PERSON_COUNTER_SLUGS,
   personCompanyId,
   personDisplayName,
-} from "../../lib/attio.ts";
+} from "../../lib/attio.js";
 import {
   advanceCursor,
   advanceCursorTo,
@@ -16,15 +16,15 @@ import {
   isAfterCursor,
   saveSyncCursor,
   type CursorEvent,
-} from "../../lib/cursors.ts";
+} from "../../lib/cursors.js";
 import {
   fetchHeyReachConversations,
   heyReachMessageId,
   type HeyReachConversation,
   type HeyReachMessage,
-} from "../../lib/heyreach.ts";
-import { isAuthorizedCron, json, serverError } from "../../lib/http.ts";
-import { errorMessage } from "../../lib/json.ts";
+} from "../../lib/heyreach.js";
+import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
+import { errorMessage } from "../../lib/json.js";
 
 const SYNC_KEY = "heyreach-touchpoints";
 

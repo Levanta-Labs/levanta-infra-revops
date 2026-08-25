@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.ts";
-import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.ts";
-import { GET as instantlySync } from "../../api/cron/instantly-touchpoint-sync.ts";
-import { installFetchMock, jsonResponse } from "./test-utils.ts";
+import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.js";
+import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.js";
+import { GET as instantlySync } from "../../api/cron/instantly-touchpoint-sync.js";
+import { installFetchMock, jsonResponse } from "./test-utils.js";
 
 const envNames = [
   "SUPABASE_URL",

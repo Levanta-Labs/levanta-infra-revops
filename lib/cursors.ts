@@ -1,10 +1,10 @@
-import { supabaseBaseUrl, supabaseHeaders } from "./endpoints.ts";
+import { supabaseBaseUrl, supabaseHeaders } from "./endpoints.js";
 import {
   arrayValue,
   isJsonObject,
   responseJson,
   stringValue,
-} from "./json.ts";
+} from "./json.js";
 
 const CURSOR_TABLE = "Attio_Integrations_Touchpoint_Cursors";
 const DEFAULT_LOOKBACK_MS = 10 * 60 * 1_000;

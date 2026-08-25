@@ -10,7 +10,7 @@ import {
   instantlyAuthHeader,
   supabaseBaseUrl,
   supabaseHeaders,
-} from "../../lib/endpoints.ts";
+} from "../../lib/endpoints.js";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
 
