@@ -32,8 +32,7 @@ async function expectOk(label: string, response: Response): Promise<void> {
 }
 
 /** Collects one string field from every element of an Attio `data` array. */
-async function attioValues(path: string, field: string): Promise<ReadonlySet<string>> {
-  const response = await fetch(`${ATTIO_BASE}${path}`, { headers: attioHeaders() });
+async function valuesFrom(path: string, response: Response, field: string): Promise<ReadonlySet<string>> {
   await expectOk(`Attio ${path}`, response);
   const body = await responseJson(response);
   if (!isJsonObject(body)) throw new Error(`Attio ${path} returned no object`);
@@ -45,6 +44,10 @@ async function attioValues(path: string, field: string): Promise<ReadonlySet<str
   }
   if (values.size === 0) throw new Error(`Attio ${path} returned no ${field} values`);
   return values;
+}
+
+async function attioValues(path: string, field: string): Promise<ReadonlySet<string>> {
+  return valuesFrom(path, await fetch(`${ATTIO_BASE}${path}`, { headers: attioHeaders() }), field);
 }
 
 //=============================================================================================================
@@ -135,7 +138,15 @@ liveTest("the Master TAM and DNC lists exist", async () => {
 liveTest("the configured deal owner is a workspace member", async () => {
   const owner = optionalEnv("ATTIO_DEFAULT_DEAL_OWNER");
   if (!owner) throw new Error("ATTIO_DEFAULT_DEAL_OWNER is not configured");
-  const emails = await attioValues("/workspace_members", "email_address");
+
+  const response = await fetch(`${ATTIO_BASE}/workspace_members`, { headers: attioHeaders() });
+  if (response.status === 403) {
+    //Distinguish "cannot check" from "checked and wrong". A 403 here says nothing about the configured value.
+    throw new Error(
+      "Cannot verify ATTIO_DEFAULT_DEAL_OWNER: the Attio token is not permitted to read workspace members. Grant it that scope or confirm the owner by hand. This is a token permission problem, not evidence that the owner is wrong.",
+    );
+  }
+  const emails = await valuesFrom("/workspace_members", response, "email_address");
   const match = [...emails].some((email) => email.toLowerCase() === owner.toLowerCase());
   if (!match) {
     throw new Error(

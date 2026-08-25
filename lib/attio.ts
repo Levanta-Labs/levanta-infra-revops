@@ -210,10 +210,6 @@ export function findPersonByLinkedIn(profileUrl: string | null): Promise<AttioPe
 
 //=============================================================================================================
 
-export async function getPerson(personId: string): Promise<AttioPerson> {
-  return parseAttioPerson(responseData(await attioFetch(`/objects/people/records/${personId}`)));
-}
-
 //============================================================================================================
 //push to attio
 //
