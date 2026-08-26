@@ -102,6 +102,45 @@ export function matchedInterestedTags(call: AircallCall, interested: ReadonlySet
 }
 
 /**
+ * Who the call was with, for a log line. Aircall attaches a contact only to a number already in its address book,
+ * which for a dialled campaign is usually neither, so the number stands in when there is no name.
+ */
+export function callSubject(call: AircallCall): string {
+  const contact = call.contact;
+  const named = [contact?.firstName, contact?.lastName].filter((part) => part).join(" ");
+  const who = named || contact?.companyName || null;
+  const phone = toE164(call.rawDigits);
+  return [who, phone].filter((part) => part).join(" ") || "no contact and no number on the call";
+}
+
+/**
+ * Logs the interested decision for one call and returns the tags that matched. Every call the check sees produces a
+ * line naming who it was with and every tag it carried, whether or not anything matched: a run that reports nothing
+ * interested has to be readable as "these calls, these tags, no match" rather than as silence, since silence cannot
+ * be told apart from the check never having run. The configured set is printed on a miss, where the question of what
+ * the tags were compared against actually arises.
+ */
+export function logInterestedDecision(
+  call: AircallCall,
+  source: InterestedSource,
+  interested: ReadonlySet<string>,
+): readonly string[] {
+  const tags = call.tags.map((tag) => tag.name);
+  const matched = matchedInterestedTags(call, interested);
+  const label = `[interested] ${source} call ${call.id} (${callSubject(call)})`;
+  if (matched.length > 0) {
+    console.log(`${label}: INTERESTED - matched ${JSON.stringify(matched)} of ${JSON.stringify(tags)}`);
+  } else if (tags.length === 0) {
+    console.log(`${label}: not interested - the call carries no tags at all`);
+  } else {
+    console.log(
+      `${label}: not interested - ${JSON.stringify(tags)} matches none of ${JSON.stringify([...interested])}`,
+    );
+  }
+  return matched;
+}
+
+/**
  * Records an interested call in Attio: the person, the deal, a note on each, the lead source, and the DNC listing.
  * `occurredAt` is in epoch seconds - the webhook's own timestamp, or when the call ended for a polled one.
  */
@@ -152,23 +191,13 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const callTags = webhook.call.tags.map((tag) => tag.name);
-    const matched = matchedInterestedTags(webhook.call, interestedTagSet());
+    const matched = logInterestedDecision(webhook.call, "webhook", interestedTagSet());
 
-    if (callTags.length === 0) {
-      console.log(
-        `[interested] webhook call ${webhook.call.id}: skipped - no tags found on the call`,
-      );
-      return json({ skipped: true, reason: "tag not found" });
-    }
     if (matched.length === 0) {
-      console.log(
-        `[interested] webhook call ${webhook.call.id}: skipped - tags not interested: ${JSON.stringify(callTags)}`,
-      );
-      return json({ skipped: true, reason: "tag not tracked", tags: callTags });
+      return callTags.length === 0
+        ? json({ skipped: true, reason: "tag not found" })
+        : json({ skipped: true, reason: "tag not tracked", tags: callTags });
     }
-    console.log(
-      `[interested] webhook call ${webhook.call.id}: matched tag(s) ${JSON.stringify(matched)}`,
-    );
 
     const result = await processAircallInterested(webhook.call, webhook.timestamp, "webhook");
     if (result.status === "no_contact_details") {

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { fetchAircallCalls, parseAircallWebhook, toE164 } from "../../lib/aircall.js";
+import { callSubject, logInterestedDecision } from "../../api/aircall-interested.js";
 import {
   fetchHeyReachConversations,
   heyReachMessageId,
@@ -92,6 +93,61 @@ describe("Aircall client", () => {
     expect(toE164("+19497354000")).toBe("+19497354000");
     expect(toE164(null)).toBeNull();
     expect(toE164("")).toBeNull();
+  });
+
+  test("names the call's other party for a log line, falling back to the number", () => {
+    const call = (contact: unknown, rawDigits: string | null = "+1 813-919-6470") =>
+      parseAircallWebhook({
+        event: "call.tagged",
+        timestamp: 1,
+        token: "t",
+        data: { id: 1, status: "done", started_at: 1, duration: 0, raw_digits: rawDigits, contact },
+      }).call;
+
+    expect(callSubject(call({ first_name: "Abhi", last_name: "Visuvasam" }))).toBe("Abhi Visuvasam +18139196470");
+    //A dialled campaign call has no contact at all, which is the case the log most needs to stay readable for.
+    expect(callSubject(call(null))).toBe("+18139196470");
+    expect(callSubject(call({ company_name: "Schellman" }, null))).toBe("Schellman");
+    expect(callSubject(call(null, null))).toBe("no contact and no number on the call");
+  });
+
+  test("logs a decision for every call the interested check sees, matched or not", () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (line: unknown) => void lines.push(String(line));
+    const call = (tags: readonly string[]) =>
+      parseAircallWebhook({
+        event: "call.tagged",
+        timestamp: 1,
+        token: "t",
+        data: {
+          id: 42,
+          status: "done",
+          started_at: 1,
+          duration: 0,
+          raw_digits: "+1 813-919-6470",
+          tags: tags.map((name) => ({ name })),
+        },
+      }).call;
+    const interested = new Set(["booked", "connected"]);
+    try {
+      expect(logInterestedDecision(call(["Outbound Campaign", "Booked"]), "poll", interested)).toEqual(["Booked"]);
+      expect(logInterestedDecision(call(["Outbound Campaign"]), "poll", interested)).toEqual([]);
+      expect(logInterestedDecision(call([]), "webhook", interested)).toEqual([]);
+    } finally {
+      console.log = original;
+    }
+
+    //A miss is as loud as a hit, and says what the tags were compared against.
+    expect(lines[0]).toBe(
+      '[interested] poll call 42 (+18139196470): INTERESTED - matched ["Booked"] of ["Outbound Campaign","Booked"]',
+    );
+    expect(lines[1]).toBe(
+      '[interested] poll call 42 (+18139196470): not interested - ["Outbound Campaign"] matches none of ["booked","connected"]',
+    );
+    expect(lines[2]).toBe(
+      "[interested] webhook call 42 (+18139196470): not interested - the call carries no tags at all",
+    );
   });
 
   test("follows Aircall next_page_link pagination", async () => {
