@@ -45,9 +45,25 @@ an Aircall touchpoint for a Person with no associated Company records only the c
 | `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
 | `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
-| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes; also runs the interested workflow for any call in the window already carrying an `AIRCALL_INTERESTED_TAGS` tag |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+
+Aircall applies an outcome tag after the call, so the webhook is not the only way an interested call is found. The
+touchpoint cron reads each call's tags straight from the API and runs the same workflow - `processAircallInterested`,
+shared with the webhook - for any call in its window that is already tagged. The two paths are complementary rather
+than redundant: the webhook reacts immediately but only to the tags on the payload it was sent, while the poll sees
+whatever the API holds by the time it runs. Because a tag is applied after the call, a high-water cursor alone would
+carry a call out of the window before the tag it is wanted for exists, so every run re-reads the last ten minutes for
+the interested check. Calls in that lookback are re-checked even though the cursor has passed them: an interested
+call is therefore handled on two consecutive runs and its notes are written twice, which is deliberate - a duplicate
+note can be deleted, a missed booking disappears silently. Touchpoint counters stay cursor-gated and are never
+double-counted. Measured against this workspace's tag history, 63 of 67 hand-applied tags landed within five minutes
+of the call ending, three within thirty, and one took 165 minutes; the last of those is still missed.
+
+The interested step is given its own error handling inside the run, so a failure there cannot stop the touchpoint
+counters from being written, or the reverse. It needs `ATTIO_DEFAULT_DEAL_OWNER` and `AIRCALL_INTERESTED_TAGS`, which
+the cron route now reads as well as the webhook.
 
 All three interested webhooks are configured directly in the provider, pointed at the production host
 `https://levanta-crm-overhaul.vercel.app`. Instantly and HeyReach authenticate with an `x-webhook-secret` custom
