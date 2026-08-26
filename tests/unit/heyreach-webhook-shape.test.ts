@@ -55,6 +55,76 @@ describe("HeyReach interested payload shapes", () => {
   });
 
   //=========================================================================================================
+  //The auto-tag events (lead auto tagged positive and its siblings) arrive flat, with the container name folded
+  //into each key, which is the shape that was being rejected in production.
+  //=========================================================================================================
+
+  test("accepts a flat auto-tag payload whose keys carry a lead prefix", () => {
+    const fields = parseHeyReachInterestedWebhook({
+      eventType: "LEAD_AUTO_TAGGED_POSITIVE",
+      campaignId: 12345,
+      campaignName: "Q3 Founders",
+      linkedInAccountId: 987,
+      leadProfileUrl: PROFILE,
+      leadEmailAddress: "ada@example.com",
+      leadFirstName: "Ada",
+      leadLastName: "Lovelace",
+      leadCompanyName: "Engines",
+    });
+    expect(fields).toEqual({
+      profileUrl: PROFILE,
+      email: "ada@example.com",
+      firstName: "Ada",
+      lastName: "Lovelace",
+      companyName: "Engines",
+    });
+  });
+
+  test("accepts lead-prefixed keys in snake_case too", () => {
+    const fields = parseHeyReachInterestedWebhook({
+      event_type: "LEAD_AUTO_TAGGED_POSITIVE",
+      lead_profile_url: PROFILE,
+      lead_first_name: "Ada",
+    });
+    expect(fields.profileUrl).toBe(PROFILE);
+    expect(fields.firstName).toBe("Ada");
+  });
+
+  test("matches a key however it is cased or separated", () => {
+    expect(parseHeyReachInterestedWebhook({ "Lead-Profile-URL": PROFILE }).profileUrl).toBe(PROFILE);
+    expect(parseHeyReachInterestedWebhook({ lead: { LinkedInURL: PROFILE } }).profileUrl).toBe(PROFILE);
+  });
+
+  test("finds a lead container nested below the top level", () => {
+    const fields = parseHeyReachInterestedWebhook({
+      event: "LEAD_AUTO_TAGGED_POSITIVE",
+      data: { campaign: { id: 1 }, lead: { profileUrl: PROFILE, firstName: "Ada" } },
+    });
+    expect(fields.profileUrl).toBe(PROFILE);
+    expect(fields.firstName).toBe("Ada");
+  });
+
+  test("prefers the lead container over a sibling object that also looks like a person", () => {
+    const fields = parseHeyReachInterestedWebhook({
+      taggedBy: { profileUrl: "https://www.linkedin.com/in/a-teammate", firstName: "Someone" },
+      lead: { profileUrl: PROFILE, firstName: "Ada" },
+    });
+    expect(fields.profileUrl).toBe(PROFILE);
+    expect(fields.firstName).toBe("Ada");
+  });
+
+  test("takes every field from the object that identified the lead", () => {
+    //A name lifted off one record and pinned to another would be worse than a missing name.
+    const fields = parseHeyReachInterestedWebhook({
+      lead: { profileUrl: PROFILE },
+      otherPerson: { firstName: "Grace", lastName: "Hopper", companyName: "Navy" },
+    });
+    expect(fields.firstName).toBeNull();
+    expect(fields.lastName).toBeNull();
+    expect(fields.companyName).toBeNull();
+  });
+
+  //=========================================================================================================
   //The safety property. A HeyReach body also carries the sending LinkedIn account. Matching on that URL would
   //attach the reply to the wrong Person, or invent a Person record for our own sender.
   //=========================================================================================================
@@ -76,6 +146,27 @@ describe("HeyReach interested payload shapes", () => {
     ).toThrow("missing profileUrl and email");
   });
 
+  test("refuses flattened keys that belong to the sending account", () => {
+    expect(() =>
+      parseHeyReachInterestedWebhook({
+        eventType: "LEAD_AUTO_TAGGED_POSITIVE",
+        senderProfileUrl: "https://www.linkedin.com/in/our-own-sender",
+        linkedInAccountEmailAddress: "us@ours.com",
+      }),
+    ).toThrow("missing profileUrl and email");
+  });
+
+  test("does not descend into the sending account however its container is spelled", () => {
+    for (const container of ["linkedInAccount", "linked_in_account", "sender", "senderProfile", "mailbox"]) {
+      expect(() =>
+        parseHeyReachInterestedWebhook({
+          event: "LEAD_AUTO_TAGGED_POSITIVE",
+          [container]: { profileUrl: "https://www.linkedin.com/in/our-own-sender" },
+        }),
+      ).toThrow("missing profileUrl and email");
+    }
+  });
+
   test("reports the payload structure but none of its values", () => {
     const secretish = {
       event: "REPLY_RECEIVED",
@@ -95,6 +186,13 @@ describe("HeyReach interested payload shapes", () => {
     expect(message).not.toContain("Ada Lovelace");
     expect(message).not.toContain("ada@example.com");
     expect(message).not.toContain("555-0123");
+  });
+
+  test("terminates on a self-referential payload instead of spinning", () => {
+    const payload: Record<string, unknown> = { event: "LEAD_AUTO_TAGGED_POSITIVE" };
+    payload.self = payload;
+    payload.lead = { profileUrl: PROFILE, self: payload };
+    expect(parseHeyReachInterestedWebhook(payload).profileUrl).toBe(PROFILE);
   });
 
   test("rejects a payload that is not an object at all", () => {
