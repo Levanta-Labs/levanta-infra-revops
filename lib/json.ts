@@ -26,6 +26,28 @@ export function arrayValue(parent: JsonObject, key: string): readonly unknown[] 
   return Array.isArray(value) ? value : [];
 }
 
+/**
+ * The key structure of an unknown payload, with types but no values, so an unrecognised webhook shape can be
+ * mapped from a log line without recording anybody's name, address, or message text.
+ */
+export function describeShape(value: unknown, depth = 2, budget = 8): string {
+  //An array is a container rather than a level of nesting, so it does not spend `depth` - a payload that wraps the
+  //interesting object in a list should still show that object's keys. `budget` always decrements, which bounds the
+  //recursion for untrusted input however it is nested.
+  if (budget <= 0) return "...";
+  if (Array.isArray(value)) {
+    return value.length === 0 ? "[]" : `[${describeShape(value[0], depth, budget - 1)}]`;
+  }
+  if (isJsonObject(value)) {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return "{}";
+    if (depth <= 0) return `{${keys.length} key(s)}`;
+    return `{ ${keys.map((key) => `${key}: ${describeShape(value[key], depth - 1, budget - 1)}`).join(", ")} }`;
+  }
+  if (value === null) return "null";
+  return typeof value;
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }

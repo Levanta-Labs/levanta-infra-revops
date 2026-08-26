@@ -85,6 +85,13 @@ export function parseHeyReachConversation(value: unknown): HeyReachConversation 
   };
 }
 
+/**
+ * Note that HeyReach applies `from`/`to` with day granularity, not to the minute: any `from` inside today returns
+ * every conversation touched since UTC midnight, each with its full message list, however narrow the window asked
+ * for. So a five-minute run routinely gets back dozens of messages that are hours or days old. The rounding goes
+ * down to the start of the day, never up, so the result over-includes rather than under-includes and no message can
+ * slip past a window boundary. Deduplication is the per-message cursor check in the sync handler, not this filter.
+ */
 export async function fetchHeyReachConversations(
   query: HeyReachConversationQuery,
 ): Promise<readonly HeyReachConversation[]> {
