@@ -1,5 +1,5 @@
 import { fetchAircallCalls, toE164, type AircallCall } from "../../lib/aircall.js";
-import { interestedTagSet, matchedInterestedTags, processAircallInterested } from "../aircall-interested.js";
+import { interestedTagSet, logInterestedDecision, processAircallInterested } from "../aircall-interested.js";
 import {
   companyCounterSlug,
   createNote,
@@ -44,9 +44,8 @@ async function processInterestedTag(
   interested: ReadonlySet<string>,
   failures: string[],
 ): Promise<boolean> {
-  const matched = matchedInterestedTags(call, interested);
-  if (matched.length === 0) return false;
-  console.log(`[interested] poll call ${call.id}: matched tag(s) ${JSON.stringify(matched)}`);
+  //Logs the decision for every call the poll looked at, matched or not, so a quiet run is still accounted for.
+  if (logInterestedDecision(call, "poll", interested).length === 0) return false;
   try {
     const result = await processAircallInterested(call, call.endedAt ?? call.startedAt, "poll");
     return result.status === "done";
