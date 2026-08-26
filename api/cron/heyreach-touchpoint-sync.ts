@@ -8,6 +8,7 @@ import {
   personCompanyId,
   personCounterSlug,
   personDisplayName,
+  personLabel,
 } from "../../lib/attio.js";
 import {
   advanceCursor,
@@ -66,9 +67,10 @@ export async function processHeyReachTouchpoint(
     return "skipped";
   }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
+  const personName = personLabel(person);
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
     console.log(
-      `[event] heyreach message ${event.cursor.id}: skipped - person ${personId} is not on the Master TAM list`,
+      `[event] heyreach message ${event.cursor.id}: skipped - person ${personName} is not on the Master TAM list`,
     );
     return "not_tam";
   }
@@ -77,8 +79,8 @@ export async function processHeyReachTouchpoint(
   const leadName = `${profile.firstName ?? ""} ${profile.lastName ?? ""}`.trim() || "HeyReach conversation";
   const title = `${event.message.subject ?? leadName} — ${event.message.createdAt}`;
   const body = event.message.body || "(no message content)";
-  await createNote("people", personId, title, body);
-  await incrementCounter("people", personId, personCounterSlug("heyreach"));
+  await createNote("people", personId, title, body, personName);
+  await incrementCounter("people", personId, personCounterSlug("heyreach"), personName);
 
   const companyId = personCompanyId(person);
   if (companyId) {

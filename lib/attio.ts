@@ -192,7 +192,7 @@ async function findPerson(attribute: string, value: string | null): Promise<Atti
     return null;
   }
   const person = parseAttioPerson(data[0]);
-  console.log(`[lookup] person by ${attribute} ${JSON.stringify(value)}: matched ${person.id.record_id}`);
+  console.log(`[lookup] person by ${attribute} ${JSON.stringify(value)}: matched ${personLabel(person)}`);
   return person;
 }
 
@@ -215,7 +215,13 @@ export function findPersonByLinkedIn(profileUrl: string | null): Promise<AttioPe
 //
 //Every write reports what it did, so a run can be read back action by action from the logs. A failure names the
 //action before the error propagates, which is the difference between "the sync broke" and "the note on person X
-//could not be created". Record ids are logged; record contents are not.
+//could not be created".
+//
+//A record is logged by the name it carries in Attio, so a run reads as a list of people rather than a list of
+//identifiers. Only the name is logged, never the rest of the record's contents. The caller supplies that name,
+//because it is the caller that holds the record: the helpers below are handed an id, and a helper that has only
+//an id logs the id rather than spending a request to resolve a name for a log line. The exception is
+//incrementCounter, which has to read the record anyway and so takes the name off a response already paid for.
 //============================================================================================================
 
 async function withAction<T>(action: string, run: () => Promise<T>): Promise<T> {
@@ -236,7 +242,7 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
       body: JSON.stringify({ data: { values } }),
     });
     const person = parseAttioPerson(responseData(response));
-    console.log(`[action] person created: ${person.id.record_id}`);
+    console.log(`[action] person created: ${personLabel(person)}`);
     return person;
   } catch (error) {
     console.error(`[action] FAILED - person could not be created: ${errorMessage(error)}`);
@@ -244,13 +250,17 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
   }
 }
 
-export async function patchPerson(personId: string, values: PatchPersonValues): Promise<void> {
+export async function patchPerson(
+  personId: string,
+  values: PatchPersonValues,
+  personName: string = personId,
+): Promise<void> {
   const slugs = Object.keys(values);
   if (slugs.length === 0) {
-    console.log(`[action] person ${personId} not updated - no attributes needed writing`);
+    console.log(`[action] person ${personName} not updated - no attributes needed writing`);
     return;
   }
-  await withAction(`person ${personId} updated: ${slugs.join(", ")}`, () =>
+  await withAction(`person ${personName} updated: ${slugs.join(", ")}`, () =>
     attioFetch(`/objects/people/records/${personId}`, {
       method: "PATCH",
       body: JSON.stringify({ data: { values } }),
@@ -258,7 +268,11 @@ export async function patchPerson(personId: string, values: PatchPersonValues): 
   );
 }
 
-export async function isPersonInList(personId: string, listSlug: string): Promise<boolean> {
+export async function isPersonInList(
+  personId: string,
+  listSlug: string,
+  personName: string = personId,
+): Promise<boolean> {
   const response = await attioFetch(`/objects/people/records/${personId}/entries`);
   const data = responseData(response);
   if (!Array.isArray(data)) throw new Error("Attio list entries response is invalid");
@@ -267,12 +281,16 @@ export async function isPersonInList(personId: string, listSlug: string): Promis
     const listId = objectValue(entry, "list_id");
     return stringValue(listId?.slug) === listSlug || stringValue(entry.list_api_slug) === listSlug;
   });
-  console.log(`[lookup] person ${personId} ${member ? "is" : "is NOT"} on list ${listSlug}`);
+  console.log(`[lookup] person ${personName} ${member ? "is" : "is NOT"} on list ${listSlug}`);
   return member;
 }
 
-export async function addPersonToList(personId: string, listSlug: string): Promise<void> {
-  await withAction(`person ${personId} added to list ${listSlug}`, () =>
+export async function addPersonToList(
+  personId: string,
+  listSlug: string,
+  personName: string = personId,
+): Promise<void> {
+  await withAction(`person ${personName} added to list ${listSlug}`, () =>
     attioFetch(`/lists/${listSlug}/entries`, {
       method: "PUT",
       body: JSON.stringify({
@@ -287,8 +305,9 @@ export async function createNote(
   parentRecordId: string,
   title: string,
   content: string,
+  parentName: string = parentRecordId,
 ): Promise<void> {
-  await withAction(`note added to ${parentObject} ${parentRecordId} (${JSON.stringify(title)})`, () =>
+  await withAction(`note added to ${parentObject} ${parentName} (${JSON.stringify(title)})`, () =>
     attioFetch("/notes", {
       method: "POST",
       body: JSON.stringify({
@@ -317,26 +336,46 @@ function parseCounterValue(value: unknown, attributeSlug: string): number {
   return counter;
 }
 
+/**
+ * The name on a record we have already fetched. Attio spells the attribute two ways - a person's name is
+ * structured (`full_name`), a company's is a plain text `value` - and either may be absent. Returns null rather
+ * than throwing on any shape it does not recognise: a log line is not worth failing a write over.
+ */
+function fetchedRecordName(record: unknown): string | null {
+  if (!isJsonObject(record)) return null;
+  const data = record.data;
+  if (!isJsonObject(data)) return null;
+  const values = objectValue(data, "values");
+  if (!values) return null;
+  const first = arrayValue(values, "name")[0];
+  if (!isJsonObject(first)) return null;
+  return stringValue(first.full_name) ?? stringValue(first.value);
+}
+
 export async function incrementCounter(
   objectType: Exclude<AttioObject, "deals">,
   recordId: string,
   attributeSlug: string,
+  recordName: string = recordId,
 ): Promise<void> {
+  //The current value has to be read before it can be raised, and that response carries the record's name. Taking
+  //the name from it is what lets a company - whose name no caller here has in hand - be logged by name without a
+  //request of its own. Until that read returns, the caller's name is all there is to report a failure by.
+  let label = recordName;
   try {
-    const current = parseCounterValue(
-      await attioFetch(`/objects/${objectType}/records/${recordId}`),
-      attributeSlug,
-    );
+    const record = await attioFetch(`/objects/${objectType}/records/${recordId}`);
+    label = fetchedRecordName(record) ?? recordName;
+    const current = parseCounterValue(record, attributeSlug);
     await attioFetch(`/objects/${objectType}/records/${recordId}`, {
       method: "PATCH",
       body: JSON.stringify({ data: { values: { [attributeSlug]: current + 1 } } }),
     });
     console.log(
-      `[action] counter ${attributeSlug} on ${objectType} ${recordId}: ${current} -> ${current + 1}`,
+      `[action] counter ${attributeSlug} on ${objectType} ${label}: ${current} -> ${current + 1}`,
     );
   } catch (error) {
     console.error(
-      `[action] FAILED - counter ${attributeSlug} on ${objectType} ${recordId}: ${errorMessage(error)}`,
+      `[action] FAILED - counter ${attributeSlug} on ${objectType} ${label}: ${errorMessage(error)}`,
     );
     if (error instanceof AttioApiError && (error.status === 400 || error.status === 404)) {
       console.warn(
@@ -354,18 +393,19 @@ export async function ensureInterestedDeal(
 ): Promise<string> {
   const existing = person.values.associated_deals[0]?.target_record_id;
   if (existing) {
-    console.log(`[action] deal reused: ${existing} already associated with person ${person.id.record_id}`);
+    console.log(`[action] deal reused: deal ${existing} is already associated with person ${personLabel(person)}`);
     return existing;
   }
 
   const companyId = person.values.company[0]?.target_record_id;
+  const dealName = dealNameHint || "New Interested Deal";
   try {
     const response = await attioFetch("/objects/deals/records", {
       method: "POST",
       body: JSON.stringify({
         data: {
           values: {
-            name: dealNameHint || "New Interested Deal",
+            name: dealName,
             stage: "Interested",
             owner: ownerEmail,
             associated_people: [
@@ -389,12 +429,12 @@ export async function ensureInterestedDeal(
     const dealId = stringValue(id?.record_id);
     if (!dealId) throw new Error("Attio deal response is missing record_id");
     console.log(
-      `[action] deal created: ${dealId} for person ${person.id.record_id}${companyId ? ` and company ${companyId}` : " with no associated company"}`,
+      `[action] deal created: ${JSON.stringify(dealName)} for person ${personLabel(person)}${companyId ? ` and company ${companyId}` : " with no associated company"}`,
     );
     return dealId;
   } catch (error) {
     console.error(
-      `[action] FAILED - deal could not be created for person ${person.id.record_id}: ${errorMessage(error)}`,
+      `[action] FAILED - deal could not be created for person ${personLabel(person)}: ${errorMessage(error)}`,
     );
     throw error;
   }
@@ -402,6 +442,11 @@ export async function ensureInterestedDeal(
 
 export function personDisplayName(person: AttioPerson): string | null {
   return person.values.name[0]?.full_name ?? null;
+}
+
+/** What a person is called in the logs: their name, or their record id when Attio holds no name for them. */
+export function personLabel(person: AttioPerson): string {
+  return personDisplayName(person) ?? person.id.record_id;
 }
 
 export function personCompanyId(person: AttioPerson): string | null {

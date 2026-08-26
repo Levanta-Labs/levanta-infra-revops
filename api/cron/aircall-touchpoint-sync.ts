@@ -9,6 +9,7 @@ import {
   personCompanyId,
   personCounterSlug,
   personDisplayName,
+  personLabel,
 } from "../../lib/attio.js";
 import {
   advanceCursor,
@@ -42,8 +43,9 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
     return "skipped";
   }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
-    console.log(`[event] aircall call ${call.id}: skipped - person ${personId} is not on the Master TAM list`);
+  const personName = personLabel(person);
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
+    console.log(`[event] aircall call ${call.id}: skipped - person ${personName} is not on the Master TAM list`);
     return "not_tam";
   }
 
@@ -51,7 +53,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
   const durationMinutes = Math.round(call.duration / 60);
   const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${durationMinutes} min`;
   const title = `Aircall Touchpoint — ${timestamp}`;
-  await incrementCounter("people", personId, personCounterSlug("aircall"));
+  await incrementCounter("people", personId, personCounterSlug("aircall"), personName);
 
   const companyId = personCompanyId(person);
   if (companyId) {

@@ -10,6 +10,7 @@ import {
   LEAD_SOURCE_LABELS,
   LISTS,
   patchPerson,
+  personLabel,
   type CreatePersonValues,
   type PersonNameInput,
 } from "../lib/attio.js";
@@ -116,6 +117,7 @@ export async function POST(request: Request): Promise<Response> {
     if (!person) person = await createPerson(personValues(fields));
 
     const personId = person.id.record_id;
+    const personName = personLabel(person);
     const dealId = await ensureInterestedDeal(
       person,
       dealName(fields),
@@ -123,15 +125,16 @@ export async function POST(request: Request): Promise<Response> {
     );
     const history = buildCallHistorySummary(fields);
     const title = LEAD_SOURCE_LABELS.aircall;
-    await createNote("people", personId, title, history);
+    await createNote("people", personId, title, history, personName);
     await createNote("deals", dealId, title, history);
     await patchPerson(
       personId,
       blankPersonValues(person, { ...personValues(fields), lead_source: title }),
+      personName,
     );
-    await addPersonToList(personId, LISTS.DNC);
+    await addPersonToList(personId, LISTS.DNC, personName);
 
-    console.log(`[route] aircall-interested: completed - person ${personId}, deal ${dealId}`);
+    console.log(`[route] aircall-interested: completed - person ${personName}, deal ${dealId}`);
     return json({ success: true, personId, dealId });
   } catch (error) {
     return serverError("Aircall interested webhook error", error);
