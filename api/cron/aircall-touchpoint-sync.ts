@@ -1,4 +1,4 @@
-import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.js";
+import { fetchAircallCalls, toE164, type AircallCall } from "../../lib/aircall.js";
 import { interestedTagSet, matchedInterestedTags, processAircallInterested } from "../aircall-interested.js";
 import {
   companyCounterSlug,
@@ -46,14 +46,14 @@ async function processInterestedTag(
 ): Promise<boolean> {
   const matched = matchedInterestedTags(call, interested);
   if (matched.length === 0) return false;
-  console.log(`[event] aircall call ${call.id}: interested tag(s) ${JSON.stringify(matched)} found by the poll`);
+  console.log(`[interested] poll call ${call.id}: matched tag(s) ${JSON.stringify(matched)}`);
   try {
-    const result = await processAircallInterested(call, call.endedAt ?? call.startedAt);
+    const result = await processAircallInterested(call, call.endedAt ?? call.startedAt, "poll");
     return result.status === "done";
   } catch (error) {
     failures.push(`Call ${call.id} (interested): ${errorMessage(error)}`);
     console.error(
-      `[event] aircall call ${call.id}: the interested workflow FAILED and was passed over - ${errorMessage(error)}`,
+      `[interested] poll call ${call.id}: FAILED and was passed over - ${errorMessage(error)}`,
     );
     return false;
   }
@@ -64,21 +64,22 @@ export function aircallCursorEvent(call: AircallCall): CursorEvent {
 }
 
 export async function processAircallTouchpoint(call: AircallCall): Promise<ProcessingOutcome> {
-  const phone = call.rawDigits;
+  //Attio stores E.164, so the punctuated raw_digits Aircall sends never matches a record as it stands.
+  const phone = toE164(call.rawDigits);
   if (!phone) {
-    console.log(`[event] aircall call ${call.id}: skipped - the call carried no phone number`);
+    console.log(`[event] aircall touchpoint call ${call.id}: skipped - the call carried no phone number`);
     return "skipped";
   }
 
   const person = await findPersonByPhone(phone);
   if (!person) {
-    console.log(`[event] aircall call ${call.id}: skipped - no Attio person has phone ${phone}`);
+    console.log(`[event] aircall touchpoint call ${call.id}: skipped - no Attio person has phone ${phone}`);
     return "skipped";
   }
   const personId = person.id.record_id;
   const personName = personLabel(person);
   if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
-    console.log(`[event] aircall call ${call.id}: skipped - person ${personName} is not on the Master TAM list`);
+    console.log(`[event] aircall touchpoint call ${call.id}: skipped - person ${personName} is not on the Master TAM list`);
     return "not_tam";
   }
 
@@ -129,9 +130,9 @@ export async function GET(request: Request): Promise<Response> {
         const outcome = await processAircallTouchpoint(call);
         results[outcome] += 1;
       } catch (error) {
-        failures.push(`Call ${call.id}: ${errorMessage(error)}`);
+        failures.push(`Call ${call.id} (touchpoint): ${errorMessage(error)}`);
         console.error(
-          `[event] aircall call ${call.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
+          `[event] aircall touchpoint call ${call.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
         );
       }
       //The cursor advances whether or not the touchpoint succeeded. A failed event is passed over after one

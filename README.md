@@ -61,6 +61,11 @@ note can be deleted, a missed booking disappears silently. Touchpoint counters s
 double-counted. Measured against this workspace's tag history, 63 of 67 hand-applied tags landed within five minutes
 of the call ending, three within thirty, and one took 165 minutes; the last of those is still missed.
 
+Aircall reports a number as `raw_digits`, punctuated for display (`+1 949-735-4000`), while Attio stores and matches
+E.164 (`+19497354000`), so every lookup keyed on the raw value missed. `toE164` normalises it, and both Aircall paths
+apply it: the interested workflow inside `extractAircallFields`, so the number written back to Attio is normalised
+too, and the touchpoint sync before its own person lookup.
+
 The interested step is given its own error handling inside the run, so a failure there cannot stop the touchpoint
 counters from being written, or the reverse. It needs `ATTIO_DEFAULT_DEAL_OWNER` and `AIRCALL_INTERESTED_TAGS`, which
 the cron route now reads as well as the webhook.
@@ -142,10 +147,11 @@ Secret values are never logged.
 | `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
 | `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
 | `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_PERSON_*` or `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
-| `[route]` | The decision a webhook made before touching Attio: which Aircall tag matched, that a call carried no tags at all, that the tags present were not interested ones, that an Instantly event was not `lead_interested`, or that a payload had no email and no phone. Ends with a completion line naming the person and deal |
+| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or that a payload had no email and no phone. Ends with a completion line naming the person and deal |
+| `[interested]` | The Aircall interested workflow, naming the call and which caller found it - `webhook` for the payload the provider sent, `poll` for a tag the touchpoint cron read from the API. Records which tags matched, that the call's tags were not interested ones, that it carried no way to reach a person, and the person and deal it finished with |
 | `[lookup]` | Each person search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list |
 | `[action]` | Each write and its outcome: person created, person updated with the attribute list, person left untouched because every target attribute was already populated, deal created, deal reused, note added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
-| `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list |
+| `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list. An Aircall line names the touchpoint process, to separate it from the interested check running over the same call |
 | `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor |
 
 A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line

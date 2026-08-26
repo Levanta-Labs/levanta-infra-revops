@@ -84,6 +84,9 @@ function dealName(fields: AircallInterestedFields): string {
 //outcome tag after the call, sometimes minutes after, so neither caller sees every tag on its own.
 //=============================================================================================================
 
+/** Which caller drove the workflow, so a log line says whether a webhook or the poll found the call. */
+export type InterestedSource = "webhook" | "poll";
+
 export type InterestedResult =
   | { readonly status: "done"; readonly personId: string; readonly dealId: string }
   | { readonly status: "no_contact_details" };
@@ -102,11 +105,15 @@ export function matchedInterestedTags(call: AircallCall, interested: ReadonlySet
  * Records an interested call in Attio: the person, the deal, a note on each, the lead source, and the DNC listing.
  * `occurredAt` is in epoch seconds - the webhook's own timestamp, or when the call ended for a polled one.
  */
-export async function processAircallInterested(call: AircallCall, occurredAt: number): Promise<InterestedResult> {
+export async function processAircallInterested(
+  call: AircallCall,
+  occurredAt: number,
+  source: InterestedSource,
+): Promise<InterestedResult> {
   const fields = extractAircallFields(call, occurredAt);
   if (!fields.email && !fields.phone) {
     console.warn(
-      `[route] aircall-interested: rejected call ${call.id} - the call carried neither an email nor a phone number, so no person can be matched or created`,
+      `[interested] ${source} call ${call.id}: rejected - the call carried neither an email nor a phone number, so no person can be matched or created`,
     );
     return { status: "no_contact_details" };
   }
@@ -133,7 +140,7 @@ export async function processAircallInterested(call: AircallCall, occurredAt: nu
   );
   await addPersonToList(personId, LISTS.DNC, personName);
 
-  console.log(`[route] aircall-interested: completed - person ${personName}, deal ${dealId}`);
+  console.log(`[interested] ${source} call ${call.id}: completed - person ${personName}, deal ${dealId}`);
   return { status: "done", personId, dealId };
 }
 
@@ -149,21 +156,21 @@ export async function POST(request: Request): Promise<Response> {
 
     if (callTags.length === 0) {
       console.log(
-        `[route] aircall-interested: skipped call ${webhook.call.id} - no tags found on the call`,
+        `[interested] webhook call ${webhook.call.id}: skipped - no tags found on the call`,
       );
       return json({ skipped: true, reason: "tag not found" });
     }
     if (matched.length === 0) {
       console.log(
-        `[route] aircall-interested: skipped call ${webhook.call.id} - tags not interested: ${JSON.stringify(callTags)}`,
+        `[interested] webhook call ${webhook.call.id}: skipped - tags not interested: ${JSON.stringify(callTags)}`,
       );
       return json({ skipped: true, reason: "tag not tracked", tags: callTags });
     }
     console.log(
-      `[route] aircall-interested: call ${webhook.call.id} matched interested tag(s) ${JSON.stringify(matched)}`,
+      `[interested] webhook call ${webhook.call.id}: matched tag(s) ${JSON.stringify(matched)}`,
     );
 
-    const result = await processAircallInterested(webhook.call, webhook.timestamp);
+    const result = await processAircallInterested(webhook.call, webhook.timestamp, "webhook");
     if (result.status === "no_contact_details") {
       return json({ error: "No email or phone in payload" }, 422);
     }
