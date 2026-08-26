@@ -125,7 +125,7 @@ export async function GET(request: Request): Promise<Response> {
     cursor = advanceCursorTo(cursor, upperBoundMs);
     await saveSyncCursor(cursor);
     console.log(
-      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) returned, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
