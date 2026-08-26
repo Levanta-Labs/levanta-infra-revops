@@ -1,4 +1,5 @@
-import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.js";
+import { fetchAircallCalls, toE164, type AircallCall } from "../../lib/aircall.js";
+import { interestedTagSet, matchedInterestedTags, processAircallInterested } from "../aircall-interested.js";
 import {
   companyCounterSlug,
   createNote,
@@ -24,28 +25,61 @@ import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
 
 const SYNC_KEY = "aircall-touchpoints";
 
+//An outcome tag is applied after the call, sometimes minutes after, so the cursor can carry a call out of the window
+//before the tag it is wanted for exists. Every run therefore re-reads this far back for the interested check alone.
+//Calls inside it are re-checked even though the cursor has passed them, which means an interested call is handled on
+//two consecutive runs and its notes are written twice. That is the intended trade: a duplicate note can be deleted,
+//a missed booking is gone silently. The touchpoint counters stay cursor-gated, so they are never double-counted.
+const INTERESTED_LOOKBACK_MS = 10 * 60 * 1_000;
+
 type ProcessingOutcome = "processed" | "skipped" | "not_tam";
+
+/**
+ * Runs the interested workflow for a call the poll found already tagged. It is kept apart from the touchpoint
+ * processing above, and given its own try, so that neither step can stop the other from running on the same call.
+ * Returns whether it wrote anything, for the run summary.
+ */
+async function processInterestedTag(
+  call: AircallCall,
+  interested: ReadonlySet<string>,
+  failures: string[],
+): Promise<boolean> {
+  const matched = matchedInterestedTags(call, interested);
+  if (matched.length === 0) return false;
+  console.log(`[interested] poll call ${call.id}: matched tag(s) ${JSON.stringify(matched)}`);
+  try {
+    const result = await processAircallInterested(call, call.endedAt ?? call.startedAt, "poll");
+    return result.status === "done";
+  } catch (error) {
+    failures.push(`Call ${call.id} (interested): ${errorMessage(error)}`);
+    console.error(
+      `[interested] poll call ${call.id}: FAILED and was passed over - ${errorMessage(error)}`,
+    );
+    return false;
+  }
+}
 
 export function aircallCursorEvent(call: AircallCall): CursorEvent {
   return { id: String(call.id), timestampMs: (call.endedAt ?? call.startedAt) * 1_000 };
 }
 
 export async function processAircallTouchpoint(call: AircallCall): Promise<ProcessingOutcome> {
-  const phone = call.rawDigits;
+  //Attio stores E.164, so the punctuated raw_digits Aircall sends never matches a record as it stands.
+  const phone = toE164(call.rawDigits);
   if (!phone) {
-    console.log(`[event] aircall call ${call.id}: skipped - the call carried no phone number`);
+    console.log(`[event] aircall touchpoint call ${call.id}: skipped - the call carried no phone number`);
     return "skipped";
   }
 
   const person = await findPersonByPhone(phone);
   if (!person) {
-    console.log(`[event] aircall call ${call.id}: skipped - no Attio person has phone ${phone}`);
+    console.log(`[event] aircall touchpoint call ${call.id}: skipped - no Attio person has phone ${phone}`);
     return "skipped";
   }
   const personId = person.id.record_id;
   const personName = personLabel(person);
   if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
-    console.log(`[event] aircall call ${call.id}: skipped - person ${personName} is not on the Master TAM list`);
+    console.log(`[event] aircall touchpoint call ${call.id}: skipped - person ${personName} is not on the Master TAM list`);
     return "not_tam";
   }
 
@@ -74,23 +108,31 @@ export async function GET(request: Request): Promise<Response> {
     const upperBoundMs = Date.now();
     let cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
 
-    const calls = [...(await fetchAircallCalls(cursor.timestampMs, upperBoundMs))].sort(
+    //Whichever reaches further back: a cursor behind after downtime, or the fixed interested lookback.
+    const windowStartMs = Math.min(cursor.timestampMs, upperBoundMs - INTERESTED_LOOKBACK_MS);
+    const calls = [...(await fetchAircallCalls(windowStartMs, upperBoundMs))].sort(
       (left, right) => aircallCursorEvent(left).timestampMs - aircallCursorEvent(right).timestampMs,
     );
 
     const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
     const failures: string[] = [];
+    //Read up front, so a missing or empty list fails the run once with a named variable rather than per call.
+    const interestedTags = interestedTagSet();
+    let interestedCount = 0;
 
     for (const call of calls) {
       const event = aircallCursorEvent(call);
+      //Ahead of the cursor check, because a call the cursor has already passed is exactly the one whose tag arrived
+      //late, and it is the only reason the window reaches back at all.
+      if (await processInterestedTag(call, interestedTags, failures)) interestedCount += 1;
       if (!isAfterCursor(cursor, event)) continue;
       try {
         const outcome = await processAircallTouchpoint(call);
         results[outcome] += 1;
       } catch (error) {
-        failures.push(`Call ${call.id}: ${errorMessage(error)}`);
+        failures.push(`Call ${call.id} (touchpoint): ${errorMessage(error)}`);
         console.error(
-          `[event] aircall call ${call.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
+          `[event] aircall touchpoint call ${call.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
         );
       }
       //The cursor advances whether or not the touchpoint succeeded. A failed event is passed over after one
@@ -101,12 +143,13 @@ export async function GET(request: Request): Promise<Response> {
     cursor = advanceCursorTo(cursor, upperBoundMs);
     await saveSyncCursor(cursor);
     console.log(
-      `[run] aircall sync: ${calls.length} call(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] aircall sync: ${calls.length} call(s) in window (from ${new Date(windowStartMs).toISOString()}), ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
       callsFound: calls.length,
       ...results,
+      interested: interestedCount,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),
       ...(failures.length > 0 ? { errors: failures } : {}),

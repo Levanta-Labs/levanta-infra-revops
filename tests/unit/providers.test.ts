@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { fetchAircallCalls, parseAircallWebhook } from "../../lib/aircall.js";
+import { fetchAircallCalls, parseAircallWebhook, toE164 } from "../../lib/aircall.js";
 import {
   fetchHeyReachConversations,
   heyReachMessageId,
@@ -82,6 +82,16 @@ describe("Aircall client", () => {
     expect(webhook.call.rawDigits).toBe("+15555550123");
     expect(webhook.call.contact?.email).toBe("ada@example.com");
     expect(webhook.call.tags).toEqual([{ name: "Interested" }]);
+  });
+
+  test("normalises the punctuated raw_digits Aircall sends into the E.164 Attio matches on", () => {
+    //Every shape seen across a 300-call sample, US and international.
+    expect(toE164("+1 949-735-4000")).toBe("+19497354000");
+    expect(toE164("+44 7812 661348")).toBe("+447812661348");
+    expect(toE164("+353 87 258 4998")).toBe("+353872584998");
+    expect(toE164("+19497354000")).toBe("+19497354000");
+    expect(toE164(null)).toBeNull();
+    expect(toE164("")).toBeNull();
   });
 
   test("follows Aircall next_page_link pagination", async () => {

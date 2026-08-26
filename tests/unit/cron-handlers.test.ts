@@ -9,6 +9,8 @@ const envNames = [
   "SUPABASE_SECRET_KEY",
   "AIRCALL_API_ID",
   "AIRCALL_API_TOKEN",
+  "AIRCALL_INTERESTED_TAGS",
+  "ATTIO_DEFAULT_DEAL_OWNER",
   "INSTANTLY_API_KEY",
   "HEYREACH_API_KEY",
   "CRON_SECRET",
@@ -25,6 +27,8 @@ beforeEach(() => {
   process.env.SUPABASE_SECRET_KEY = "sb_secret_test";
   process.env.AIRCALL_API_ID = "aircall-id";
   process.env.AIRCALL_API_TOKEN = "aircall-token";
+  process.env.AIRCALL_INTERESTED_TAGS = "Booked, Connected";
+  process.env.ATTIO_DEFAULT_DEAL_OWNER = "owner@example.com";
   process.env.INSTANTLY_API_KEY = "instantly-key";
   process.env.HEYREACH_API_KEY = "heyreach-key";
   process.env.CRON_SECRET = "cron-secret";
@@ -134,6 +138,134 @@ describe("cron handlers", () => {
         (call) => call.input.includes("objects/companies/records/company-1") && call.init?.method === "PATCH",
       );
       expect(companyPatchCalls).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall runs the interested workflow for a polled call already carrying an interested tag", async () => {
+    //The tag is applied after the call, so the poll is what finds it - there is no webhook in this path at all.
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("objects/people/records/person-1/entries")) return jsonResponse({ data: [] });
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: { associated_deals: [] } }] });
+      }
+      if (url.includes("objects/people/records/person-1")) return jsonResponse({ data: {} });
+      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+      if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+1 555-555-0123",
+              started_at: Math.floor(Date.now() / 1000) - 120,
+              ended_at: Math.floor(Date.now() / 1000) - 60,
+              duration: 42,
+              tags: [{ name: "Outbound Campaign" }, { name: "Booked" }],
+              contact: { id: 77, first_name: "Ada", last_name: "Lovelace", emails: [{ value: "ada@example.com" }] },
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await aircallSync(cronRequest());
+      expect(await response.json()).toMatchObject({ success: true, callsFound: 1, interested: 1 });
+
+      //A deal, a note on the person and on the deal, and the DNC listing - the full interested workflow.
+      expect(mock.calls.some((call) => call.input.includes("objects/deals/records"))).toBe(true);
+      expect(mock.calls.filter((call) => call.input.includes("/notes"))).toHaveLength(2);
+      expect(mock.calls.some((call) => call.input.includes("/lists/dnc/entries"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall still acts on an interested tag applied to a call the cursor has already passed", async () => {
+    //The call ended six minutes ago and the cursor was saved four minutes ago, so the touchpoint side has finished
+    //with it. The tag was applied since. Only the lookback window brings it back for the interested check.
+    const endedAt = Math.floor(Date.now() / 1000) - 360;
+    const cursorSavedAt = new Date(Date.now() - 4 * 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "aircall-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: { associated_deals: [] } }] });
+      }
+      if (url.includes("objects/people/records/person-1")) return jsonResponse({ data: {} });
+      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+      if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("api.aircall.io")) {
+        //The requested window must reach back past the cursor, or this call would not be returned at all.
+        const from = Number(new URL(url).searchParams.get("from")) * 1000;
+        expect(from).toBeLessThan(Date.parse(cursorSavedAt));
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+1 555-555-0123",
+              started_at: endedAt - 60,
+              ended_at: endedAt,
+              duration: 60,
+              tags: [{ name: "Booked" }],
+              contact: { id: 77, first_name: "Ada", last_name: "Lovelace", emails: [{ value: "ada@example.com" }] },
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const body = await (await aircallSync(cronRequest())).json();
+      //Interested ran; the touchpoint did not, because the cursor is still past this call.
+      expect(body).toMatchObject({ callsFound: 1, interested: 1, processed: 0, skipped: 0, not_tam: 0 });
+      expect(mock.calls.some((call) => call.input.includes("objects/deals/records"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall leaves a polled call alone when none of its tags are interested", async () => {
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("objects/people/records/query")) return jsonResponse({ data: [] });
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+1 555-555-0123",
+              started_at: Math.floor(Date.now() / 1000) - 120,
+              ended_at: Math.floor(Date.now() / 1000) - 60,
+              duration: 42,
+              tags: [{ name: "Outbound Campaign" }],
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      expect(await (await aircallSync(cronRequest())).json()).toMatchObject({ callsFound: 1, interested: 0 });
+      expect(mock.calls.some((call) => call.input.includes("objects/deals/records"))).toBe(false);
     } finally {
       mock.restore();
     }

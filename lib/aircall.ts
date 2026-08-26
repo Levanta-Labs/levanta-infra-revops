@@ -44,6 +44,18 @@ export interface AircallWebhook {
 
 
 
+/**
+ * Aircall reports a number as `raw_digits`, punctuated for display ("+1 949-735-4000"), while Attio stores and
+ * matches on E.164 ("+19497354000"), so a lookup keyed on the raw value misses. Every raw_digits carries its
+ * leading "+" - across a 300-call sample no number arrived without one - so normalising is dropping everything
+ * that is not a digit and putting the "+" back.
+ */
+export function toE164(rawDigits: string | null): string | null {
+  if (!rawDigits) return null;
+  const digits = rawDigits.replace(/\D/g, "");
+  return digits ? `+${digits}` : null;
+}
+
 function parseTag(value: unknown): AircallTag | null {
   if (!isJsonObject(value)) return null;
   const name = stringValue(value.name);
