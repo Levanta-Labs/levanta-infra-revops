@@ -10,6 +10,7 @@ import {
   LEAD_SOURCE_LABELS,
   LISTS,
   patchPerson,
+  personLabel,
   type CreatePersonValues,
   type PersonNameInput,
 } from "../lib/attio.js";
@@ -199,6 +200,7 @@ export async function POST(request: Request): Promise<Response> {
     if (!person) person = await createPerson(personValues(fields));
 
     const personId = person.id.record_id;
+    const personName = personLabel(person);
     const dealId = await ensureInterestedDeal(
       person,
       dealName(fields),
@@ -210,16 +212,17 @@ export async function POST(request: Request): Promise<Response> {
     const messages = conversations.flatMap((conversation) => conversation.messages);
     const history = formatHeyReachThread(messages);
     const title = LEAD_SOURCE_LABELS.heyreach;
-    await createNote("people", personId, title, history);
+    await createNote("people", personId, title, history, personName);
     await createNote("deals", dealId, title, history);
     await patchPerson(
       personId,
       blankPersonValues(person, { ...personValues(fields), lead_source: title }),
+      personName,
     );
-    await addPersonToList(personId, LISTS.DNC);
+    await addPersonToList(personId, LISTS.DNC, personName);
     const campaignsStopped = await stopLeadInActiveCampaigns(fields.profileUrl, fields.email);
     console.log(
-      `[route] heyreach-interested: completed - person ${personId}, deal ${dealId}, ${messages.length} message(s) summarised, ${campaignsStopped} campaign(s) stopped`,
+      `[route] heyreach-interested: completed - person ${personName}, deal ${dealId}, ${messages.length} message(s) summarised, ${campaignsStopped} campaign(s) stopped`,
     );
     return json({ success: true, personId, dealId, campaignsStopped });
   } catch (error) {

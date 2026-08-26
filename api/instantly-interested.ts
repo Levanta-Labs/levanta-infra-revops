@@ -9,6 +9,7 @@ import {
   LEAD_SOURCE_LABELS,
   LISTS,
   patchPerson,
+  personLabel,
   type CreatePersonValues,
   type PersonNameInput,
 } from "../lib/attio.js";
@@ -93,6 +94,7 @@ export async function POST(request: Request): Promise<Response> {
     let person = await findPersonByEmail(fields.email);
     if (!person) person = await createPerson(personValues(fields));
     const personId = person.id.record_id;
+    const personName = personLabel(person);
     const dealId = await ensureInterestedDeal(
       person,
       dealName(fields),
@@ -101,15 +103,16 @@ export async function POST(request: Request): Promise<Response> {
     const emails = await fetchInstantlyEmails({ leadEmail: fields.email });
     const history = formatInstantlyThread(emails, fields.campaignName);
     const title = LEAD_SOURCE_LABELS.instantly;
-    await createNote("people", personId, title, history);
+    await createNote("people", personId, title, history, personName);
     await createNote("deals", dealId, title, history);
     await patchPerson(
       personId,
       blankPersonValues(person, { ...personValues(fields), lead_source: title }),
+      personName,
     );
-    await addPersonToList(personId, LISTS.DNC);
+    await addPersonToList(personId, LISTS.DNC, personName);
     console.log(
-      `[route] instantly-interested: completed - person ${personId}, deal ${dealId}, ${emails.length} email(s) summarised`,
+      `[route] instantly-interested: completed - person ${personName}, deal ${dealId}, ${emails.length} email(s) summarised`,
     );
     return json({ success: true, personId, dealId });
   } catch (error) {

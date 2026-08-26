@@ -8,6 +8,7 @@ import {
   personCompanyId,
   personCounterSlug,
   personDisplayName,
+  personLabel,
 } from "../../lib/attio.js";
 import {
   advanceCursor,
@@ -40,16 +41,17 @@ export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise
     return "skipped";
   }
   const personId = person.id.record_id;
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM))) {
-    console.log(`[event] instantly email ${email.id}: skipped - person ${personId} is not on the Master TAM list`);
+  const personName = personLabel(person);
+  if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
+    console.log(`[event] instantly email ${email.id}: skipped - person ${personName} is not on the Master TAM list`);
     return "not_tam";
   }
 
   const subject = email.subject ?? "(no subject)";
   const body = email.bodyText ?? "(no content)";
   const title = `${subject} — ${email.timestampEmail}`;
-  await createNote("people", personId, title, body);
-  await incrementCounter("people", personId, personCounterSlug("instantly"));
+  await createNote("people", personId, title, body, personName);
+  await incrementCounter("people", personId, personCounterSlug("instantly"), personName);
 
   const companyId = personCompanyId(person);
   if (companyId) {
