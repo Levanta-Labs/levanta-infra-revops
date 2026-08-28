@@ -35,15 +35,6 @@ export interface AircallCall {
   readonly contact: AircallContact | null;
 }
 
-export interface AircallWebhook {
-  readonly event: string;
-  readonly timestamp: number;
-  readonly token: string;
-  readonly call: AircallCall;
-}
-
-
-
 /**
  * Aircall reports a number as `raw_digits`, punctuated for display ("+1 949-735-4000"), while Attio stores and
  * matches on E.164 ("+19497354000"), so a lookup keyed on the raw value misses. Every raw_digits carries its
@@ -63,6 +54,7 @@ function parseTag(value: unknown): AircallTag | null {
 }
 
 function contactEmail(contact: Record<string, unknown>): string | null {
+  //Aircall spells a contact address two ways: a scalar `email`, or an `emails` list of strings or of objects.
   const direct = stringValue(contact.email);
   if (direct) return direct;
   for (const candidate of arrayValue(contact, "emails")) {
@@ -93,6 +85,7 @@ export function parseAircallCall(value: unknown): AircallCall {
   if (!isJsonObject(value)) throw new Error("Aircall returned an invalid call");
   const id = numberValue(value.id);
   const startedAt = numberValue(value.started_at);
+  //id and started_at are the two fields the cursor and the window depend on; absent either, the call is unusable.
   if (id === null || startedAt === null) {
     throw new Error("Aircall call is missing id or started_at");
   }
@@ -111,36 +104,44 @@ export function parseAircallCall(value: unknown): AircallCall {
   };
 }
 
-export function parseAircallWebhook(value: unknown): AircallWebhook {
-  if (!isJsonObject(value)) throw new Error("Aircall webhook payload must be an object");
-  const event = stringValue(value.event);
-  const timestamp = numberValue(value.timestamp);
-  const token = stringValue(value.token);
-  if (!event || timestamp === null || !token) {
-    throw new Error("Aircall webhook is missing event, timestamp, or token");
-  }
-  return { event, timestamp, token, call: parseAircallCall(value.data) };
-}
-
+//---------------------------------------------------------------------------------------------------------
+//Reads every completed call in a window. Sole Aircall reader; the touchpoint cron is the only caller.
+//FLOW: 1. build page one from fromMs/toMs. 2. follow meta.next_page_link until null. 3. parse each entry with
+//parseAircallCall. 4. drop anything not finished.
+//WINDOW SEMANTICS - the reason the caller over-reaches: Aircall documents from/to as filters on a call's
+//CREATION date, and the Call object carries no created_at at all (only started_at, answered_at, ended_at), so
+//the filter is effectively on call START. Callers key their cursor on ended_at, so fromMs must be pulled back
+//by at least the longest call expected or a long call is filtered out here (not yet "done") on the run that
+//covers its start and is out of range by the run that covers its end. See MAX_CALL_DURATION_MS in the cron.
+//Sorting cannot substitute for this: `order` only walks created_at, and a call outside the filter is absent
+//from the result set entirely, not merely out of order. No v1 endpoint filters or sorts on ended_at.
+//USES: aircallAuthHeader, credentialHint (endpoints.ts); responseJson, arrayValue, objectValue (json.ts).
+//---------------------------------------------------------------------------------------------------------
 export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
   const calls: AircallCall[] = [];
+  //Aircall takes whole seconds. Floor both bounds so the window can only widen, never clip an edge call.
   const first = new URL(`${AIRCALL_BASE}/calls`);
   first.searchParams.set("from", String(Math.floor(fromMs / 1_000)));
   first.searchParams.set("to", String(Math.floor(toMs / 1_000)));
-  first.searchParams.set("order", "asc");
   first.searchParams.set("per_page", "50");
   let nextUrl: string | null = first.toString();
 
+  //[PERF] Page cost scales with the width of the window, so widening fromMs is not free - see the cron constant.
   while (nextUrl) {
+    //[SECURITY] Basic credentials are rebuilt per request from env and never held in module state.
     const response = await fetch(nextUrl, { headers: { Authorization: aircallAuthHeader() } });
     const body = await responseJson(response);
+    //[DEBUG] credentialHint names AIRCALL_API_ID / AIRCALL_API_TOKEN on a 401/403.
     if (!response.ok) {
       throw new Error(`Aircall API error ${response.status}: ${JSON.stringify(body)}${credentialHint("aircall", response.status)}`);
     }
     if (!isJsonObject(body)) throw new Error("Aircall calls response is invalid");
     calls.push(...arrayValue(body, "calls").map(parseAircallCall));
+    //Aircall hands back an absolute URL for the next page; null ends the walk.
     const meta = objectValue(body, "meta");
     nextUrl = stringValue(meta?.next_page_link);
   }
+  //A call still ringing or in progress has no completion time, so it cannot be placed on the cursor timeline.
+  //It is simply omitted; a later run reads it once Aircall marks it done.
   return calls.filter((call) => call.status === "done" && call.endedAt !== null);
 }

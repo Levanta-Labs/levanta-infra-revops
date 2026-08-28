@@ -64,6 +64,14 @@ export interface InstantlyEmailQuery {
   readonly leadEmail?: string;
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Reads emails, paginated. Two callers with different shapes of query: the touchpoint cron passes a time
+//window, the interested webhook passes a lead address and no bounds (the whole thread for that lead).
+//FLOW: 1. build a page from whichever query fields are set. 2. GET. 3. parse items. 4. follow
+//next_starting_after until absent.
+//Filters are on timestamp_created, which is also what the cron keys its cursor on, so window and cursor agree.
+//USES: instantlyAuthHeader, credentialHint (endpoints.ts); responseJson, arrayValue (json.ts).
+//---------------------------------------------------------------------------------------------------------
 export async function fetchInstantlyEmails(
   query: InstantlyEmailQuery,
 ): Promise<readonly InstantlyEmail[]> {
@@ -73,7 +81,10 @@ export async function fetchInstantlyEmails(
   do {
     const url = new URL(`${INSTANTLY_BASE}/emails`);
     url.searchParams.set("limit", "100");
+    //Ascending, so the caller's cursor advances monotonically as it walks the result.
     url.searchParams.set("sort_order", "asc");
+    //Minus one millisecond: the bound is treated as exclusive, and an email sitting exactly on the cursor
+    //timestamp must still be returned. The caller's isAfterCursor check discards it if it was already handled.
     if (query.fromMs !== undefined) {
       url.searchParams.set("min_timestamp_created", new Date(Math.max(0, query.fromMs - 1)).toISOString());
     }
@@ -83,10 +94,12 @@ export async function fetchInstantlyEmails(
     if (query.leadEmail) url.searchParams.set("lead", query.leadEmail);
     if (startingAfter) url.searchParams.set("starting_after", startingAfter);
 
+    //[SECURITY] The key is read from env per request and never cached in module state.
     const response = await fetch(url, {
       headers: { Authorization: instantlyAuthHeader() },
     });
     const body = await responseJson(response);
+    //[DEBUG] credentialHint names INSTANTLY_API_KEY on a 401/403.
     if (!response.ok) {
       throw new Error(`Instantly API error ${response.status}: ${JSON.stringify(body)}${credentialHint("instantly", response.status)}`);
     }

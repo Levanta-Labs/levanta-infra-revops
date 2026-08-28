@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildCallHistorySummary,
   extractAircallFields,
-} from "../../api/aircall-interested.js";
+} from "../../lib/aircall-interested.js";
 import { aircallCursorEvent } from "../../api/cron/aircall-touchpoint-sync.js";
 import { heyReachTouchpointEvents } from "../../api/cron/heyreach-touchpoint-sync.js";
 import { instantlyCursorEvent } from "../../api/cron/instantly-touchpoint-sync.js";

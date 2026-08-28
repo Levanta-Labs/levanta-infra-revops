@@ -162,7 +162,7 @@ liveTest("the configured deal owner is a workspace member", async () => {
 //=============================================================================================================
 
 liveTest("the request-verification secrets are configured", () => {
-  const missing = ["CRON_SECRET", "AIRCALL_WEBHOOK_TOKEN", "INSTANTLY_WEBHOOK_SECRET", "HEYREACH_WEBHOOK_SECRET"]
+  const missing = ["CRON_SECRET", "INSTANTLY_WEBHOOK_SECRET", "HEYREACH_WEBHOOK_SECRET"]
     .filter((name) => optionalEnv(name) === null);
   if (missing.length > 0) {
     throw new Error(`Not configured, so the matching routes will reject every request: ${missing.join(", ")}`);

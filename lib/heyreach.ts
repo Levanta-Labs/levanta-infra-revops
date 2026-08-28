@@ -85,13 +85,18 @@ export function parseHeyReachConversation(value: unknown): HeyReachConversation 
   };
 }
 
-/**
- * Note that HeyReach applies `from`/`to` with day granularity, not to the minute: any `from` inside today returns
- * every conversation touched since UTC midnight, each with its full message list, however narrow the window asked
- * for. So a five-minute run routinely gets back dozens of messages that are hours or days old. The rounding goes
- * down to the start of the day, never up, so the result over-includes rather than under-includes and no message can
- * slip past a window boundary. Deduplication is the per-message cursor check in the sync handler, not this filter.
- */
+//---------------------------------------------------------------------------------------------------------
+//Reads conversations with their full message lists, paginated. Two callers: the touchpoint cron passes a time
+//window, the interested webhook passes one profile URL.
+//FLOW: 1. POST a page with the query folded into the filters block. 2. parse items. 3. follow nextCursor while
+//hasNextPage. 4. a truncated page (hasNextPage with no cursor) throws rather than silently returning less.
+//[PERF] HeyReach applies from/to with DAY granularity, not to the minute: any `from` inside today returns every
+//conversation touched since UTC midnight, each with its full message list, however narrow the window asked for.
+//A five-minute run therefore routinely receives messages hours or days old, and the volume grows through the
+//day. Rounding always goes DOWN to the start of the day, so the result over-includes and no message can slip
+//past a window boundary. Deduplication is the per-message cursor check in the sync handler, not this filter.
+//USES: heyreachHeaders, credentialHint (endpoints.ts); responseJson, arrayValue, booleanValue (json.ts).
+//---------------------------------------------------------------------------------------------------------
 export async function fetchHeyReachConversations(
   query: HeyReachConversationQuery,
 ): Promise<readonly HeyReachConversation[]> {
@@ -107,6 +112,7 @@ export async function fetchHeyReachConversations(
         cursor,
         ...(query.fromMs !== undefined ? { from: new Date(query.fromMs).toISOString() } : {}),
         ...(query.toMs !== undefined ? { to: new Date(query.toMs).toISOString() } : {}),
+        //Every filter must be present even when unused; the API rejects a partial filters block.
         filters: {
           linkedInAccountIds: [],
           campaignIds: [],
@@ -133,10 +139,17 @@ export async function fetchHeyReachConversations(
   return conversations;
 }
 
+/**
+ * A stable per-message ID. HeyReach gives messages none, and the cursor needs one to tell events apart at the
+ * same timestamp, so the identity is a SHA-256 of the fields that define the message. Deterministic across
+ * runs, which is what makes it usable as a duplicate key; two byte-identical messages in one conversation at
+ * one instant collapse to a single event.
+ */
 export async function heyReachMessageId(
   conversation: HeyReachConversation,
   message: HeyReachMessage,
 ): Promise<string> {
+  //NUL-joined so no combination of field values can produce the same input as a different combination.
   const input = [
     conversation.id,
     message.createdAt,
@@ -165,6 +178,15 @@ function parseCampaign(value: unknown): HeyReachCampaign {
   return { campaignId, campaignStatus, leadStatus };
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Ends outbound sequencing for a lead who has said yes. The only provider-side write in the codebase.
+//FLOW: 1. no profile URL -> 0, see below. 2. list the lead's campaigns. 3. keep those where both the campaign
+//and the lead's place in it are still live. 4. stop each. 5. return how many were stopped.
+//[STABILITY] A failed stop throws and is not retried; the caller has already written the CRM record.
+//KNOWN GAP: step 1 returns early because StopLeadInCampaign is driven by leadUrl, which an email-only lead
+//does not supply. The lookup at step 2 would accept the email; the stop at step 4 would not. Such a lead stays
+//in sequence. Closing this needs the leadMemberId from the step-2 response, which parseCampaign discards.
+//---------------------------------------------------------------------------------------------------------
 export async function stopLeadInActiveCampaigns(
   profileUrl: string | null,
   email: string | null,
@@ -180,6 +202,8 @@ export async function stopLeadInActiveCampaigns(
     throw new Error(`HeyReach campaign lookup failed ${response.status}: ${JSON.stringify(body)}${credentialHint("heyreach", response.status)}`);
   }
   if (!isJsonObject(body)) throw new Error("HeyReach campaigns response is invalid");
+  //Both dimensions must be live. A paused campaign still counts: it can be resumed and would resume messaging.
+  //A lead already finished or replied-out of a campaign has nothing left to stop.
   const activeCampaignStatuses = new Set(["IN_PROGRESS", "PAUSED", "STARTING"]);
   const activeLeadStatuses = new Set(["Pending", "InSequence", "Paused"]);
   const campaigns = arrayValue(body, "items")

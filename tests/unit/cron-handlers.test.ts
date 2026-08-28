@@ -191,7 +191,8 @@ describe("cron handlers", () => {
 
   test("Aircall still acts on an interested tag applied to a call the cursor has already passed", async () => {
     //The call ended six minutes ago and the cursor was saved four minutes ago, so the touchpoint side has finished
-    //with it. The tag was applied since. Only the lookback window brings it back for the interested check.
+    //with it. The tag was applied since. Only the ten-minute lookback brings it back for the interested check:
+    //min(cursor, now - 10m) reaches further back than the cursor alone, which is the whole point of the constant.
     const endedAt = Math.floor(Date.now() / 1000) - 360;
     const cursorSavedAt = new Date(Date.now() - 4 * 60 * 1000).toISOString();
     const mock = installFetchMock((url, init) => {
@@ -232,8 +233,134 @@ describe("cron handlers", () => {
     try {
       const body = await (await aircallSync(cronRequest())).json();
       //Interested ran; the touchpoint did not, because the cursor is still past this call.
-      expect(body).toMatchObject({ callsFound: 1, interested: 1, processed: 0, skipped: 0, not_tam: 0 });
+      expect(body).toMatchObject({
+        callsFound: 1,
+        callsInScope: 1,
+        interested: 1,
+        processed: 0,
+        skipped: 0,
+        not_tam: 0,
+      });
       expect(mock.calls.some((call) => call.input.includes("objects/deals/records"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall reaches back past the longest call, because the API filters on creation time", async () => {
+    //Regression: /calls filters on when a call was CREATED, but this sync places calls by when they ENDED. A
+    //call lasting longer than the completion window used to be filtered out as "not done" on every run that
+    //covered its start, then fell out of range before it ever looked finished - lost entirely. The requested
+    //`from` must therefore sit a full call-duration margin below the oldest completion the run acts on.
+    let requestedFromMs = 0;
+    const startedAt = Math.floor(Date.now() / 1000) - 95 * 60; //began 95 minutes ago
+    const endedAt = Math.floor(Date.now() / 1000) - 60; //ended one minute ago
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("objects/people/records/person-1/entries")) {
+        return jsonResponse({ data: [{ list_id: { slug: "master_tam_list" } }] });
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: { associated_deals: [] } }] });
+      }
+      if (url.includes("objects/people/records/person-1")) {
+        //Serves both the interested patch and the counter's read-then-write.
+        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { values: { number_of_calls: [] } } });
+      }
+      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+      if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("api.aircall.io")) {
+        requestedFromMs = Number(new URL(url).searchParams.get("from")) * 1000;
+        //Only returned because the window reaches back far enough to cover the call's start.
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+1 555-555-0123",
+              started_at: startedAt,
+              ended_at: endedAt,
+              duration: endedAt - startedAt,
+              tags: [{ name: "Booked" }],
+              contact: { id: 77, first_name: "Ada", last_name: "Lovelace", emails: [{ value: "ada@example.com" }] },
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const body = await (await aircallSync(cronRequest())).json();
+      //A 95-minute call that ended a minute ago is both counted and checked for its tag.
+      expect(body).toMatchObject({ callsFound: 1, processed: 1, interested: 1 });
+      expect(requestedFromMs).toBeLessThan(startedAt * 1000);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall ignores a call that ended before the window it acts on, despite the wider fetch", async () => {
+    //The margin above drags in old calls purely for reach. Neither gate may act on them: the cursor blocks the
+    //touchpoint, and an explicit completion floor blocks the interested check that is not cursor-gated.
+    const endedAt = Math.floor(Date.now() / 1000) - 3 * 60 * 60; //finished three hours ago
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+1 555-555-0123",
+              started_at: endedAt - 60,
+              ended_at: endedAt,
+              duration: 60,
+              tags: [{ name: "Booked" }],
+              contact: { id: 77, first_name: "Ada", last_name: "Lovelace", emails: [{ value: "ada@example.com" }] },
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const body = await (await aircallSync(cronRequest())).json();
+      //Fetched for reach, but outside scope, so neither gate acts and the summary says so.
+      expect(body).toMatchObject({ callsFound: 1, callsInScope: 0, processed: 0, interested: 0, failed: 0 });
+      //No Attio call of any kind: an old call must not be re-recorded just because the fetch reached it.
+      expect(mock.calls.some((call) => call.input.includes("api.attio.com"))).toBe(false);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("every sync parks its cursor short of now, so late-published events are not skipped", async () => {
+    const saved: number[] = [];
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") {
+        saved.push(Date.parse(JSON.parse(String(init.body)).cursor_timestamp));
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("api.aircall.io")) return jsonResponse({ calls: [], meta: { next_page_link: null } });
+      if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
+      return jsonResponse({ items: [], totalCount: 0, hasNextPage: false, nextCursor: null });
+    });
+    try {
+      const before = Date.now();
+      await aircallSync(cronRequest());
+      await instantlySync(cronRequest());
+      await heyReachSync(cronRequest());
+      expect(saved).toHaveLength(3);
+      //CURSOR_GRACE_MS is two minutes; each mark must land at least a minute behind the run's own clock.
+      for (const mark of saved) expect(mark).toBeLessThanOrEqual(before - 60_000);
     } finally {
       mock.restore();
     }

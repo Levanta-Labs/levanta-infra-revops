@@ -76,6 +76,14 @@ export class AttioApiError extends Error {
   }
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Single transport for every Attio call in the codebase. Nothing else calls fetch against Attio.
+//FLOW: 1. prefix the path with ATTIO_BASE. 2. merge attioHeaders (endpoints.ts) under any caller override.
+//3. parse the body with responseJson (json.ts). 4. non-2xx -> throw AttioApiError carrying status and body.
+//[SECURITY] The bearer token is read from env per request by attioHeaders and never cached in module state.
+//[DEBUG] credentialHint appends the env var name to a 401/403; the typed status lets incrementCounter tell a
+//bad attribute slug (400/404) apart from a transport failure.
+//---------------------------------------------------------------------------------------------------------
 export async function attioFetch(path: string, options: RequestInit = {}): Promise<unknown> {
   const response = await fetch(`${ATTIO_BASE}${path}`, {
     ...options,
@@ -93,11 +101,11 @@ export async function attioFetch(path: string, options: RequestInit = {}): Promi
 }
 
 //=============================================================================================================
-//parce functions, turns raw pull from attio (json) into usable data 
+//parce functions, turns raw pull from attio (json) into usable data
 //=============================================================================================================
 
 //#region helper functions
-function parseRecordReference(value: unknown): AttioRecordReference | null { 
+function parseRecordReference(value: unknown): AttioRecordReference | null {
   if (!isJsonObject(value)) return null;
   const recordId = stringValue(value.target_record_id);
   if (!recordId) return null;
@@ -108,6 +116,7 @@ function parseRecordReference(value: unknown): AttioRecordReference | null {
 }
 
 function parseReferences(values: JsonObject, key: string): readonly AttioRecordReference[] {
+  //Unreadable entries are dropped rather than throwing: one malformed reference should not void the record.
   return arrayValue(values, key)
     .map(parseRecordReference)
     .filter((value): value is AttioRecordReference => value !== null);
@@ -116,6 +125,13 @@ function parseReferences(values: JsonObject, key: string): readonly AttioRecordR
 //#endregion
 
 //#region master methode
+//---------------------------------------------------------------------------------------------------------
+//Turns one raw Attio person record into the shape the rest of the codebase uses.
+//FLOW: 1. require id.record_id and values. 2. read the linked deals and company as references. 3. read names.
+//4. record which attribute slugs hold anything at all, for blankPersonValues.
+//Step 4 is type-agnostic on purpose: Attio wraps every attribute in an array whatever its type, so a non-empty
+//array is the only "has a value" test that works across text, references, and counters alike.
+//---------------------------------------------------------------------------------------------------------
 export function parseAttioPerson(value: unknown): AttioPerson {
   if (!isJsonObject(value)) throw new Error("Attio returned an invalid person record");
   const id = objectValue(value, "id");
@@ -156,6 +172,8 @@ export function blankPersonValues(
   const fillable: Record<string, unknown> = {};
   for (const [slug, value] of Object.entries(candidate)) {
     if (value === undefined) continue;
+    //Populated means "Attio holds something here". A PATCH would replace the whole attribute, not merge into
+    //it, so anything already present is left strictly alone.
     if (person.populatedAttributes.has(slug)) continue;
     fillable[slug] = value;
   }
@@ -176,6 +194,14 @@ function responseData(value: unknown): unknown {
 //          Match Data From Thrid Party Records To Record ID In Attio
 //=============================================================================================================
 
+//---------------------------------------------------------------------------------------------------------
+//One filtered person query. The three exported wrappers below differ only in the attribute searched.
+//FLOW: 1. no value -> no query. 2. POST the filter, limit 1. 3. no hit -> null. 4. hit -> parseAttioPerson.
+//[DEBUG] Every branch logs, including the misses. A lookup that quietly returns null is the usual cause of a
+//touchpoint vanishing, so the searched attribute and value are named in the log line.
+//NOTE: those log lines carry the business identifier - an address, number, or profile URL. Not credentials,
+//but personal data in a retained log.
+//---------------------------------------------------------------------------------------------------------
 async function findPerson(attribute: string, value: string | null): Promise<AttioPerson | null> {
   if (!value) {
     console.log(`[lookup] person by ${attribute}: skipped - no value to search for`);
@@ -201,6 +227,7 @@ export function findPersonByEmail(email: string | null): Promise<AttioPerson | n
 }
 
 export function findPersonByPhone(phone: string | null): Promise<AttioPerson | null> {
+  //Callers must pass E.164: Attio matches on the stored form, not on a punctuated display number.
   return findPerson("phone_numbers", phone);
 }
 
@@ -224,6 +251,7 @@ export function findPersonByLinkedIn(profileUrl: string | null): Promise<AttioPe
 //incrementCounter, which has to read the record anyway and so takes the name off a response already paid for.
 //============================================================================================================
 
+/** [DEBUG] Wraps one write so the log says whether it happened. Re-throws unchanged; changes no control flow. */
 async function withAction<T>(action: string, run: () => Promise<T>): Promise<T> {
   try {
     const result = await run();
@@ -235,7 +263,9 @@ async function withAction<T>(action: string, run: () => Promise<T>): Promise<T> 
   }
 }
 
+/** Creates a person and returns it parsed, so the caller has both the new ID and its populated-attribute set. */
 export async function createPerson(values: CreatePersonValues): Promise<AttioPerson> {
+  //Not withAction: the log line needs the created record's name, which only exists after the response parses.
   try {
     const response = await attioFetch("/objects/people/records", {
       method: "POST",
@@ -250,12 +280,14 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
   }
 }
 
+/** Writes the given attributes. Callers pass blankPersonValues output, so this never overwrites existing data. */
 export async function patchPerson(
   personId: string,
   values: PatchPersonValues,
   personName: string = personId,
 ): Promise<void> {
   const slugs = Object.keys(values);
+  //An empty patch means every candidate attribute was already populated. Skip the request, log the reason.
   if (slugs.length === 0) {
     console.log(`[action] person ${personName} not updated - no attributes needed writing`);
     return;
@@ -268,6 +300,11 @@ export async function patchPerson(
   );
 }
 
+//---------------------------------------------------------------------------------------------------------
+//List-membership test. The three touchpoint crons gate every write on this returning true for Master TAM.
+//FLOW: 1. read the person's list entries. 2. match the slug in either spelling Attio uses for it.
+//[PERF] One request per person per event, uncached.
+//---------------------------------------------------------------------------------------------------------
 export async function isPersonInList(
   personId: string,
   listSlug: string,
@@ -276,6 +313,7 @@ export async function isPersonInList(
   const response = await attioFetch(`/objects/people/records/${personId}/entries`);
   const data = responseData(response);
   if (!Array.isArray(data)) throw new Error("Attio list entries response is invalid");
+  //Attio returns the slug as list_id.slug on some entries and list_api_slug on others; accept both.
   const member = data.some((entry) => {
     if (!isJsonObject(entry)) return false;
     const listId = objectValue(entry, "list_id");
@@ -285,6 +323,7 @@ export async function isPersonInList(
   return member;
 }
 
+/** PUT asserts the entry, so re-adding an already-listed person is a no-op rather than a duplicate. */
 export async function addPersonToList(
   personId: string,
   listSlug: string,
@@ -300,6 +339,7 @@ export async function addPersonToList(
   );
 }
 
+/** Appends a note. Attio has no upsert for notes, so calling twice produces two notes. */
 export async function createNote(
   parentObject: AttioObject,
   parentRecordId: string,
@@ -323,6 +363,7 @@ export async function createNote(
   );
 }
 
+/** Reads one counter attribute off a fetched record. Absent means zero; present but non-numeric is a config error. */
 function parseCounterValue(value: unknown, attributeSlug: string): number {
   const data = responseData(value);
   if (!isJsonObject(data)) throw new Error("Attio record response is invalid");
@@ -352,6 +393,15 @@ function fetchedRecordName(record: unknown): string | null {
   return stringValue(first.full_name) ?? stringValue(first.value);
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Raises a counter attribute by one. Read-then-write, because Attio exposes no atomic increment.
+//FLOW: 1. GET the record. 2. take its name off that response for the log. 3. parseCounterValue. 4. PATCH
+//current+1. 5. on failure, name the slug when the status suggests the attribute itself is wrong.
+//[STABILITY] Two concurrent runs against one record would both read the same value and one increment would be
+//lost. Nothing guards against overlapping invocations of the same sync.
+//[DEBUG] A 400 or 404 here almost always means the ATTIO_*_COUNTER_SLUG env value does not name a real
+//attribute on that object, so the log says so explicitly rather than reporting a bare API error.
+//---------------------------------------------------------------------------------------------------------
 export async function incrementCounter(
   objectType: Exclude<AttioObject, "deals">,
   recordId: string,
@@ -386,6 +436,14 @@ export async function incrementCounter(
   }
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Returns the deal to attach interested history to, creating one only when the person has none.
+//FLOW: 1. person already linked to a deal -> return it. 2. otherwise create at stage Interested, owned by
+//ownerEmail, linked to the person and to their company when one exists.
+//Step 1 is deliberately stage-blind: any existing deal is reused whatever phase it sits in, so an interested
+//signal updates the live deal rather than opening a second one alongside it.
+//USES: attioFetch (this module); ownerEmail comes from defaultDealOwner below.
+//---------------------------------------------------------------------------------------------------------
 export async function ensureInterestedDeal(
   person: AttioPerson,
   dealNameHint: string,
@@ -397,6 +455,7 @@ export async function ensureInterestedDeal(
     return existing;
   }
 
+  //A person with no linked company still gets a deal; the association is simply omitted.
   const companyId = person.values.company[0]?.target_record_id;
   const dealName = dealNameHint || "New Interested Deal";
   try {
@@ -461,6 +520,7 @@ export function personCompanyId(person: AttioPerson): string | null {
 function counterSlug(scope: "PERSON" | "COMPANY", provider: Provider): string {
   const envName = `ATTIO_${scope}_${provider.toUpperCase()}_COUNTER_SLUG`;
   const slug = requiredEnv(envName);
+  //[DEBUG] Not a secret, so the resolved slug is printed in full once per process to make a typo visible.
   reportConfigValue(envName, slug);
   return slug;
 }
@@ -476,6 +536,7 @@ export function companyCounterSlug(provider: Provider): string {
 /** Single accessor for the deal owner so the configured address is reported once, by domain only. */
 export function defaultDealOwner(): string {
   const owner = requiredEnv("ATTIO_DEFAULT_DEAL_OWNER");
+  //[SECURITY] Domain only. Enough to spot the wrong workspace without publishing a mailbox to the logs.
   reportConfigEmail("ATTIO_DEFAULT_DEAL_OWNER", owner);
   return owner;
 }
