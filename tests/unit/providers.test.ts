@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { fetchAircallCalls, parseAircallCall, toE164 } from "../../lib/aircall.js";
+import { fetchAircallCalls, parseAircallCall } from "../../lib/aircall.js";
+import { toE164 } from "../../lib/phone.js";
 import { callSubject, logInterestedDecision } from "../../lib/aircall-interested.js";
 import {
   fetchHeyReachConversations,
@@ -88,6 +89,11 @@ describe("Aircall client", () => {
     expect(toE164("+19497354000")).toBe("+19497354000");
     expect(toE164(null)).toBeNull();
     expect(toE164("")).toBeNull();
+    //A "+" anywhere but the front is discarded with the rest of the punctuation, never carried into the result.
+    expect(toE164("555+1234567")).toBe("+5551234567");
+    //Too short to dial and too long to be a number: a fragment, not something to write into the CRM.
+    expect(toE164("555-0123")).toBeNull();
+    expect(toE164("+1234567890123456")).toBeNull();
   });
 
   test("names the call's other party for a log line, falling back to the number", () => {

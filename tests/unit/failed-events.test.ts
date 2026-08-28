@@ -97,18 +97,18 @@ function aircallMock(cursorRow?: unknown) {
     if (url.includes("objects/people/records/")) {
       return init?.method === "PATCH"
         ? jsonResponse({})
-        : jsonResponse({ data: { values: { number_of_calls: [] } } });
+        : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [] } } });
     }
     if (url.includes("objects/companies/records/company-1")) {
       // The write that fails, and keeps failing, for call 1.
       return init?.method === "PATCH"
         ? jsonResponse({ error: "attio rejected this record" }, 500)
-        : jsonResponse({ data: { values: { number_of_calls: [{ value: 3 }] } } });
+        : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [{ value: 3 }] } } });
     }
     if (url.includes("objects/companies/records/company-2")) {
       return init?.method === "PATCH"
         ? jsonResponse({})
-        : jsonResponse({ data: { values: { number_of_calls: [{ value: 5 }] } } });
+        : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [{ value: 5 }] } } });
     }
     if (url.includes("/notes")) return jsonResponse({});
     throw new Error(`Unexpected fetch: ${url}`);

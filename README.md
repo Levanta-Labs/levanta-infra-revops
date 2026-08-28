@@ -25,7 +25,9 @@ Configure local integrations by copying `.env.example` to `.env.local` and suppl
 
 The Vercel functions handle two workflows:
 
-1. Interested webhooks find or create an Attio Person, ensure an Interested Deal exists, write source-history notes, set Lead Source, and add the Person to the DNC list.
+1. Interested events resolve an Attio Person, resolve or create their Company, ensure an Interested Deal exists,
+   write source-history notes, fill blank attributes on all three records, and suppress the lead on every
+   outbound platform.
 2. Cron jobs poll each provider for new touchpoints - Instantly and HeyReach every five minutes, Aircall hourly. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
 
 The three syncs do not write the same records, by design:
@@ -40,11 +42,128 @@ An Aircall touchpoint deliberately writes no Person note, because the call and i
 and the Person only needs the count. The note exists on the Company as the roll-up view. A consequence worth knowing:
 an Aircall touchpoint for a Person with no associated Company records only the counter increment.
 
+### The interested workflow is shared, and cannot overwrite
+
+All three providers converge on `recordInterestedLead` in `lib/interested.ts`. Each provider contributes only
+three things - how it parses its own payload, how it looks a Person up in Attio, and how it renders its own
+message history into a note. Everything after that is one code path:
+
+| Step | What it does |
+| --- | --- |
+| 1. Person | The provider's own lookup order, creating a Person from the lead when there is no match |
+| 2. Company | The Company already linked to the Person if there is one, else found by domain then by exact name, else created - but only when a name or domain exists to create it from |
+| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is named strictly `<company> - Interested` |
+| 4. Notes | The provider's rendered history, on the Person and on the Deal |
+| 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
+| 6. Suppression | The Attio DNC list plus every registered outbound platform |
+
+**Nothing overwrites.** `updateAttioAttributes` reads what a record already holds and writes only the
+attributes that are blank, so third-party data fills gaps and never contradicts the CRM. Someone who corrected
+a job title in Attio will not find it replaced by whatever the provider still believes.
+
+The one exception is the multiselect attributes - `email_addresses`, `phone_numbers`, `domains`. A PATCH replaces
+an attribute wholesale rather than appending to it, so for these the existing entries are read and sent back
+alongside the new one. A second address for a lead is additive information, and skipping the write outright is
+what previously dropped it. If any existing entry cannot be read back in full, the attribute is declined
+outright rather than risking a write that would delete real data.
+
+Values that will not fit an Attio attribute are dropped rather than guessed at: a headcount or revenue figure
+that does not parse, a "website" that is not really a domain, a postal address whose country does not resolve to
+an ISO code. A blank attribute is recoverable; a confidently wrong value in a CRM that nothing will ever
+overwrite is not.
+
+**A rejected attribute cannot fail the event.** Attributes are written as one PATCH, which is the only request
+usually made. If Attio rejects that write on its *content* - a `400` or `422`, meaning some value it will not
+accept - the attributes are retried one at a time so that one bad value costs only itself, and whatever is still
+rejected is dropped. A rejection that is not about content (`401`, `404`, a `5xx`, a transport failure) is not
+retried, because no single attribute caused it and N further attempts would fail identically.
+
+Either way the step does not raise. By the time attributes are written the Person, Company, Deal, and notes are
+already committed, and losing all of that because one provider value would not fit an Attio attribute is a far
+worse outcome than a blank field. What was dropped is logged under `[attio]` - an attribute silently missing with
+no record of why is undiagnosable. The one part that still raises is the *read*: without knowing what a record
+already holds there is no way to write to it without risking an overwrite.
+
+### Interest on one platform means suppression on all of them
+
+Interest is a fact about the person, not about the channel that noticed it. A lead who answers the phone must
+stop receiving the cold email sequence too, and the reverse - suppressing only the channel that happened to
+report first is how a lead ends up pitched twice. So every interested event, whatever found it, runs the same
+`suppressInterestedLead`:
+
+| Channel | Action | Needs |
+| --- | --- | --- |
+| Attio | Add the Person to the DNC list | the Person |
+| Instantly | Add the address to the workspace blocklist | an email address |
+| HeyReach | Stop the lead in every campaign still able to message them | a LinkedIn profile URL |
+
+Aircall is absent because it is a phone system with no campaign or blocklist API - there is nothing there to
+call. Aircall dialling is governed by the Attio DNC list, which is why that is the first channel and the one
+that matters most.
+
+Each channel is independent and a failure in one does not stop the others: half the platforms suppressed is
+strictly better than one suppressed and the rest untouched because the first threw. Failures are returned in the
+route's response body rather than raised, so an unreachable platform cannot fail an event Attio already
+recorded. A channel reporting `skipped` is not a failure - it means the lead is not present on that platform,
+usually for want of the one identifier it works by.
+
+### Adding a fourth platform
+
+Provider support is a register, not a set of branches. Adding one is an append plus its own extractor:
+
+1. **`lib/providers.ts`** - add an entry to `SOURCES` with its `displayName`. That single entry widens the
+   `Provider` type and derives the Lead Source and Deal Source strings (`<Name> Cold Outreach` and
+   `<Name> Cold Outreach - Automated`). If the platform also sends outbound and must be silenced, append a
+   `SuppressionChannel` to `THIRD_PARTY_SUPPRESSION_CHANNELS`; from that moment it is suppressed for every
+   provider, with no change to any route.
+2. **A provider module** - parse its payload and return an `InterestedLead` via `interestedLead()`, naming only
+   the fields it actually has. Everything it cannot supply stays null and simply is not written.
+3. **A route or cron** - call `recordInterestedLead` with the lead, a `findPerson` lookup, and a `history`
+   renderer.
+4. **Two environment variables** - `ATTIO_PERSON_<KEY>_COUNTER_SLUG` and `ATTIO_COMPANY_<KEY>_COUNTER_SLUG`,
+   derived from the provider key. These throw on first use if absent, so a missing one fails loudly rather than
+   writing a counter nobody reads.
+
+Nothing in the Attio mapping, the write path, the company resolution, or the deal naming needs to change.
+
+### What each platform contributes
+
+Only fields that exist on both sides are mapped. The providers are not equally rich:
+
+| Attio target | Aircall | Instantly | HeyReach |
+| --- | --- | --- | --- |
+| Person `name`, `email_addresses` | yes | yes | yes |
+| Person `phone_numbers` | yes | yes | - |
+| Person `linkedin` | - | yes | yes |
+| Person `job_title` | - | yes | yes |
+| Person `description` | yes | - | yes |
+| Person `location` | - | yes | yes |
+| Person `campaign_name`, `date_added`, `lead_source`, `company` | yes | yes | yes |
+| Company `name` | yes | yes | yes |
+| Company `domains`, `primary_location`, `employee_range`, `estimated_arr_usd` | - | yes | - |
+| Deal `lead_source`, `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes |
+| Deal `phone_number_7` | yes | yes | - |
+| Deal `linkedin` | - | yes | yes |
+| Deal `website`, `industry`, `employees`, `revenue` | - | yes | - |
+
+Aircall is the thinnest by a wide margin: no LinkedIn URL, job title, industry, headcount, or revenue exists
+anywhere in its API, and a name or company appears only when the dialled number was already in Aircall's address
+book - which for a cold campaign it usually is not. A cold dial therefore creates no Company at all, because a
+company record named after a phone number is worse than no company.
+
+Instantly is the richest, but almost none of it is on the webhook. `/api/instantly-interested` reads the lead
+record back (`POST /leads/list`) for the job title, LinkedIn URL, phone, industry, headcount, revenue, location,
+and company address, which live under the campaign's custom variables. That lookup is best-effort: if it fails,
+the event is still recorded from the webhook body alone.
+
+HeyReach's enrichment is free. The route already fetches the conversation for the note, and every entry carries
+the correspondent's position, headline, location, company, and all three of HeyReach's email fields.
+
 ## Webhook and cron routes
 
 | Route | Source | Expected request |
 | --- | --- | --- |
-| `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
+| `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields; the route reads the lead record back for enrichment |
 | `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
 | `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET hourly (`0 * * * *`); also runs the interested workflow for any call whose completion falls in the window and already carries an `AIRCALL_INTERESTED_TAGS` tag |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
@@ -139,7 +258,7 @@ Keep credentials in `.env.local` for local development and configure the same va
 
 | Variable | Purpose |
 | --- | --- |
-| `ATTIO_API_KEY` | Attio API token with record, list-entry, and note permissions |
+| `ATTIO_API_KEY` | Attio API token with record, list-entry, and note permissions on People, Companies, and Deals |
 | `ATTIO_DEFAULT_DEAL_OWNER` | Workspace member email used when creating a Deal |
 | `ATTIO_PERSON_AIRCALL_COUNTER_SLUG` | Person counter slug for Aircall calls |
 | `ATTIO_PERSON_INSTANTLY_COUNTER_SLUG` | Person counter slug for Instantly emails |
@@ -149,15 +268,18 @@ Keep credentials in `.env.local` for local development and configure the same va
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
-| `INSTANTLY_API_KEY` | Instantly v2 API key with `emails:read` or broader scope |
+| `INSTANTLY_API_KEY` | Instantly v2 API key; needs to read emails and leads, and to write blocklist entries |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
-| `HEYREACH_API_KEY` | HeyReach API key |
+| `HEYREACH_API_KEY` | HeyReach API key; needs to read conversations and to stop leads in campaigns |
 | `HEYREACH_WEBHOOK_SECRET` | Secret configured on the HeyReach webhook as the `x-webhook-secret` custom header |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Server-side Supabase secret key; never expose it to a client |
 | `CRON_SECRET` | Vercel Cron authorization secret |
 
 Legacy Supabase JWT projects may use `SUPABASE_SERVICE_ROLE_KEY` instead of `SUPABASE_SECRET_KEY`.
+
+A fourth provider adds two more counter-slug variables, named from its provider key - see
+[Adding a fourth platform](#adding-a-fourth-platform).
 
 ## Cursor persistence
 
@@ -194,6 +316,21 @@ one is reported so it can be reconciled by hand:
 
 The Supabase server key must have `SELECT`, `INSERT`, and `UPDATE` access to the table. Keep it in Vercel server-side environment variables only.
 
+## How the code is annotated
+
+Comment tags mark what a block is *for*, so the diagnostic scaffolding can be told from the rules at a glance:
+
+| Tag | Meaning |
+| --- | --- |
+| `[LOGIC]` | A business rule. Changing it changes what ends up in the CRM |
+| `[DEBUG]` | Diagnostic only - a log line, or a branch that exists to make a failure legible. Removing it would change no record |
+| `[SECURITY]` | A guard against writing the wrong data, exposing a secret, or acting on an unauthenticated request |
+| `[STABILITY]` | What happens when something fails partway - what is already committed, what is retried, what is not |
+| `[PERF]` | A cost worth knowing about: requests per event, how a window widens work |
+
+Functions carry a `FLOW:` list of numbered steps in plain English, and a `USES:` line naming what they depend
+on and where it lives, so a reader can follow a call without searching for its imports.
+
 ## Reading a run from the logs
 
 Every environment read and every write is reported to the console, so a misconfigured deployment can be identified,
@@ -207,10 +344,12 @@ Secret values are never logged.
 | `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
 | `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
 | `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_PERSON_*` or `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
-| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or which HeyReach lead is being handled. Ends with a completion line naming the person and deal |
+| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or which HeyReach lead is being handled. Ends with a line counting the history entries summarised and the platforms that failed to suppress |
 | `[interested]` | The Aircall interested workflow, naming the call and who it was with. Always `poll`: the cron is the only caller. Every call the check sees produces a decision line listing every tag it carried, whether or not any matched, and on a miss the configured set it was compared against; a run reporting nothing interested is therefore readable as "these calls, these tags, no match" rather than as silence. A match is followed by the person and deal it finished with, or by the reason it could not: no way to reach a person (the call carried neither an email nor a phone number), or a failure passed over |
-| `[lookup]` | Each person search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list |
-| `[action]` | Each write and its outcome: person created, person updated with the attribute list, person left untouched because every target attribute was already populated, deal created, deal reused, note added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
+| `[lookup]` | Each person and company search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list. A company line also says when the person was already linked to one, or when neither Attio nor the provider names one and the deal will be named for an unknown company. An Instantly lead lookup names which enrichment fields arrived, by field name only |
+| `[action]` | Each write and its outcome: person or company created, a record updated with the attribute list, a record left untouched because every target attribute was already populated, deal created, deal reused, note added, blocklist entry added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
+| `[suppress]` | One line per outbound platform - suppressed, skipped with the identifier it lacked, or `FAILED` with the reason - then a summary naming every platform and its outcome. A failure here is reported, not raised: the Attio record was already written |
+| `[attio]` | An attribute was not written and the event continued anyway: a multiselect left alone because its existing entries could not all be read back, so a replacing write would have risked deleting real data; or a value Attio rejected, named individually, with a count of what was written and what was dropped |
 | `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list. An Aircall line names the touchpoint process, to separate it from the interested check running over the same call |
 | `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor. Aircall reports two counts, because its fetch is deliberately wider than its scope: `fetched` is everything the two-hour reach-back returned, `scope` is the subset completing at or after the floor the run acts on. Only the second is expected to match the processed and interested figures; the response body carries the same pair as `callsFound` and `callsInScope` |
 
@@ -231,7 +370,11 @@ Run the compiler and isolated unit suite:
 bun run check
 ```
 
-The unit suite mocks every external write and covers provider response validation, pagination, handlers, touchpoint event identity, Attio helpers, and Supabase cursor persistence.
+The unit suite mocks every external write and covers provider response validation, pagination, handlers, touchpoint
+event identity, Attio helpers, and Supabase cursor persistence. The shared interested workflow is covered
+separately in `tests/unit/interested.test.ts`: the attribute transforms at each bucket boundary, the never-overwrite
+rule, the multiselect merge and the cases where it declines to write, the strict deal naming, and suppression
+continuing across platforms after one of them fails.
 
 Run opt-in, read-only smoke tests against configured live accounts:
 

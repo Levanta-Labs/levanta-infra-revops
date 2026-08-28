@@ -23,6 +23,17 @@ export interface HeyReachProfile {
   readonly firstName: string | null;
   readonly lastName: string | null;
   readonly companyName: string | null;
+  //Everything below is enrichment the interested workflow maps onto Attio. It arrives on the correspondent
+  //profile of a conversation the route already fetches for the note, so reading it costs no extra request.
+  readonly position: string | null;
+  readonly headline: string | null;
+  readonly about: string | null;
+  readonly location: string | null;
+  //HeyReach spells an address three ways and any one of them may be the only one set: what the workspace
+  //entered by hand, what HeyReach enriched, and what the profile itself carried.
+  readonly emailAddress: string | null;
+  readonly enrichedEmailAddress: string | null;
+  readonly customEmailAddress: string | null;
 }
 
 export interface HeyReachConversation {
@@ -65,6 +76,13 @@ function parseProfile(value: unknown): HeyReachProfile {
     firstName: stringValue(value.firstName),
     lastName: stringValue(value.lastName),
     companyName: stringValue(value.companyName),
+    position: stringValue(value.position),
+    headline: stringValue(value.headline),
+    about: stringValue(value.about),
+    location: stringValue(value.location),
+    emailAddress: stringValue(value.emailAddress),
+    enrichedEmailAddress: stringValue(value.enrichedEmailAddress),
+    customEmailAddress: stringValue(value.customEmailAddress),
   };
 }
 

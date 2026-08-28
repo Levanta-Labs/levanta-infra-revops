@@ -15,6 +15,7 @@ describe("HeyReach interested payload shapes", () => {
       firstName: "Ada",
       lastName: "Lovelace",
       companyName: "Engines",
+      campaignName: null,
     });
   });
 
@@ -34,6 +35,7 @@ describe("HeyReach interested payload shapes", () => {
       firstName: "Ada",
       lastName: "Lovelace",
       companyName: "Engines",
+      campaignName: null,
     });
   });
 
@@ -77,6 +79,8 @@ describe("HeyReach interested payload shapes", () => {
       firstName: "Ada",
       lastName: "Lovelace",
       companyName: "Engines",
+      //The flat auto-tag payload carries the campaign at the top level, alongside the lead-prefixed fields.
+      campaignName: "Q3 Founders",
     });
   });
 

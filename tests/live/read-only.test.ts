@@ -1,10 +1,6 @@
 import { expect, test } from "bun:test";
-import {
-  companyCounterSlug,
-  LISTS,
-  personCounterSlug,
-  type Provider,
-} from "../../lib/attio.js";
+import { companyCounterSlug, LISTS, personCounterSlug } from "../../lib/attio.js";
+import type { Provider } from "../../lib/providers.js";
 import {
   AIRCALL_BASE,
   aircallAuthHeader,

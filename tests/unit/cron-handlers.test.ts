@@ -97,10 +97,10 @@ describe("cron handlers", () => {
         });
       }
       if (url.includes("objects/people/records/person-1")) {
-        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { values: { number_of_calls: [] } } });
+        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [] } } });
       }
       if (url.includes("objects/companies/records/company-1")) {
-        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { values: { number_of_calls: [] } } });
+        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [] } } });
       }
       if (url.includes("/notes")) return jsonResponse({});
       if (url.includes("api.aircall.io")) {
@@ -153,8 +153,12 @@ describe("cron handlers", () => {
         return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: { associated_deals: [] } }] });
       }
       if (url.includes("objects/people/records/person-1")) return jsonResponse({ data: {} });
-      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+      if (url.includes("objects/deals/records")) {
+        return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
+      }
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      //Suppression now runs across every outbound platform, not just the Attio DNC list.
+      if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
       if (url.includes("/notes")) return jsonResponse({ data: {} });
       if (url.includes("api.aircall.io")) {
         return jsonResponse({
@@ -204,8 +208,12 @@ describe("cron handlers", () => {
         return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: { associated_deals: [] } }] });
       }
       if (url.includes("objects/people/records/person-1")) return jsonResponse({ data: {} });
-      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+      if (url.includes("objects/deals/records")) {
+        return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
+      }
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      //Suppression now runs across every outbound platform, not just the Attio DNC list.
+      if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
       if (url.includes("/notes")) return jsonResponse({ data: {} });
       if (url.includes("api.aircall.io")) {
         //The requested window must reach back past the cursor, or this call would not be returned at all.
@@ -266,10 +274,14 @@ describe("cron handlers", () => {
       }
       if (url.includes("objects/people/records/person-1")) {
         //Serves both the interested patch and the counter's read-then-write.
-        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { values: { number_of_calls: [] } } });
+        return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [] } } });
       }
-      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+      if (url.includes("objects/deals/records")) {
+        return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
+      }
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      //Suppression now runs across every outbound platform, not just the Attio DNC list.
+      if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
       if (url.includes("/notes")) return jsonResponse({ data: {} });
       if (url.includes("api.aircall.io")) {
         requestedFromMs = Number(new URL(url).searchParams.get("from")) * 1000;

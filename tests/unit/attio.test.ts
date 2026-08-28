@@ -1,12 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   addPersonToList,
-  blankPersonValues,
   createNote,
   findPersonByEmail,
   incrementCounter,
   parseAttioPerson,
-  patchPerson,
+  patchRecord,
 } from "../../lib/attio.js";
 import { installFetchMock, jsonResponse } from "./test-utils.js";
 
@@ -23,6 +22,7 @@ const person = {
 
 const parsedPerson = {
   ...person,
+  rawValues: person.values,
   populatedAttributes: new Set(["associated_deals", "company", "name"]),
 };
 
@@ -51,49 +51,11 @@ describe("Attio record parsing", () => {
   });
 });
 
-describe("filling only blank person attributes", () => {
-  const existing = parseAttioPerson({
-    id: { record_id: "person-1" },
-    values: {
-      name: [{ full_name: "Ada Lovelace" }],
-      email_addresses: [],
-      lead_source: [{ value: "Instantly Cold Outreach" }],
-    },
-  });
-
-  test("fills a blank attribute from the third party", () => {
-    expect(
-      blankPersonValues(existing, { email_addresses: ["ada@example.com"] }),
-    ).toEqual({ email_addresses: ["ada@example.com"] });
-  });
-
-  test("never overwrites an attribute Attio already holds", () => {
-    expect(
-      blankPersonValues(existing, {
-        name: [{ first_name: "A", last_name: "L", full_name: "A. Lovelace" }],
-        lead_source: "Aircall Cold Outreach",
-      }),
-    ).toEqual({});
-  });
-
-  test("fills blanks and preserves populated attributes in the same call", () => {
-    expect(
-      blankPersonValues(existing, {
-        email_addresses: ["ada@example.com"],
-        linkedin: "https://linkedin.com/in/ada",
-        name: [{ first_name: "A", last_name: "L", full_name: "A. Lovelace" }],
-        lead_source: "Aircall Cold Outreach",
-      }),
-    ).toEqual({
-      email_addresses: ["ada@example.com"],
-      linkedin: "https://linkedin.com/in/ada",
-    });
-  });
-
-  test("skips the Attio write entirely when nothing is blank", async () => {
+describe("writing attributes", () => {
+  test("skips the Attio write entirely when there is nothing to write", async () => {
     const mock = installFetchMock(() => jsonResponse({ data: {} }));
     try {
-      await patchPerson("person-1", {});
+      await patchRecord("people", "person-1", {});
       expect(mock.calls).toHaveLength(0);
     } finally {
       mock.restore();
@@ -139,7 +101,7 @@ describe("Attio API helpers", () => {
   test("reads and increments numeric counters", async () => {
     const mock = installFetchMock((_url, _init, index) =>
       index === 0
-        ? jsonResponse({ data: { values: { number_of_calls: [{ value: 2 }] } } })
+        ? jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [{ value: 2 }] } } })
         : jsonResponse({ data: {} }),
     );
     try {

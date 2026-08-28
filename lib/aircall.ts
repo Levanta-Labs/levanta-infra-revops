@@ -1,4 +1,7 @@
 import { AIRCALL_BASE, aircallAuthHeader, credentialHint } from "./endpoints.js";
+//Aircall spells a number for display ("+1 949-735-4000"); Attio matches E.164. One shared normaliser, because
+//a lookup keyed on the wrong spelling misses and creates a duplicate Person - see lib/phone.ts.
+import { toE164 } from "./phone.js";
 import {
   arrayValue,
   isJsonObject,
@@ -21,6 +24,11 @@ export interface AircallContact {
   readonly lastName: string | null;
   readonly companyName: string | null;
   readonly email: string | null;
+  //Every number on the address-book entry, E.164. The dialled raw_digits is only one of them, and the others
+  //are as much this person's numbers as that one is.
+  readonly phoneNumbers: readonly string[];
+  //Aircall's free-text notes field on a contact. Whatever an agent wrote there about who this person is.
+  readonly information: string | null;
 }
 
 export interface AircallCall {
@@ -35,22 +43,21 @@ export interface AircallCall {
   readonly contact: AircallContact | null;
 }
 
-/**
- * Aircall reports a number as `raw_digits`, punctuated for display ("+1 949-735-4000"), while Attio stores and
- * matches on E.164 ("+19497354000"), so a lookup keyed on the raw value misses. Every raw_digits carries its
- * leading "+" - across a 300-call sample no number arrived without one - so normalising is dropping everything
- * that is not a digit and putting the "+" back.
- */
-export function toE164(rawDigits: string | null): string | null {
-  if (!rawDigits) return null;
-  const digits = rawDigits.replace(/\D/g, "");
-  return digits ? `+${digits}` : null;
-}
-
 function parseTag(value: unknown): AircallTag | null {
   if (!isJsonObject(value)) return null;
   const name = stringValue(value.name);
   return name ? { name } : null;
+}
+
+/** Every number on a contact, normalised. Aircall lists them as objects; a stray string is accepted too. */
+function contactPhoneNumbers(contact: Record<string, unknown>): readonly string[] {
+  const numbers: string[] = [];
+  for (const candidate of arrayValue(contact, "phone_numbers")) {
+    const raw = typeof candidate === "string" ? candidate : isJsonObject(candidate) ? stringValue(candidate.value) : null;
+    const e164 = toE164(raw);
+    if (e164 && !numbers.includes(e164)) numbers.push(e164);
+  }
+  return numbers;
 }
 
 function contactEmail(contact: Record<string, unknown>): string | null {
@@ -78,6 +85,8 @@ function parseContact(value: unknown): AircallContact | null {
     lastName: stringValue(value.last_name),
     companyName: stringValue(value.company_name),
     email: contactEmail(value),
+    phoneNumbers: contactPhoneNumbers(value),
+    information: stringValue(value.information),
   };
 }
 
