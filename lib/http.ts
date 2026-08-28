@@ -13,6 +13,7 @@ export async function requestJson(request: Request): Promise<unknown> {
   }
 }
 
+/** [DEBUG] Terminal catch for every route. Logs the raw error, returns only its message to the caller. */
 export function serverError(label: string, error: unknown): Response {
   console.error(label, error);
   return json({ error: errorMessage(error) }, 500);
@@ -52,6 +53,13 @@ function verifySecret(
   return false;
 }
 
+//---------------------------------------------------------------------------------------------------------
+//[SECURITY] Gate on all three cron routes. Called first in every GET, before any external request.
+//FLOW: 1. no CRON_SECRET configured -> reject; nothing can be verified. 2. no authorization header -> reject.
+//3. not "Bearer <secret>" -> reject. 4. otherwise compare against the configured value.
+//Each branch is distinct because the four failures need different fixes, and a bare 401 names none of them.
+//[DEBUG] Rejections log the reason and how the two values diverge - never either value.
+//---------------------------------------------------------------------------------------------------------
 export function isAuthorizedCron(request: Request): boolean {
   const secret = optionalEnv("CRON_SECRET");
   if (secret === null) {
@@ -76,6 +84,11 @@ export function isAuthorizedCron(request: Request): boolean {
   return verifySecret("cron", "CRON_SECRET", "the authorization header", header.slice(BEARER.length), secret);
 }
 
+/**
+ * [SECURITY] Gate on the Instantly and HeyReach webhook routes. Both providers send a shared value in a custom
+ * x-webhook-secret header. Called before the request body is read, so an unauthenticated caller never reaches
+ * a parser. Same three rejection branches as isAuthorizedCron, for the same diagnostic reason.
+ */
 export function hasWebhookSecret(request: Request, envName: string): boolean {
   const secret = optionalEnv(envName);
   if (secret === null) {

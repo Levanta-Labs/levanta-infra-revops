@@ -17,14 +17,16 @@ bun install
 bun run check
 ```
 
-The project requires Bun `1.3.13`. Configure local integrations by copying `.env.example` to `.env.local` and supplying the required credentials before invoking a webhook or cron route.
+The project runs on Bun `1.x`; `packageManager` pins `1.3.13` for local installs, and `vercel.json` selects the
+`1.x` runtime (Vercel accepts only `1.x` or `1.4.x` there, so the exact patch cannot be pinned in both places).
+Configure local integrations by copying `.env.example` to `.env.local` and supplying the required credentials before invoking a webhook or cron route.
 
 ## How CRM activity is synchronized
 
 The Vercel functions handle two workflows:
 
 1. Interested webhooks find or create an Attio Person, ensure an Interested Deal exists, write source-history notes, set Lead Source, and add the Person to the DNC list.
-2. Five-minute cron jobs poll each provider for new touchpoints. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
+2. Cron jobs poll each provider for new touchpoints - Instantly and HeyReach every five minutes, Aircall hourly. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
 
 The three syncs do not write the same records, by design:
 
@@ -42,24 +44,70 @@ an Aircall touchpoint for a Person with no associated Company records only the c
 
 | Route | Source | Expected request |
 | --- | --- | --- |
-| `/api/aircall-interested` | Aircall | A documented Aircall webhook envelope; matching is driven by `AIRCALL_INTERESTED_TAGS` |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields |
 | `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
-| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes; also runs the interested workflow for any call in the window already carrying an `AIRCALL_INTERESTED_TAGS` tag |
+| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET hourly (`0 * * * *`); also runs the interested workflow for any call whose completion falls in the window and already carries an `AIRCALL_INTERESTED_TAGS` tag |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 
-Aircall applies an outcome tag after the call, so the webhook is not the only way an interested call is found. The
-touchpoint cron reads each call's tags straight from the API and runs the same workflow - `processAircallInterested`,
-shared with the webhook - for any call in its window that is already tagged. The two paths are complementary rather
-than redundant: the webhook reacts immediately but only to the tags on the payload it was sent, while the poll sees
-whatever the API holds by the time it runs. Because a tag is applied after the call, a high-water cursor alone would
-carry a call out of the window before the tag it is wanted for exists, so every run re-reads the last ten minutes for
-the interested check. Calls in that lookback are re-checked even though the cursor has passed them: an interested
-call is therefore handled on two consecutive runs and its notes are written twice, which is deliberate - a duplicate
-note can be deleted, a missed booking disappears silently. Touchpoint counters stay cursor-gated and are never
-double-counted. Measured against this workspace's tag history, 63 of 67 hand-applied tags landed within five minutes
-of the call ending, three within thirty, and one took 165 minutes; the last of those is still missed.
+### Aircall interested leads are found by polling, not by webhook
+
+There is no `/api/aircall-interested` route. It was removed. Aircall applies an outcome tag *after* the call ends,
+so the payload the webhook received almost never carried the tag yet, and the touchpoint cron had to cover the gap
+regardless; running both meant every tagged call was recorded twice. The workflow now lives in
+`lib/aircall-interested.ts` and has exactly one caller, the cron.
+
+Each run reads every call's tags straight from the API and runs `processAircallInterested` for any call already
+tagged. Because a tag is applied after the call, a high-water cursor alone would carry a call past the check before
+its tag exists, so the interested check is not cursor-gated. Its floor is `min(cursor, now - INTERESTED_LOOKBACK_MS)`,
+with the lookback set to ten minutes.
+
+**This sync runs hourly, and at that cadence the ten-minute lookback does not normally bind.** The cursor sits about
+62 minutes back (the gap plus the two-minute `CURSOR_GRACE_MS`), so `min()` picks the cursor and real tag tolerance
+is ~62 minutes. The constant only takes effect when two runs land within ten minutes of each other - a manual
+trigger behind a scheduled one, or a retry - which is worth keeping it for, but it is not what sets tolerance day to
+day. Shortening the cadence below ten minutes, or widening the constant past the gap, would make it bind again.
+
+What the hourly cursor floor gives you, measured against this workspace's tag history (63 of 67 hand-applied tags
+landed within five minutes of the call ending, three within thirty, one took 165 minutes):
+
+- **Tag coverage: 66 of 67.** Only the 165-minute outlier is missed.
+- **One note per interested call.** A call is normally checked on a single run. At a five-minute cadence the
+  ten-minute lookback overlapped every interested call across two consecutive runs and wrote its notes twice by
+  design; hourly, that overlap shrinks to calls completing inside the two-minute grace band.
+- **Latency up to an hour** before a booking's deal, notes, and DNC entry reach Attio.
+- **Heavier runs.** One invocation processes an hour of calls, each touchpoint being up to eight sequential Attio
+  requests. See the note on `maxDuration` under Deployment.
+
+If the lookback is ever retuned, two figures move together: tag tolerance, and how many times an interested call's
+notes are written, which is the lookback divided by the cadence. Having both wide coverage and no duplicates needs a
+record of which calls were already recorded, which does not exist today.
+
+Touchpoint counters are cursor-gated at any cadence and never double-counted.
+
+### Why the Aircall window reaches back two hours
+
+Aircall's `/calls` endpoint filters on a call's **creation** time. This sync places calls on its timeline by
+**completion** time, because that is when a call becomes a countable touchpoint and when its tag can exist. The two
+do not coincide, and the gap between them is the call's duration.
+
+A call is therefore visible to the query from the moment it starts, but `fetchAircallCalls` discards it until it is
+`done`. With a window only as wide as the completion window, a call lasting longer than that window was filtered out
+as unfinished on every run covering its start, then fell out of range before it ever looked finished - lost
+entirely, touchpoint and tag alike. Longer cron intervals do not fix this; they only move the boundary.
+
+So the request reaches back `MAX_CALL_DURATION_MS` (two hours) below the oldest completion the run acts on. That
+reach is also why the interested check needs an explicit floor of its own rather than simply acting on everything
+the fetch returned: without one it would re-record up to two hours of already-handled calls on every run. The
+extra calls the margin pulls in are rejected by two independent gates - `isAfterCursor` for touchpoints, and the
+completion floor for the interested check, which is deliberately not cursor-gated.
+
+**This sets a hard ceiling on call length.** A call is caught while its duration stays under roughly this value -
+about 2h02m at the current setting, since the floor trails the completion by up to `CURSOR_GRACE_MS`. Anything
+longer is dropped in full, touchpoint and tag alike, and dropped *silently*: it never reaches the fetch, so no
+counter, log line, or failure entry records that it existed. Widening the constant costs pagination and nothing
+else. Narrowing it below the longest call the account actually makes reintroduces exactly the loss it was added
+to fix.
 
 Aircall reports a number as `raw_digits`, punctuated for display (`+1 949-735-4000`), while Attio stores and matches
 E.164 (`+19497354000`), so every lookup keyed on the raw value missed. `toE164` normalises it, and both Aircall paths
@@ -67,16 +115,23 @@ apply it: the interested workflow inside `extractAircallFields`, so the number w
 too, and the touchpoint sync before its own person lookup.
 
 The interested step is given its own error handling inside the run, so a failure there cannot stop the touchpoint
-counters from being written, or the reverse. It needs `ATTIO_DEFAULT_DEAL_OWNER` and `AIRCALL_INTERESTED_TAGS`, which
-the cron route now reads as well as the webhook.
+counters from being written, or the reverse. It needs `ATTIO_DEFAULT_DEAL_OWNER` and `AIRCALL_INTERESTED_TAGS`; the
+latter is read before any network call, so a missing or empty list fails the run without first paying for the fetch.
 
-All three interested webhooks are configured directly in the provider, pointed at the production host
+Both interested webhooks are configured directly in the provider, pointed at the production host
 `https://levanta-crm-overhaul.vercel.app`. Instantly and HeyReach authenticate with an `x-webhook-secret` custom
-header whose value must match the corresponding environment variable. Aircall instead sends its own issued token
-inside the payload, so it needs no custom header. Point providers at the production hostname, never at a
-deployment-specific URL, which is pinned to a single deployment.
+header whose value must match the corresponding environment variable. Point providers at the production hostname,
+never at a deployment-specific URL, which is pinned to a single deployment. Any Aircall webhook still pointed at
+this project should be removed in Aircall: the route no longer exists and every delivery will 404.
 
-The HeyReach integration uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints. Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
+The HeyReach integration uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints.
+
+HeyReach applies its `from`/`to` filter with **day** granularity, so a five-minute run receives every conversation
+touched since UTC midnight, each with its full message list, and hashes every message before the per-message cursor
+check rejects it. Cost therefore grows through the day. Pre-filtering out conversations with no activity past the
+cursor would avoid most of that work; it is deliberately not done, so the per-message check absorbs the whole load.
+
+Instantly uses the current v2 email schema (`timestamp_created`, numeric `ue_type`, nullable `lead`, and nested `body`) and its documented timestamp filters. Scheduled and automatic-reply emails are not counted as touchpoints.
 
 ## Configuration
 
@@ -93,7 +148,6 @@ Keep credentials in `.env.local` for local development and configure the same va
 | `ATTIO_COMPANY_INSTANTLY_COUNTER_SLUG` | Company counter slug for Instantly emails |
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
-| `AIRCALL_WEBHOOK_TOKEN` | Token Aircall issues and includes in the webhook JSON payload; copy it from Aircall rather than choosing a value |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
 | `INSTANTLY_API_KEY` | Instantly v2 API key with `emails:read` or broader scope |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
@@ -114,6 +168,12 @@ All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process m
 - `heyreach-touchpoints`
 
 `cursor_timestamp` is the completed high-water mark. `cursor_value` contains a JSON array of event IDs at that exact timestamp, preventing events with identical timestamps from being lost or replayed. A missing row starts with a ten-minute lookback and is created automatically. `last_updated_at` is refreshed on every upsert.
+
+At the end of a run the mark is parked at `now - CURSOR_GRACE_MS` (two minutes), not at `now`. Provider timestamps
+are generated on the provider's clock and become readable through its API some time later; parking at the function's
+own `Date.now()` silently skipped anything landing in that gap. Re-reading two minutes costs nothing, because
+`isAfterCursor` rejects the overlap - and when the newest handled event is more recent than the parked value the
+cursor is left untouched, so its boundary ID set survives and that event is not replayed.
 
 ### A touchpoint that fails partway through
 
@@ -147,12 +207,12 @@ Secret values are never logged.
 | `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
 | `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
 | `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_PERSON_*` or `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
-| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or that a payload had no email and no phone. Ends with a completion line naming the person and deal |
-| `[interested]` | The Aircall interested workflow, naming the call, who it was with, and which caller found it - `webhook` for the payload the provider sent, `poll` for a tag the touchpoint cron read from the API. Every call the check sees produces a decision line listing every tag it carried, whether or not any matched, and on a miss the configured set it was compared against; a run reporting nothing interested is therefore readable as "these calls, these tags, no match" rather than as silence. A match is followed by the person and deal it finished with, or by the reason it could not: no way to reach a person, or a failure passed over |
+| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or which HeyReach lead is being handled. Ends with a completion line naming the person and deal |
+| `[interested]` | The Aircall interested workflow, naming the call and who it was with. Always `poll`: the cron is the only caller. Every call the check sees produces a decision line listing every tag it carried, whether or not any matched, and on a miss the configured set it was compared against; a run reporting nothing interested is therefore readable as "these calls, these tags, no match" rather than as silence. A match is followed by the person and deal it finished with, or by the reason it could not: no way to reach a person (the call carried neither an email nor a phone number), or a failure passed over |
 | `[lookup]` | Each person search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list |
 | `[action]` | Each write and its outcome: person created, person updated with the attribute list, person left untouched because every target attribute was already populated, deal created, deal reused, note added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
 | `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list. An Aircall line names the touchpoint process, to separate it from the interested check running over the same call |
-| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor |
+| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor. Aircall reports two counts, because its fetch is deliberately wider than its scope: `fetched` is everything the two-hour reach-back returned, `scope` is the subset completing at or after the floor the run acts on. Only the second is expected to match the processed and interested figures; the response body carries the same pair as `callsFound` and `callsInScope` |
 
 A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line
 states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in
@@ -196,7 +256,12 @@ two kinds of failure:
 
 ## Deployment
 
-`vercel.json` selects Vercel's Bun `1.x` runtime and schedules all three syncs every five minutes. Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
+`vercel.json` selects Vercel's Bun `1.x` runtime and schedules the Instantly and HeyReach syncs every five minutes and the Aircall sync hourly (`0 * * * *`). Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
+
+Every function under `api/` is given `maxDuration: 300`. One touchpoint is up to eight sequential Attio requests and
+the work is unbounded by design, so at the platform default a busy window could be cut off mid-event, leaving a note
+written and its counter not. Three hundred seconds is the Pro ceiling; the project already exceeds Hobby's cron
+limits, so it cannot be running there.
 
 Attio counter updates remain read-then-write because Attio does not expose an atomic increment operation. The sync
 handlers process events sequentially, and a failed event is passed over rather than retried, as described under

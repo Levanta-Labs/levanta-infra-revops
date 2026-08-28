@@ -13,6 +13,7 @@ import {
 import {
   advanceCursor,
   advanceCursorTo,
+  CURSOR_GRACE_MS,
   getSyncCursor,
   isAfterCursor,
   saveSyncCursor,
@@ -26,10 +27,18 @@ const SYNC_KEY = "instantly-touchpoints";
 
 type ProcessingOutcome = "processed" | "skipped" | "not_tam";
 
+/** Keyed on timestamp_created, which is also what the API filters on, so window and cursor agree. */
 export function instantlyCursorEvent(email: InstantlyEmail): CursorEvent {
   return { id: email.id, timestampMs: Date.parse(email.timestampCreated) };
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Records one email as a touchpoint on the Person and, when linked, the Company.
+//FLOW: 1. require a lead address. 2. match a Person on it. 3. require Master TAM membership. 4. note plus
+//counter on the Person. 5. note plus counter on the Company when one is linked.
+//USES: findPersonByEmail, isPersonInList, createNote, incrementCounter, personCompanyId, personCounterSlug,
+//companyCounterSlug (lib/attio.ts).
+//---------------------------------------------------------------------------------------------------------
 export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise<ProcessingOutcome> {
   if (!email.leadEmail) {
     console.log(`[event] instantly email ${email.id}: skipped - no lead email on the record`);
@@ -42,6 +51,7 @@ export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise
   }
   const personId = person.id.record_id;
   const personName = personLabel(person);
+  //Master TAM is the gate on counting anything: off-list people are read but never written to.
   if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
     console.log(`[event] instantly email ${email.id}: skipped - person ${personName} is not on the Master TAM list`);
     return "not_tam";
@@ -66,12 +76,23 @@ export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise
   return "processed";
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Vercel Cron entry point, every five minutes.
+//FLOW: 1. isAuthorizedCron (lib/http.ts). 2. getSyncCursor (lib/cursors.ts). 3. fetchInstantlyEmails
+//(lib/instantly.ts) over cursor..now. 4. keep only real sent/received traffic. 5. sort by creation time.
+//6. per email, skip anything at or below the mark, else processInstantlyTouchpoint. 7. advance the mark past
+//each handled email. 8. park at (now - CURSOR_GRACE_MS) and persist.
+//[STABILITY] A failed email is counted and passed over, never retried: its earlier writes are committed, so a
+//retry would duplicate them, and a permanently failing one would block the sync forever.
+//---------------------------------------------------------------------------------------------------------
 export async function GET(request: Request): Promise<Response> {
+  //[SECURITY] Runs before any external call, so an unauthorized request costs nothing.
   if (!isAuthorizedCron(request)) return json({ error: "Unauthorized" }, 401);
   try {
     const upperBoundMs = Date.now();
     let cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
     const emails = [...(await fetchInstantlyEmails({ fromMs: cursor.timestampMs, toMs: upperBoundMs }))]
+      //Scheduled mail has not happened yet and an auto-reply is not a human touchpoint; neither is counted.
       .filter(
         (email) =>
           (email.emailType === "sent" || email.emailType === "received") && !email.isAutoReply,
@@ -85,6 +106,7 @@ export async function GET(request: Request): Promise<Response> {
 
     for (const email of emails) {
       const event = instantlyCursorEvent(email);
+      //Everything at or below the mark was handled on an earlier run - this is the sole duplicate guard.
       if (!isAfterCursor(cursor, event)) continue;
       try {
         const outcome = await processInstantlyTouchpoint(email);
@@ -100,7 +122,8 @@ export async function GET(request: Request): Promise<Response> {
       cursor = advanceCursor(cursor, event);
     }
 
-    cursor = advanceCursorTo(cursor, upperBoundMs);
+    //[STABILITY] Park short of now. An email Instantly has not yet published is picked up next run, not skipped.
+    cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
     await saveSyncCursor(cursor);
     console.log(
       `[run] instantly sync: ${emails.length} email(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
@@ -111,6 +134,7 @@ export async function GET(request: Request): Promise<Response> {
       ...results,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),
+      //[DEBUG] Errors are returned as well as logged, so a manual run reports failures without a log search.
       ...(failures.length > 0 ? { errors: failures } : {}),
     };
     return json(body, failures.length > 0 ? 500 : 200);

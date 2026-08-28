@@ -13,10 +13,19 @@ import {
   personLabel,
   type CreatePersonValues,
   type PersonNameInput,
-} from "../lib/attio.js";
-import { parseAircallWebhook, toE164, type AircallCall } from "../lib/aircall.js";
-import { requiredCsvEnv, requiredEnv } from "../lib/env.js";
-import { json, requestJson, serverError } from "../lib/http.js";
+} from "./attio.js";
+import { toE164, type AircallCall } from "./aircall.js";
+import { requiredCsvEnv } from "./env.js";
+
+//=============================================================================================================
+//The Aircall interested workflow. Driven only by the touchpoint cron, which finds tagged calls by polling.
+//
+//There was formerly a /api/aircall-interested webhook route as well. It was removed: Aircall applies the
+//outcome tag after the call ends, so the payload the webhook received usually carried no tag yet, and the poll
+//had to cover the gap regardless. Keeping both meant every tagged call was recorded twice.
+//
+//Nothing here touches HTTP - the module is pure workflow so the cron can call it directly.
+//=============================================================================================================
 
 export interface AircallInterestedFields {
   readonly email: string | null;
@@ -63,6 +72,7 @@ function personValues(fields: AircallInterestedFields): CreatePersonValues {
     phone_numbers?: readonly string[];
     name?: readonly PersonNameInput[];
   } = {};
+  //Each key is omitted rather than set null when absent, because blankPersonValues keys off presence.
   if (fields.email) values.email_addresses = [fields.email];
   if (fields.phone) values.phone_numbers = [fields.phone];
   if (fields.firstName || fields.lastName) {
@@ -78,20 +88,11 @@ function dealName(fields: AircallInterestedFields): string {
   return `${fields.firstName ?? ""} ${fields.lastName ?? ""}`.trim() || "New Interested Deal";
 }
 
-//=============================================================================================================
-//The interested workflow itself, kept free of anything HTTP so both callers can drive it: the webhook below, which
-//reacts to a single tagged call, and the touchpoint cron, which finds tagged calls by polling. Aircall applies the
-//outcome tag after the call, sometimes minutes after, so neither caller sees every tag on its own.
-//=============================================================================================================
-
-/** Which caller drove the workflow, so a log line says whether a webhook or the poll found the call. */
-export type InterestedSource = "webhook" | "poll";
-
 export type InterestedResult =
   | { readonly status: "done"; readonly personId: string; readonly dealId: string }
   | { readonly status: "no_contact_details" };
 
-/** The configured interested tags, lowercased for comparison. Read once per request or run, never per call. */
+/** The configured interested tags, lowercased for comparison. Read once per run, never per call. */
 export function interestedTagSet(): ReadonlySet<string> {
   return new Set(requiredCsvEnv("AIRCALL_INTERESTED_TAGS").map((tag) => tag.toLowerCase()));
 }
@@ -113,21 +114,20 @@ export function callSubject(call: AircallCall): string {
   return [who, phone].filter((part) => part).join(" ") || "no contact and no number on the call";
 }
 
-/**
- * Logs the interested decision for one call and returns the tags that matched. Every call the check sees produces a
- * line naming who it was with and every tag it carried, whether or not anything matched: a run that reports nothing
- * interested has to be readable as "these calls, these tags, no match" rather than as silence, since silence cannot
- * be told apart from the check never having run. The configured set is printed on a miss, where the question of what
- * the tags were compared against actually arises.
- */
+//---------------------------------------------------------------------------------------------------------
+//[DEBUG] Emits one decision line per call examined and returns the matching tags.
+//Every call produces a line, match or miss, so a run that records nothing interested reads as "these calls,
+//these tags, no match" rather than as silence. Silence is indistinguishable from the check never running.
+//The configured set is printed only on a miss, which is where "compared against what?" is the open question.
+//USES: matchedInterestedTags, callSubject (this module).
+//---------------------------------------------------------------------------------------------------------
 export function logInterestedDecision(
   call: AircallCall,
-  source: InterestedSource,
   interested: ReadonlySet<string>,
 ): readonly string[] {
   const tags = call.tags.map((tag) => tag.name);
   const matched = matchedInterestedTags(call, interested);
-  const label = `[interested] ${source} call ${call.id} (${callSubject(call)})`;
+  const label = `[interested] poll call ${call.id} (${callSubject(call)})`;
   if (matched.length > 0) {
     console.log(`${label}: INTERESTED - matched ${JSON.stringify(matched)} of ${JSON.stringify(tags)}`);
   } else if (tags.length === 0) {
@@ -140,23 +140,31 @@ export function logInterestedDecision(
   return matched;
 }
 
-/**
- * Records an interested call in Attio: the person, the deal, a note on each, the lead source, and the DNC listing.
- * `occurredAt` is in epoch seconds - the webhook's own timestamp, or when the call ended for a polled one.
- */
+//---------------------------------------------------------------------------------------------------------
+//Records an interested call in Attio. Called by the touchpoint cron once a call's tags have matched.
+//FLOW: 1. flatten the call (extractAircallFields). 2. bail if there is no email and no phone - nothing to
+//match or create on. 3. resolve the person: email, then phone, then create. 4. ensureInterestedDeal - reuses
+//any deal already linked to the person, whatever its stage, and only creates one when none exists.
+//5. note on the person and on the deal. 6. patchPerson with blankPersonValues, which fills only attributes
+//Attio currently holds nothing for. 7. add to the DNC list so outbound stops contacting them.
+//USES: attio.ts for every write; occurredAt is epoch SECONDS (the call's ended_at).
+//[STABILITY] Steps 4-7 are separate Attio calls with no transaction. A throw partway leaves the earlier
+//writes committed; the cron catches it, counts the failure, and moves to the next call.
+//---------------------------------------------------------------------------------------------------------
 export async function processAircallInterested(
   call: AircallCall,
   occurredAt: number,
-  source: InterestedSource,
 ): Promise<InterestedResult> {
   const fields = extractAircallFields(call, occurredAt);
+  //No identifier at all: creating a person would produce an unmatchable blank record, so stop here.
   if (!fields.email && !fields.phone) {
     console.warn(
-      `[interested] ${source} call ${call.id}: rejected - the call carried neither an email nor a phone number, so no person can be matched or created`,
+      `[interested] poll call ${call.id}: rejected - the call carried neither an email nor a phone number, so no person can be matched or created`,
     );
     return { status: "no_contact_details" };
   }
 
+  //Email first: it is the stronger identifier. Phone is the fallback for a dialled number Aircall knows nothing about.
   let person = await findPersonByEmail(fields.email);
   if (!person) person = await findPersonByPhone(fields.phone);
   if (!person) person = await createPerson(personValues(fields));
@@ -172,6 +180,7 @@ export async function processAircallInterested(
   const title = LEAD_SOURCE_LABELS.aircall;
   await createNote("people", personId, title, history, personName);
   await createNote("deals", dealId, title, history);
+  //blankPersonValues strips any attribute Attio already holds, so third-party data can only fill gaps.
   await patchPerson(
     personId,
     blankPersonValues(person, { ...personValues(fields), lead_source: title }),
@@ -179,32 +188,6 @@ export async function processAircallInterested(
   );
   await addPersonToList(personId, LISTS.DNC, personName);
 
-  console.log(`[interested] ${source} call ${call.id}: completed - person ${personName}, deal ${dealId}`);
+  console.log(`[interested] poll call ${call.id}: completed - person ${personName}, deal ${dealId}`);
   return { status: "done", personId, dealId };
-}
-
-export async function POST(request: Request): Promise<Response> {
-  try {
-    const webhook = parseAircallWebhook(await requestJson(request));
-    if (webhook.token !== requiredEnv("AIRCALL_WEBHOOK_TOKEN")) {
-      return json({ error: "Unauthorized" }, 401);
-    }
-
-    const callTags = webhook.call.tags.map((tag) => tag.name);
-    const matched = logInterestedDecision(webhook.call, "webhook", interestedTagSet());
-
-    if (matched.length === 0) {
-      return callTags.length === 0
-        ? json({ skipped: true, reason: "tag not found" })
-        : json({ skipped: true, reason: "tag not tracked", tags: callTags });
-    }
-
-    const result = await processAircallInterested(webhook.call, webhook.timestamp, "webhook");
-    if (result.status === "no_contact_details") {
-      return json({ error: "No email or phone in payload" }, 422);
-    }
-    return json({ success: true, personId: result.personId, dealId: result.dealId });
-  } catch (error) {
-    return serverError("Aircall interested webhook error", error);
-  }
 }

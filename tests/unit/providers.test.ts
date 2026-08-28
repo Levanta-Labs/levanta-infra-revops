@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { fetchAircallCalls, parseAircallWebhook, toE164 } from "../../lib/aircall.js";
-import { callSubject, logInterestedDecision } from "../../api/aircall-interested.js";
+import { fetchAircallCalls, parseAircallCall, toE164 } from "../../lib/aircall.js";
+import { callSubject, logInterestedDecision } from "../../lib/aircall-interested.js";
 import {
   fetchHeyReachConversations,
   heyReachMessageId,
@@ -73,16 +73,11 @@ const heyReachConversation = {
 };
 
 describe("Aircall client", () => {
-  test("parses the documented webhook envelope and call fields", () => {
-    const webhook = parseAircallWebhook({
-      event: "call.tagged",
-      timestamp: 1_700_000_121,
-      token: "webhook-token",
-      data: aircallCall,
-    });
-    expect(webhook.call.rawDigits).toBe("+15555550123");
-    expect(webhook.call.contact?.email).toBe("ada@example.com");
-    expect(webhook.call.tags).toEqual([{ name: "Interested" }]);
+  test("parses the documented call fields", () => {
+    const call = parseAircallCall(aircallCall);
+    expect(call.rawDigits).toBe("+15555550123");
+    expect(call.contact?.email).toBe("ada@example.com");
+    expect(call.tags).toEqual([{ name: "Interested" }]);
   });
 
   test("normalises the punctuated raw_digits Aircall sends into the E.164 Attio matches on", () => {
@@ -97,12 +92,7 @@ describe("Aircall client", () => {
 
   test("names the call's other party for a log line, falling back to the number", () => {
     const call = (contact: unknown, rawDigits: string | null = "+1 813-919-6470") =>
-      parseAircallWebhook({
-        event: "call.tagged",
-        timestamp: 1,
-        token: "t",
-        data: { id: 1, status: "done", started_at: 1, duration: 0, raw_digits: rawDigits, contact },
-      }).call;
+      parseAircallCall({ id: 1, status: "done", started_at: 1, duration: 0, raw_digits: rawDigits, contact });
 
     expect(callSubject(call({ first_name: "Abhi", last_name: "Visuvasam" }))).toBe("Abhi Visuvasam +18139196470");
     //A dialled campaign call has no contact at all, which is the case the log most needs to stay readable for.
@@ -116,24 +106,19 @@ describe("Aircall client", () => {
     const original = console.log;
     console.log = (line: unknown) => void lines.push(String(line));
     const call = (tags: readonly string[]) =>
-      parseAircallWebhook({
-        event: "call.tagged",
-        timestamp: 1,
-        token: "t",
-        data: {
-          id: 42,
-          status: "done",
-          started_at: 1,
-          duration: 0,
-          raw_digits: "+1 813-919-6470",
-          tags: tags.map((name) => ({ name })),
-        },
-      }).call;
+      parseAircallCall({
+        id: 42,
+        status: "done",
+        started_at: 1,
+        duration: 0,
+        raw_digits: "+1 813-919-6470",
+        tags: tags.map((name) => ({ name })),
+      });
     const interested = new Set(["booked", "connected"]);
     try {
-      expect(logInterestedDecision(call(["Outbound Campaign", "Booked"]), "poll", interested)).toEqual(["Booked"]);
-      expect(logInterestedDecision(call(["Outbound Campaign"]), "poll", interested)).toEqual([]);
-      expect(logInterestedDecision(call([]), "webhook", interested)).toEqual([]);
+      expect(logInterestedDecision(call(["Outbound Campaign", "Booked"]), interested)).toEqual(["Booked"]);
+      expect(logInterestedDecision(call(["Outbound Campaign"]), interested)).toEqual([]);
+      expect(logInterestedDecision(call([]), interested)).toEqual([]);
     } finally {
       console.log = original;
     }
@@ -146,7 +131,7 @@ describe("Aircall client", () => {
       '[interested] poll call 42 (+18139196470): not interested - ["Outbound Campaign"] matches none of ["booked","connected"]',
     );
     expect(lines[2]).toBe(
-      "[interested] webhook call 42 (+18139196470): not interested - the call carries no tags at all",
+      "[interested] poll call 42 (+18139196470): not interested - the call carries no tags at all",
     );
   });
 
