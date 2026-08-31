@@ -14,6 +14,14 @@ import {
   supabaseHeaders,
 } from "../../lib/endpoints.js";
 import { optionalEnv } from "../../lib/env.js";
+import {
+  companyValuesFor,
+  dealValuesFor,
+  interestedLead,
+  personValuesFor,
+  toArrBucket,
+  toEmployeeRange,
+} from "../../lib/interested.js";
 import { arrayValue, isJsonObject, responseJson, stringValue } from "../../lib/json.js";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
@@ -150,6 +158,132 @@ liveTest("the configured deal owner is a workspace member", async () => {
     );
   }
   expect(match).toBe(true);
+});
+
+//=============================================================================================================
+//The interested workflow's own schema. The counter slugs above are configured, so a typo in an environment
+//variable is what could break them. These are hardcoded in lib/interested.ts instead, so what breaks them is
+//somebody RENAMING an attribute in Attio - which nothing in this repo would notice until a live lead hit it.
+//
+//The slugs are not listed by hand here. A lead carrying every field a provider could ever supply is run through
+//the real mappers, and whatever keys they produce are what the workflow would genuinely write. A slug added to
+//a mapper is therefore covered by these tests the moment it is added, with no second list to keep in step.
+//=============================================================================================================
+
+/** A lead with every field populated, so the mappers emit every slug they are capable of emitting. */
+const MAXIMAL_LEAD = interestedLead("instantly", {
+  emails: ["ada@example.com"],
+  phones: ["+15555550123"],
+  firstName: "Ada",
+  lastName: "Lovelace",
+  linkedin: "https://www.linkedin.com/in/ada",
+  jobTitle: "Head of Engineering",
+  description: "A headline",
+  location: "Bristol",
+  companyName: "Engines Ltd",
+  companyDomain: "engines.example",
+  companyAddress: "12 Dock Rd, Bristol, Avon, United Kingdom, BS1 6XX",
+  employeeCount: "84",
+  annualRevenue: "4318000",
+  industry: "information technology & services",
+  website: "https://engines.example",
+  campaignName: "Q3 Founders",
+  occurredAtMs: Date.now(),
+});
+
+async function expectSlugsExist(object: string, slugs: readonly string[]): Promise<void> {
+  const live = await attioValues(`/objects/${object}/attributes`, "api_slug");
+  const missing = slugs.filter((slug) => !live.has(slug));
+  if (missing.length > 0) {
+    throw new Error(
+      `The interested workflow writes ${missing.join(", ")} on the Attio ${object} object, and no such attribute exists there. Either it was renamed in Attio or the mapping in lib/interested.ts is wrong.`,
+    );
+  }
+  expect(missing).toEqual([]);
+}
+
+liveTest("every Person attribute the workflow writes exists on the people object", async () => {
+  //`company` is a relationship written as a record reference; it is an attribute like any other here.
+  await expectSlugsExist("people", Object.keys(personValuesFor(MAXIMAL_LEAD, "00000000-0000-0000-0000-000000000000")));
+});
+
+liveTest("every Company attribute the workflow writes exists on the companies object", async () => {
+  await expectSlugsExist("companies", Object.keys(companyValuesFor(MAXIMAL_LEAD)));
+});
+
+liveTest("every Deal attribute the workflow writes exists on the deals object", async () => {
+  //name, stage, owner, and the two associations are written by ensureInterestedDeal rather than the mapper,
+  //so they are named here explicitly - a create fails outright if any of them is missing.
+  const created = ["name", "stage", "owner", "associated_people", "associated_company"];
+  await expectSlugsExist("deals", [...created, ...Object.keys(dealValuesFor(MAXIMAL_LEAD))]);
+});
+
+//---------------------------------------------------------------------------------------------------------
+//Select attributes reject any value that is not one of their options, so the bucket labels in lib/interested.ts
+//have to match Attio's option titles exactly - a renamed option is a rejected write, not a wrong one.
+//Every bucket is generated from a value that lands in it, so the check covers the whole range rather than a
+//sample of it.
+//---------------------------------------------------------------------------------------------------------
+liveTest("every Employee range bucket the workflow can produce is a real option", async () => {
+  const options = await attioValues("/objects/companies/attributes/employee_range/options", "title");
+  const produced = ["5", "25", "84", "500", "2500", "7500", "25000", "75000", "250000"]
+    .map((count) => toEmployeeRange(count))
+    .filter((bucket): bucket is string => bucket !== null);
+  expect(produced).toHaveLength(9);
+  const missing = produced.filter((bucket) => !options.has(bucket));
+  if (missing.length > 0) {
+    throw new Error(`toEmployeeRange produces ${missing.join(", ")}, which Attio's Employee range no longer offers`);
+  }
+  expect(missing).toEqual([]);
+});
+
+liveTest("every Estimated ARR bucket the workflow can produce is a real option", async () => {
+  const options = await attioValues("/objects/companies/attributes/estimated_arr_usd/options", "title");
+  const produced = ["500000", "4318000", "25000000", "75000000", "150000000", "300000000", "750000000", "5000000000", "50000000000"]
+    .map((amount) => toArrBucket(amount))
+    .filter((bucket): bucket is string => bucket !== null);
+  expect(produced).toHaveLength(9);
+  const missing = produced.filter((bucket) => !options.has(bucket));
+  if (missing.length > 0) {
+    throw new Error(`toArrBucket produces ${missing.join(", ")}, which Attio's Estimated ARR no longer offers`);
+  }
+  expect(missing).toEqual([]);
+});
+
+liveTest("the Interested deal stage exists", async () => {
+  const statuses = await attioValues("/objects/deals/attributes/stage/statuses", "title");
+  if (!statuses.has("Interested")) {
+    throw new Error(
+      'Attio\'s deal pipeline has no "Interested" stage, so every deal these workflows open would be rejected',
+    );
+  }
+  expect(statuses.has("Interested")).toBe(true);
+});
+
+//---------------------------------------------------------------------------------------------------------
+//Suppression reaches two provider endpoints that nothing else in the codebase touches, so a key scoped only
+//for reading campaigns and emails passes every check above and still cannot suppress anybody.
+//Reads only. Whether a WRITE is permitted cannot be proven without making one, and a blocklist entry is not
+//something a smoke test should leave behind.
+//---------------------------------------------------------------------------------------------------------
+liveTest("the Instantly blocklist is readable, so suppression has somewhere to write", async () => {
+  await expectOk(
+    "Instantly blocklist",
+    await fetch(`${INSTANTLY_BASE}/block-lists-entries?limit=1`, {
+      headers: { Authorization: instantlyAuthHeader() },
+    }),
+  );
+});
+
+liveTest("the Instantly lead record is readable, so an interested lead can be enriched", async () => {
+  await expectOk(
+    "Instantly leads",
+    await fetch(`${INSTANTLY_BASE}/leads/list`, {
+      method: "POST",
+      headers: { Authorization: instantlyAuthHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 1 }),
+    }),
+  );
 });
 
 //=============================================================================================================

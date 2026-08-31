@@ -489,10 +489,13 @@ export async function incrementCounter(
 //FLOW: 1. person already linked to a deal -> fetch and return it. 2. otherwise create at stage Interested,
 //owned by ownerEmail, linked to the person and to the company the caller resolved.
 //Step 1 is deliberately stage-blind: any existing deal is reused whatever phase it sits in, so an interested
-//signal updates the live deal rather than opening a second one alongside it. It is also fetched whole rather
-//than returned as a bare id, because the caller's next act is to fill its blank attributes and it cannot know
-//which are blank without reading it. On the create path the POST response already carries them, so neither
-//path costs a request the caller was not going to make anyway.
+//signal updates the live deal rather than opening a second one alongside it.
+//KNOWN GAP: a person linked to SEVERAL deals gets the first Attio returned, and that order is not specified -
+//so which deal receives the note is arbitrary. Closing it needs a rule for which deal wins (newest? furthest
+//along?); until there is one, the log names the count so the arbitrariness is at least visible.
+//The deal is fetched whole rather than returned as a bare id, because the caller's next act is to fill its
+//blank attributes and it cannot know which are blank without reading it. On the create path the POST response
+//already carries them, so neither path costs a request the caller was not going to make anyway.
 //companyId comes from the caller, not from `person`, so a company resolved for a person who had none is still
 //linked. Passing null omits the association, as before.
 //USES: attioFetch, parseAttioRecord, fetchRecord (this module); ownerEmail comes from defaultDealOwner below.
@@ -503,9 +506,17 @@ export async function ensureInterestedDeal(
   ownerEmail: string,
   companyId: string | null,
 ): Promise<AttioRecord> {
-  const existing = person.values.associated_deals[0]?.target_record_id;
+  const associated = person.values.associated_deals;
+  const existing = associated[0]?.target_record_id;
+  //[DEBUG] Logged in BOTH directions, like every other lookup here. A line only on the hit would leave "checked,
+  //found none, so created one" and "never checked" reading identically in the log, and the second is a bug the
+  //first is not. The count is named because more than one associated deal means the choice below is arbitrary.
+  console.log(
+    existing
+      ? `[lookup] deal for person ${personLabel(person)}: ${associated.length} already associated, reusing ${existing}${associated.length > 1 ? " - the first Attio returned, which is an arbitrary choice among them" : ""}`
+      : `[lookup] deal for person ${personLabel(person)}: none associated, so a new one is created`,
+  );
   if (existing) {
-    console.log(`[action] deal reused: deal ${existing} is already associated with person ${personLabel(person)}`);
     //Its name is left exactly as it stands. A deal already in the pipeline has been named by whoever is working
     //it, and the strict naming convention below governs deals this codebase opens, not deals it finds.
     return fetchRecord("deals", existing);
