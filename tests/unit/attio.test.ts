@@ -4,6 +4,7 @@ import {
   createNote,
   findPersonByEmail,
   incrementCounter,
+  isPersonInList,
   parseAttioPerson,
   patchRecord,
 } from "../../lib/attio.js";
@@ -109,6 +110,106 @@ describe("Attio API helpers", () => {
       expect(JSON.parse(String(mock.calls[1]?.init?.body))).toEqual({
         data: { values: { number_of_calls: 3 } },
       });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("retries a 429 and succeeds, rather than losing the write", async () => {
+    //The failure that prompted this: Attio 429s on "query complexity" during a busy sync run. The cron logs a
+    //failed touchpoint, passes the call over and advances its cursor anyway, so an unretried 429 lost that
+    //call's counter and note permanently. A refused request was never processed, so repeating it is safe.
+    let attempts = 0;
+    const mock = installFetchMock(() => {
+      attempts += 1;
+      if (attempts < 3) {
+        return jsonResponse(
+          { status_code: 429, type: "rate_limit_error", message: "Query complexity rate limit exceeded." },
+          429,
+        );
+      }
+      return jsonResponse({ data: [person] });
+    });
+    try {
+      const found = await findPersonByEmail("ada@example.com");
+      expect(found?.id.record_id).toBe("person-1");
+      expect(attempts).toBe(3);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("honours Retry-After over its own backoff", async () => {
+    //Attio knows when its window resets; the exponential backoff is only a guess. A 20ms header must be obeyed
+    //rather than the 500ms first backoff, which is also what keeps this test fast.
+    let attempts = 0;
+    const started = Date.now();
+    const mock = installFetchMock(() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({ message: "slow down" }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "0.02" },
+        });
+      }
+      return jsonResponse({ data: [person] });
+    });
+    try {
+      await findPersonByEmail("ada@example.com");
+      expect(attempts).toBe(2);
+      //Comfortably under the 500ms it would have waited had the header been ignored.
+      expect(Date.now() - started).toBeLessThan(400);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("gives up on a 429 after the attempt limit and raises it", async () => {
+    //Bounded, because the sync's run budget is finite and a permanently throttled account must surface rather
+    //than absorb the whole budget in sleeps.
+    let attempts = 0;
+    const mock = installFetchMock(() => {
+      attempts += 1;
+      return new Response(JSON.stringify({ message: "nope" }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    });
+    try {
+      await expect(findPersonByEmail("ada@example.com")).rejects.toThrow("Attio API error 429");
+      expect(attempts).toBe(4);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("does not retry a 500 on a write, because Attio may have applied it", async () => {
+    //A 5xx is ambiguous - the change may have landed before the response failed. Retrying POST /notes would
+    //duplicate the note, and Attio has no idempotency key to prevent it. One attempt only.
+    let attempts = 0;
+    const mock = installFetchMock(() => {
+      attempts += 1;
+      return jsonResponse({ error: "upstream" }, 500);
+    });
+    try {
+      await expect(createNote("people", "person-1", "Title", "Body")).rejects.toThrow("Attio API error 500");
+      expect(attempts).toBe(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("does retry a 500 on a read, where there is nothing to apply twice", async () => {
+    //isPersonInList is a plain GET, so a 5xx cannot have applied anything and a retry costs only the wait.
+    let attempts = 0;
+    const mock = installFetchMock(() => {
+      attempts += 1;
+      if (attempts < 2) return jsonResponse({ error: "upstream" }, 500);
+      return jsonResponse({ data: [{ list_api_slug: "master_tam_list" }] });
+    });
+    try {
+      expect(await isPersonInList("person-1", "master_tam_list")).toBe(true);
+      expect(attempts).toBe(2);
     } finally {
       mock.restore();
     }

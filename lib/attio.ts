@@ -75,28 +75,93 @@ export class AttioApiError extends Error {
   }
 }
 
+//[STABILITY] Attio rate-limits on request rate AND on "query complexity" - the filtered record queries every
+//lookup here performs. A 429 is transient by definition, so the transport waits and tries again rather than
+//surfacing it. Without this a single 429 failed one touchpoint outright: the cron logs the failure, passes the
+//call over, and advances its cursor regardless, so the counter and note were lost with no way back.
+//
+//WHAT IS RETRIED, AND WHY IT IS THIS NARROW:
+// - 429, on any method. A refused request was not processed, so repeating it cannot apply anything twice.
+// - 5xx, on GET only. A 5xx is ambiguous: Attio may have applied the change and then failed to answer. On a
+//   GET there is nothing to apply, so a retry is free. On a POST it is not - a retried POST /notes duplicates
+//   the note, and a retried record create duplicates the record. Attio offers no idempotency key, so there is
+//   no way to make those safe, and a duplicate write is worse than a surfaced error. They are raised at once.
+// - Nothing else. A 4xx other than 429 is deterministic; the same request will fail the same way.
+const RETRY_ON_ANY_METHOD = new Set([429]);
+const RETRY_ON_GET_ONLY = new Set([500, 502, 503, 504]);
+const MAX_ATTEMPTS = 4;
+//Doubles per attempt: 0.5s, 1s, 2s. Total added latency is under four seconds, which one call can afford inside
+//the sync's run budget - and a run that spends its budget waiting now stops cleanly rather than being killed.
+const RETRY_BASE_MS = 500;
+
+/** GET is the default when a caller passes no method, matching fetch. */
+function isReadOnly(options: RequestInit): boolean {
+  return (options.method ?? "GET").toUpperCase() === "GET";
+}
+
+function isRetryable(status: number, options: RequestInit): boolean {
+  if (RETRY_ON_ANY_METHOD.has(status)) return true;
+  return isReadOnly(options) && RETRY_ON_GET_ONLY.has(status);
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Whether a failure is worth attempting again on a LATER run, as against one that will fail the same way every
+//time. 429 and 5xx are the transient set; anything else Attio returns is deterministic.
+//This is NOT about an immediate retry - attioFetch has already exhausted those by the time a caller sees an
+//error. It is for a caller deciding between "throttled, come back to this" and "this is unprocessable, move
+//on": the touchpoint sync uses it to avoid advancing its cursor past a call it was merely rate-limited out of.
+//---------------------------------------------------------------------------------------------------------
+const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+export function isTransientAttioError(error: unknown): boolean {
+  return error instanceof AttioApiError && TRANSIENT_STATUSES.has(error.status);
+}
+
+/** Attio's Retry-After, in ms, when it sends one. Seconds or an HTTP date; anything else is ignored. */
+function retryAfterMs(response: Response): number | null {
+  const header = response.headers.get("retry-after");
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(header);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
+}
+
 //---------------------------------------------------------------------------------------------------------
 //Single transport for every Attio call in the codebase. Nothing else calls fetch against Attio.
 //FLOW: 1. prefix the path with ATTIO_BASE. 2. merge attioHeaders (endpoints.ts) under any caller override.
-//3. parse the body with responseJson (json.ts). 4. non-2xx -> throw AttioApiError carrying status and body.
+//3. parse the body with responseJson (json.ts). 4. a retryable status with attempts left -> wait and repeat.
+//5. any other non-2xx, or the last attempt -> throw AttioApiError carrying status and body.
 //[SECURITY] The bearer token is read from env per request by attioHeaders and never cached in module state.
 //[DEBUG] credentialHint appends the env var name to a 401/403; the typed status lets incrementCounter tell a
-//bad attribute slug (400/404) apart from a transport failure.
+//bad attribute slug (400/404) apart from a transport failure. Every retry logs, so a run that is being
+//throttled says so rather than merely appearing slow.
+//NOTE: a filtered lookup is POST /objects/*/records/query, which reads rather than writes but is still a POST,
+//so it gets the 429 retry and not the 5xx one. That is the conservative side of the line, not an oversight.
 //---------------------------------------------------------------------------------------------------------
 export async function attioFetch(path: string, options: RequestInit = {}): Promise<unknown> {
-  const response = await fetch(`${ATTIO_BASE}${path}`, {
-    ...options,
-    headers: { ...attioHeaders(), ...options.headers },
-  });
-  const body = await responseJson(response);
-  if (!response.ok) {
-    throw new AttioApiError(
-      `Attio API error ${response.status}: ${JSON.stringify(body)}${credentialHint("attio", response.status)}`,
-      response.status,
-      body,
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await fetch(`${ATTIO_BASE}${path}`, {
+      ...options,
+      headers: { ...attioHeaders(), ...options.headers },
+    });
+    const body = await responseJson(response);
+    if (response.ok) return body;
+
+    if (attempt >= MAX_ATTEMPTS || !isRetryable(response.status, options)) {
+      throw new AttioApiError(
+        `Attio API error ${response.status}: ${JSON.stringify(body)}${credentialHint("attio", response.status)}`,
+        response.status,
+        body,
+      );
+    }
+    //Attio's own figure wins when it sends one; it knows when the window resets and the backoff is a guess.
+    const waitMs = retryAfterMs(response) ?? RETRY_BASE_MS * 2 ** (attempt - 1);
+    console.warn(
+      `[attio] ${response.status} on ${path} (attempt ${attempt} of ${MAX_ATTEMPTS}) - waiting ${waitMs}ms and retrying`,
     );
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
-  return body;
 }
 
 //=============================================================================================================

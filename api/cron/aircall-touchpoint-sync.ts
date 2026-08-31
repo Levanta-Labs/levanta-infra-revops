@@ -11,6 +11,7 @@ import {
   findPersonByPhone,
   incrementCounter,
   isPersonInList,
+  isTransientAttioError,
   LISTS,
   personCompanyId,
   personCounterSlug,
@@ -28,7 +29,7 @@ import {
 } from "../../lib/cursors.js";
 import { errorMessage } from "../../lib/json.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
-import { optionalEnv, reportConfigValue } from "../../lib/env.js";
+import { reportConfigValue, tunableEnv } from "../../lib/env.js";
 
 const SYNC_KEY = "aircall-touchpoints";
 //An outcome tag is applied after the call, sometimes minutes after, so a cursor alone can carry a call past the
@@ -88,7 +89,7 @@ const DEFAULT_RUN_BUDGET_MS = 240 * 1_000;
 
 /** The budget, overridable by AIRCALL_SYNC_BUDGET_MS so a stuck backlog can be retuned without a redeploy. */
 function runBudgetMs(): number {
-  const raw = optionalEnv("AIRCALL_SYNC_BUDGET_MS");
+  const raw = tunableEnv("AIRCALL_SYNC_BUDGET_MS", `using the ${DEFAULT_RUN_BUDGET_MS / 1_000}s default`);
   if (!raw) return DEFAULT_RUN_BUDGET_MS;
   const parsed = Number(raw);
   //[STABILITY] A malformed value falls back rather than throwing. Losing the override is a tuning problem; losing
@@ -101,6 +102,40 @@ function runBudgetMs(): number {
   }
   reportConfigValue("AIRCALL_SYNC_BUDGET_MS", raw);
   return parsed;
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Raised when a touchpoint was throttled or hit a server error BEFORE it had written anything to Attio.
+//
+//WHY THE DISTINCTION EXISTS. This sync's standing policy is to count a failed call and pass it over, never
+//retrying, because its earlier writes are already committed and a retry would duplicate them. That reasoning
+//holds only once something HAS been written. A 429 on the opening lookup wrote nothing, so passing the call
+//over threw it away for no reason: the counter and note were lost and the cursor moved past it regardless.
+//Attio rate-limits on "query complexity" - the filtered lookup at the top of every touchpoint is exactly what
+//trips it - so this was the common failure, not an edge case.
+//
+//A call raising this is left ALONE: the cursor does not advance past it and the run stops, so the next run
+//retries it from the beginning. Nothing was written, so nothing can double.
+//---------------------------------------------------------------------------------------------------------
+class ThrottledBeforeWrite extends Error {
+  constructor(readonly reason: unknown) {
+    super(errorMessage(reason));
+    this.name = "ThrottledBeforeWrite";
+  }
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Wraps a touchpoint step that has not yet written anything. A TRANSIENT failure there becomes
+//ThrottledBeforeWrite; a deterministic one (a 400 or 404, a bad slug, a malformed record) is re-raised
+//untouched, because retrying it on every future run would block the sync on a call that can never succeed.
+//---------------------------------------------------------------------------------------------------------
+async function beforeAnyWrite<T>(step: () => Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    if (isTransientAttioError(error)) throw new ThrottledBeforeWrite(error);
+    throw error;
+  }
 }
 
 type ProcessingOutcome = "processed" | "skipped" | "not_tam";
@@ -153,7 +188,10 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
     return "skipped";
   }
 
-  const person = await findPersonByPhone(phone);
+  //[STABILITY] The filtered lookup, and the list read after it, are the whole pre-write region - see
+  //beforeAnyWrite. incrementCounter below opens with a read too, but its PATCH is inside the same call, so a
+  //failure there cannot be told apart from a failure after it and stays on the pass-over path.
+  const person = await beforeAnyWrite(() => findPersonByPhone(phone));
   if (!person) {
     console.log(`[event] aircall touchpoint call ${call.id}: skipped - no Attio person has phone ${phone}`);
     return "skipped";
@@ -161,7 +199,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
   const personId = person.id.record_id;
   const personName = personLabel(person);
   //Master TAM is the gate on counting anything: off-list people are read but never written to.
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
+  if (!(await beforeAnyWrite(() => isPersonInList(personId, LISTS.MASTER_TAM, personName)))) {
     console.log(`[event] aircall touchpoint call ${call.id}: skipped - person ${personName} is not on the Master TAM list`);
     return "not_tam";
   }
@@ -207,12 +245,15 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
 //    cursor is the wider of the two and so is what min() picks; the lookback is the backstop for runs that
 //    land close together - see INTERESTED_LOOKBACK_MS.
 // 6. advanceCursor past each handled call, whether or not its writes succeeded.
-// 6a. Stop the loop at runBudgetMs() if it is still going, leaving the cursor at the last completed call.
-// 7. advanceCursorTo(upperBound - CURSOR_GRACE_MS) and persist - the park is SKIPPED on a budget stop, since
-//     the calls the loop never reached are not dealt with and must stay above the mark.
+// 6a. Stop the loop if it is still going at runBudgetMs(), or if a call was throttled before writing anything,
+//     leaving the cursor at the last call actually handled.
+// 7. advanceCursorTo(upperBound - CURSOR_GRACE_MS) and persist - the park is SKIPPED on either stop, since the
+//     calls the loop never reached are not dealt with and must stay above the mark.
 //
 //[STABILITY] A failed call is counted and passed over, never retried: its earlier writes are already committed,
-//so a retry would duplicate them, and a permanently failing call would block the sync forever.
+//so a retry would duplicate them, and a permanently failing call would block the sync forever. THE EXCEPTION is
+//a transient failure before the first write, which is safe to attempt again precisely because nothing is
+//committed yet; that stops the run instead, and the next one starts on the call - see ThrottledBeforeWrite.
 //---------------------------------------------------------------------------------------------------------
 export async function GET(request: Request): Promise<Response> {
   //[SECURITY] Runs before any external call, so an unauthorized request costs nothing.
@@ -251,14 +292,16 @@ export async function GET(request: Request): Promise<Response> {
     const deadlineMs = upperBoundMs + budgetMs;
     //Number of calls the loop reached before it stopped, so a partial run can report what it left behind.
     let examinedCount = 0;
-    let stoppedOnBudget = false;
+    //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
+    //at now - so they are one value rather than two flags that could disagree.
+    let stopReason: "budget" | "throttled" | null = null;
 
     for (const call of calls) {
       //[STABILITY] Checked before the call rather than after, so the budget is what remains for a whole call and
       //not what remains after one has already overrun it. Stopping here leaves `cursor` exactly where the last
       //completed call put it; everything past this point is untouched and still above the mark next run.
       if (Date.now() >= deadlineMs) {
-        stoppedOnBudget = true;
+        stopReason = "budget";
         break;
       }
       examinedCount += 1;
@@ -275,23 +318,38 @@ export async function GET(request: Request): Promise<Response> {
         const outcome = await processAircallTouchpoint(call);
         results[outcome] += 1;
       } catch (error) {
+        //[STABILITY] Throttled before writing anything: the one failure that is safe to attempt again. The
+        //cursor is left BELOW this call and the run stops here, so the next run starts on it. Deliberately not
+        //counted as a failure - nothing was lost, the work is deferred. See ThrottledBeforeWrite.
+        if (error instanceof ThrottledBeforeWrite) {
+          console.warn(
+            `[event] aircall touchpoint call ${call.id}: throttled before writing anything - ${error.message}. The run stops here and the next one starts on this call, so nothing is lost and nothing is double-counted.`,
+          );
+          stopReason = "throttled";
+          //Examined but not handled, so it counts towards what is left rather than what was done.
+          examinedCount -= 1;
+          break;
+        }
         failures.push(`Call ${call.id} (touchpoint): ${errorMessage(error)}`);
         console.error(
           `[event] aircall touchpoint call ${call.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
         );
       }
       //The cursor advances whether or not the touchpoint succeeded. A failed event is passed over after one
-      //attempt rather than blocking every later event on this and all future runs.
+      //attempt rather than blocking every later event on this and all future runs. The one exception broke out
+      //above, before reaching this line.
       cursor = advanceCursor(cursor, event);
     }
 
     const callsRemaining = calls.length - examinedCount;
-    if (stoppedOnBudget) {
+    if (stopReason) {
       //[STABILITY] Do NOT park at now. Parking is a claim that everything up to that moment has been dealt with,
-      //and on a truncated run it has not: the calls the loop never reached would be silently skipped forever.
+      //and on a stopped run it has not: the calls the loop never reached would be silently skipped forever.
       //Leaving the cursor at the last completed call is what makes the next run resume instead of restart.
       console.warn(
-        `[run] aircall sync: stopped after ${Math.round(budgetMs / 1_000)}s of a ${calls.length}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Sustained truncation means the backlog is draining slower than calls arrive - shorten the cron cadence in vercel.json.`,
+        stopReason === "budget"
+          ? `[run] aircall sync: stopped after ${Math.round(budgetMs / 1_000)}s of a ${calls.length}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${callsRemaining > examinedCount ? " More is left than was done - if that repeats, calls are arriving faster than they are processed and the cron cadence in vercel.json wants shortening." : ""}`
+          : `[run] aircall sync: stopped by Attio throttling with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the call that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`,
       );
     } else {
       //[STABILITY] Park short of now. A call Aircall has not yet published is picked up next run instead of skipped.
@@ -299,7 +357,7 @@ export async function GET(request: Request): Promise<Response> {
     }
     await saveSyncCursor(cursor);
     console.log(
-      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${stoppedOnBudget ? `TRUNCATED with ${callsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${stopReason ? `STOPPED (${stopReason}) with ${callsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
@@ -310,10 +368,11 @@ export async function GET(request: Request): Promise<Response> {
       interested: interestedCount,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),
-      //[DEBUG] A truncated run is a success, not a failure - it wrote everything it reached and saved its place.
-      //It is reported so a manual run can see that a backlog remains rather than reading "complete" and moving on.
-      truncated: stoppedOnBudget,
-      ...(stoppedOnBudget ? { callsRemaining } : {}),
+      //[DEBUG] A stopped run is a success, not a failure - it wrote everything it reached and saved its place.
+      //It is reported so a manual run sees that a backlog remains rather than reading "complete" and moving on,
+      //and stopReason separates "ran out of time" from "Attio throttled us", which want different responses.
+      truncated: stopReason !== null,
+      ...(stopReason ? { stopReason, callsRemaining } : {}),
       //[DEBUG] Errors are returned as well as logged, so a manual run reports failures without a log search.
       ...(failures.length > 0 ? { errors: failures } : {}),
     };

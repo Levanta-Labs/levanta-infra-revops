@@ -508,6 +508,108 @@ describe("cron handlers", () => {
     }
   });
 
+  test("Aircall stops on an Attio throttle before any write, leaving the call above the cursor", async () => {
+    //The reported failure: Attio 429s the filtered person lookup on "query complexity". That is the FIRST Attio
+    //request a touchpoint makes, so nothing has been written, and the old behaviour - log it, pass the call
+    //over, advance the cursor anyway - discarded that call's counter and note for good. The run must instead
+    //stop with the cursor still BELOW the throttled call, so the next run starts on it.
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const endedAt = Math.floor(Date.now() / 1000) - 300;
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "aircall-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      //Retry-After 0 so attioFetch exhausts its four attempts without slowing the test down.
+      if (url.includes("objects/people/records/query")) {
+        return new Response(JSON.stringify({ type: "rate_limit_error", message: "Query complexity" }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "0" },
+        });
+      }
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [1, 2].map((id) => ({
+            id,
+            status: "done",
+            direction: "outbound",
+            raw_digits: `+1 555-555-000${id}`,
+            started_at: endedAt - 60,
+            ended_at: endedAt + id,
+            duration: 60,
+            tags: [{ name: "Outbound Campaign" }],
+          })),
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const body = await (await aircallSync(cronRequest())).json();
+      //Deferred, not failed: nothing was lost, so the run is still a success and failed stays at zero.
+      expect(body).toMatchObject({
+        success: true,
+        truncated: true,
+        stopReason: "throttled",
+        failed: 0,
+        processed: 0,
+        callsRemaining: 2,
+      });
+      //The cursor did NOT move past the throttled call, and was not parked at now either.
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+      //It stopped on the first call rather than throttling its way through both.
+      const queries = mock.calls.filter((call) => call.input.includes("objects/people/records/query"));
+      expect(queries).toHaveLength(4);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall still passes over a deterministic lookup failure rather than stopping forever", async () => {
+    //The other half of the distinction. A 404 will fail identically on every future run, so stopping the run on
+    //it would wedge the sync on one unprocessable call. Only a transient status defers; this one is passed over
+    //and the cursor advances, exactly as before.
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const endedAt = Math.floor(Date.now() / 1000) - 300;
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "aircall-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("objects/people/records/query")) return jsonResponse({ error: "gone" }, 404);
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [
+            {
+              id: 1,
+              status: "done",
+              direction: "outbound",
+              raw_digits: "+1 555-555-0001",
+              started_at: endedAt - 60,
+              ended_at: endedAt,
+              duration: 60,
+              tags: [{ name: "Outbound Campaign" }],
+            },
+          ],
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await aircallSync(cronRequest());
+      //A genuine failure, so it is counted and returned - and the run reports 500 as it always has.
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toMatchObject({ truncated: false, failed: 1 });
+      expect(body).not.toHaveProperty("stopReason");
+      //Passed over means the cursor moved on past it, and the run then parked short of now.
+      expect(Date.parse(body.cursorTimestamp)).toBeGreaterThan(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("Aircall falls back to the default budget when AIRCALL_SYNC_BUDGET_MS is malformed", async () => {
     //A bad override must not take the run down with it - it is a tuning knob, not a dependency.
     process.env.AIRCALL_SYNC_BUDGET_MS = "not-a-number";
