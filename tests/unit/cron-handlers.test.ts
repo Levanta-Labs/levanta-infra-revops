@@ -19,6 +19,7 @@ const envNames = [
   "ATTIO_PERSON_INSTANTLY_COUNTER_SLUG",
   "ATTIO_PERSON_HEYREACH_COUNTER_SLUG",
   "ATTIO_COMPANY_AIRCALL_COUNTER_SLUG",
+  "AIRCALL_SYNC_BUDGET_MS",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
@@ -194,11 +195,13 @@ describe("cron handlers", () => {
   });
 
   test("Aircall still acts on an interested tag applied to a call the cursor has already passed", async () => {
-    //The call ended six minutes ago and the cursor was saved four minutes ago, so the touchpoint side has finished
-    //with it. The tag was applied since. Only the ten-minute lookback brings it back for the interested check:
-    //min(cursor, now - 10m) reaches further back than the cursor alone, which is the whole point of the constant.
-    const endedAt = Math.floor(Date.now() / 1000) - 360;
-    const cursorSavedAt = new Date(Date.now() - 4 * 60 * 1000).toISOString();
+    //Two runs landing close together, which is the case INTERESTED_LOOKBACK_MS exists for: the call ended three
+    //minutes ago and the cursor was saved two minutes ago, so the touchpoint side has finished with it. The tag
+    //was applied since. Only the lookback brings it back for the interested check, because min(cursor, now -
+    //lookback) then reaches further back than the cursor alone. Deliberately inside the five-minute lookback -
+    //at the normal ten-minute cadence the cursor is the wider floor and this constant never binds.
+    const endedAt = Math.floor(Date.now() / 1000) - 180;
+    const cursorSavedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
     const mock = installFetchMock((url, init) => {
       if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
       if (url.includes("supabase.co")) {
@@ -405,6 +408,119 @@ describe("cron handlers", () => {
     try {
       expect(await (await aircallSync(cronRequest())).json()).toMatchObject({ callsFound: 1, interested: 0 });
       expect(mock.calls.some((call) => call.input.includes("objects/deals/records"))).toBe(false);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall stops on the run budget and leaves the cursor where the loop reached, not at now", async () => {
+    //A 2ms budget against an Aircall read deliberately made to take 20ms: the budget is spent before the loop
+    //starts, so it breaks on its very first call. Nothing is processed, and - the part that matters - the cursor
+    //must NOT be parked near now. Parking would claim the untouched calls had been dealt with and skip them
+    //forever, which is exactly the silent loss the budget exists to avoid. Vercel killing the function at
+    //maxDuration saved nothing at all; this saves the old mark, so the next run resumes from it.
+    process.env.AIRCALL_SYNC_BUDGET_MS = "2";
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const endedAt = Math.floor(Date.now() / 1000) - 300;
+    const mock = installFetchMock(async (url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "aircall-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("api.aircall.io")) {
+        //Real elapsed time, because the budget is wall-clock and every other mock here answers instantly.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return jsonResponse({
+          calls: [1, 2, 3].map((id) => ({
+            id,
+            status: "done",
+            direction: "outbound",
+            raw_digits: `+1 555-555-000${id}`,
+            started_at: endedAt - 60,
+            ended_at: endedAt + id,
+            duration: 60,
+            tags: [{ name: "Booked" }],
+          })),
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await aircallSync(cronRequest());
+      //A truncated run is not a failure: it wrote everything it reached and recorded where that was.
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        success: true,
+        truncated: true,
+        callsFound: 3,
+        callsRemaining: 3,
+        processed: 0,
+        interested: 0,
+      });
+      //No Attio work was attempted, so there is nothing to double-count next run.
+      expect(mock.calls.some((call) => call.input.includes("attio"))).toBe(false);
+      const write = mock.calls.find((call) => call.input.includes("supabase.co") && call.init?.method === "POST");
+      const saved = JSON.parse(String(write?.init?.body)) as { cursor_timestamp: string };
+      expect(Date.parse(saved.cursor_timestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall parks its cursor at now only when the loop actually finished", async () => {
+    //The mirror of the test above, and the reason `truncated` is reported rather than inferred: with the budget
+    //left alone the same three calls are all handled, so parking short of now is correct and the flag is false.
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const endedAt = Math.floor(Date.now() / 1000) - 300;
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "aircall-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      //No Attio person matches, so each call is skipped without any write - the loop is what is under test here.
+      if (url.includes("objects/people/records/query")) return jsonResponse({ data: [] });
+      if (url.includes("api.aircall.io")) {
+        return jsonResponse({
+          calls: [1, 2, 3].map((id) => ({
+            id,
+            status: "done",
+            direction: "outbound",
+            raw_digits: `+1 555-555-000${id}`,
+            started_at: endedAt - 60,
+            ended_at: endedAt + id,
+            duration: 60,
+            tags: [{ name: "Outbound Campaign" }],
+          })),
+          meta: { next_page_link: null },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const body = await (await aircallSync(cronRequest())).json();
+      expect(body).toMatchObject({ truncated: false, callsFound: 3, skipped: 3 });
+      expect(body).not.toHaveProperty("callsRemaining");
+      //Parked short of now, well past the half-hour-old mark it started from.
+      expect(Date.parse(body.cursorTimestamp)).toBeGreaterThan(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Aircall falls back to the default budget when AIRCALL_SYNC_BUDGET_MS is malformed", async () => {
+    //A bad override must not take the run down with it - it is a tuning knob, not a dependency.
+    process.env.AIRCALL_SYNC_BUDGET_MS = "not-a-number";
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("api.aircall.io")) return jsonResponse({ calls: [], meta: { next_page_link: null } });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await aircallSync(cronRequest());
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ truncated: false });
     } finally {
       mock.restore();
     }

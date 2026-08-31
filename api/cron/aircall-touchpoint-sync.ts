@@ -28,9 +28,9 @@ import {
 } from "../../lib/cursors.js";
 import { errorMessage } from "../../lib/json.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
+import { optionalEnv, reportConfigValue } from "../../lib/env.js";
 
 const SYNC_KEY = "aircall-touchpoints";
-
 //An outcome tag is applied after the call, sometimes minutes after, so a cursor alone can carry a call past the
 //interested check before the tag it is wanted for exists. This widens how far back that check looks, measured
 //on ended_at, for the interested workflow alone. Touchpoint counters stay cursor-gated regardless and are never
@@ -39,21 +39,26 @@ const SYNC_KEY = "aircall-touchpoints";
 //It is a FLOOR, not a window: the effective floor is min(cursor, now - this). It therefore binds only while it
 //reaches further back than the cursor does - that is, while it is wider than the inter-run gap.
 //
-//AT THE CURRENT HOURLY CADENCE IT DOES NOT NORMALLY BIND. The cursor sits about 62 minutes back (the gap plus
-//CURSOR_GRACE_MS), so min() picks the cursor and real tag tolerance is that 62 minutes, not this ten. The
-//constant takes effect only when two runs land within ten minutes of each other - a manual trigger behind a
-//scheduled one, or a retry - which is worth keeping it for, but it does not set tolerance day to day.
+//AT THE CURRENT TEN-MINUTE CADENCE IT DOES NOT NORMALLY BIND, AND FIVE MINUTES IS A MINIMUM, NOT THE WINDOW.
+//The cursor sits about 12 minutes back (the gap plus CURSOR_GRACE_MS), and 12 minutes back reaches further back
+//than five does, so min() picks the cursor. Real tag tolerance day to day is therefore ~12 minutes, not this
+//five. What this value actually guarantees is the floor when two runs land close together - a manual trigger
+//behind a scheduled one, or a retry - where the cursor is only a minute or two back and would otherwise leave
+//almost no tolerance at all. Lowering this further cannot reduce tolerance below the cursor's ~12 minutes; only
+//a shorter cadence can do that.
 //
-//So the hourly cursor is the real floor, and it gives: ~62 minutes of tolerance, which against this workspace's
-//tag history catches 66 of 67 hand-applied tags (only the 165-minute outlier is missed), and ONE check per
-//interested call, so its notes are written once. At the former five-minute cadence this constant did bind, and
-//deliberately overlapped: every interested call was checked on two consecutive runs and its notes written twice
-//- accepted because a duplicate note can be deleted while a missed booking is gone silently.
+//WHAT THIS SETTING BUYS AND WHAT IT COSTS. Against this workspace's tag history (63 of 67 hand-applied tags
+//landed within five minutes of the call ending, three within thirty, one took 165 minutes), a ~12-minute
+//tolerance catches the 63 and misses the late ones. That is the deliberate trade: it is chosen for ONE note
+//per interested call rather than for maximum tag coverage. An interested call is re-checked on every run whose
+//floor still covers it, so at a floor barely wider than the cadence it is normally checked once, occasionally
+//twice when it lands inside the two-minute grace band. Compare a 65-minute value, which recovers the 30-minute
+//tags and the 165-minute outlier but writes each interested call's person and deal notes about six times over
+//(the count is always this value divided by the cadence; the deal itself is never duplicated, only the notes).
 //
-//To make it bind again, shorten the cadence below ten minutes or widen this value past the gap. Widening trades
-//coverage for duplicates: notes are rewritten once per run the floor still covers, so the count is this value
-//divided by the cadence.
-const INTERESTED_LOOKBACK_MS = 10 * 60 * 1_000;
+//So: widen this to trade duplicate notes for late-tag coverage, lengthen the cadence to get coverage without
+//the duplicates, and leave it here to keep notes clean at the cost of a tag applied more than ~12 minutes out.
+const INTERESTED_LOOKBACK_MS = 5 * 60 * 1_000;
 
 //[STABILITY] How far back the API window must reach BEYOND the oldest completion this run cares about.
 //Aircall filters /calls on a call's creation time; this sync places calls on the timeline by ended_at. A call
@@ -64,11 +69,39 @@ const INTERESTED_LOOKBACK_MS = 10 * 60 * 1_000;
 //never below the longest call the account actually makes.
 //
 //CEILING: a call is caught while its duration is under roughly this value. Precisely, the run that first sees
-//it finished needs start >= processFloor - this, and at the hourly cadence processFloor trails the completion
-//by up to the inter-run gap, so the safe duration is about this value plus CURSOR_GRACE_MS. At two hours that
-//is calls up to ~2h02m. A longer call is dropped in full - no touchpoint, no tag - and dropped SILENTLY: it
-//never reaches the fetch, so no counter, log line, or failure records that it existed.
+//it finished needs start >= processFloor - this, and processFloor trails the completion by up to the inter-run
+//gap, so the safe duration is about this value plus CURSOR_GRACE_MS. At two hours that is calls up to ~2h02m.
+//A longer call is dropped in full - no touchpoint, no tag - and dropped SILENTLY: it never reaches the fetch,
+//so no counter, log line, or failure records that it existed.
 const MAX_CALL_DURATION_MS = 2 * 60 * 60 * 1_000;
+
+//[STABILITY] How long the per-call loop may keep working before it stops of its own accord and saves what it has.
+//Vercel kills this function at the maxDuration in vercel.json (300s), and a kill lands BEFORE saveSyncCursor, so a
+//run that overruns records no progress at all: the next run re-reads the same backlog, re-increments every counter
+//it already incremented, and overruns again. That is a permanent loop, and it is what a 504 on this route means.
+//This budget converts the overrun into a clean partial run - the cursor is saved where the loop stopped and the
+//remainder is picked up next run - so throughput becomes a matter of how fast the backlog drains, not of whether
+//anything is written at all.
+//[PERF] The margin below maxDuration has to cover the slowest single call still in flight when the budget expires
+//(seven sequential Attio requests) plus the cursor save and the response. Raise maxDuration before raising this.
+const DEFAULT_RUN_BUDGET_MS = 240 * 1_000;
+
+/** The budget, overridable by AIRCALL_SYNC_BUDGET_MS so a stuck backlog can be retuned without a redeploy. */
+function runBudgetMs(): number {
+  const raw = optionalEnv("AIRCALL_SYNC_BUDGET_MS");
+  if (!raw) return DEFAULT_RUN_BUDGET_MS;
+  const parsed = Number(raw);
+  //[STABILITY] A malformed value falls back rather than throwing. Losing the override is a tuning problem; losing
+  //the run is a data problem, and this variable is unset in normal operation anyway.
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(
+      `[config] AIRCALL_SYNC_BUDGET_MS is not a positive number (${JSON.stringify(raw)}) - using the ${DEFAULT_RUN_BUDGET_MS / 1_000}s default`,
+    );
+    return DEFAULT_RUN_BUDGET_MS;
+  }
+  reportConfigValue("AIRCALL_SYNC_BUDGET_MS", raw);
+  return parsed;
+}
 
 type ProcessingOutcome = "processed" | "skipped" | "not_tam";
 
@@ -154,7 +187,8 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
 }
 
 //---------------------------------------------------------------------------------------------------------
-//Vercel Cron entry point, hourly (`0 * * * *`). Runs two independent passes over one shared read of Aircall.
+//Vercel Cron entry point, every ten minutes (`*/10 * * * *`). Runs two independent passes over one shared read
+//of Aircall, under a wall-clock budget - see DEFAULT_RUN_BUDGET_MS for why the cadence is what it is.
 //
 //FLOW:
 // 1. isAuthorizedCron (lib/http.ts) - reject anything without the CRON_SECRET bearer.
@@ -169,10 +203,13 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
 //                   that is what lets a late-applied tag be seen. Duplicates are accepted here.
 //      touchpoint - runs only when isAfterCursor passes. Exactly once per call, ever.
 //    The MAX_CALL_DURATION_MS margin drags in older calls that both gates then reject, which is why the
-//    interested gate is an explicit floor rather than "everything the fetch returned". At the hourly cadence
-//    the two floors nearly coincide, since the cursor is what min() picks - see INTERESTED_LOOKBACK_MS.
+//    interested gate is an explicit floor rather than "everything the fetch returned". At this cadence the
+//    cursor is the wider of the two and so is what min() picks; the lookback is the backstop for runs that
+//    land close together - see INTERESTED_LOOKBACK_MS.
 // 6. advanceCursor past each handled call, whether or not its writes succeeded.
-// 7. advanceCursorTo(upperBound - CURSOR_GRACE_MS) and persist.
+// 6a. Stop the loop at runBudgetMs() if it is still going, leaving the cursor at the last completed call.
+// 7. advanceCursorTo(upperBound - CURSOR_GRACE_MS) and persist - the park is SKIPPED on a budget stop, since
+//     the calls the loop never reached are not dealt with and must stay above the mark.
 //
 //[STABILITY] A failed call is counted and passed over, never retried: its earlier writes are already committed,
 //so a retry would duplicate them, and a permanently failing call would block the sync forever.
@@ -207,7 +244,24 @@ export async function GET(request: Request): Promise<Response> {
     //keeps the summary honest - without it, callsFound alone reads as though the run ignored most of its input.
     let inScopeCount = 0;
 
+    //[STABILITY] The wall clock the loop stops at. Measured from upperBoundMs rather than a fresh Date.now(),
+    //because upperBoundMs is read at the top of the handler and so the budget covers the Aircall pagination too -
+    //a wide backlog spends real time there before the first call is ever processed.
+    const budgetMs = runBudgetMs();
+    const deadlineMs = upperBoundMs + budgetMs;
+    //Number of calls the loop reached before it stopped, so a partial run can report what it left behind.
+    let examinedCount = 0;
+    let stoppedOnBudget = false;
+
     for (const call of calls) {
+      //[STABILITY] Checked before the call rather than after, so the budget is what remains for a whole call and
+      //not what remains after one has already overrun it. Stopping here leaves `cursor` exactly where the last
+      //completed call put it; everything past this point is untouched and still above the mark next run.
+      if (Date.now() >= deadlineMs) {
+        stoppedOnBudget = true;
+        break;
+      }
+      examinedCount += 1;
       const event = aircallCursorEvent(call);
       //Interested gate. Rejects the calls the widened fetch dragged in purely for reach; everything at or above
       //the floor is checked, tagged or not, so the decision is logged either way.
@@ -231,11 +285,21 @@ export async function GET(request: Request): Promise<Response> {
       cursor = advanceCursor(cursor, event);
     }
 
-    //[STABILITY] Park short of now. A call Aircall has not yet published is picked up next run instead of skipped.
-    cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
+    const callsRemaining = calls.length - examinedCount;
+    if (stoppedOnBudget) {
+      //[STABILITY] Do NOT park at now. Parking is a claim that everything up to that moment has been dealt with,
+      //and on a truncated run it has not: the calls the loop never reached would be silently skipped forever.
+      //Leaving the cursor at the last completed call is what makes the next run resume instead of restart.
+      console.warn(
+        `[run] aircall sync: stopped after ${Math.round(budgetMs / 1_000)}s of a ${calls.length}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Sustained truncation means the backlog is draining slower than calls arrive - shorten the cron cadence in vercel.json.`,
+      );
+    } else {
+      //[STABILITY] Park short of now. A call Aircall has not yet published is picked up next run instead of skipped.
+      cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
+    }
     await saveSyncCursor(cursor);
     console.log(
-      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${stoppedOnBudget ? `TRUNCATED with ${callsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
@@ -246,6 +310,10 @@ export async function GET(request: Request): Promise<Response> {
       interested: interestedCount,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),
+      //[DEBUG] A truncated run is a success, not a failure - it wrote everything it reached and saved its place.
+      //It is reported so a manual run can see that a backlog remains rather than reading "complete" and moving on.
+      truncated: stoppedOnBudget,
+      ...(stoppedOnBudget ? { callsRemaining } : {}),
       //[DEBUG] Errors are returned as well as logged, so a manual run reports failures without a log search.
       ...(failures.length > 0 ? { errors: failures } : {}),
     };

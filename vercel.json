@@ -9,7 +9,7 @@
   "crons": [
     {
       "path": "/api/cron/aircall-touchpoint-sync",
-      "schedule": "0 * * * *"
+      "schedule": "*/10 * * * *"
     },
     {
       "path": "/api/cron/instantly-touchpoint-sync",

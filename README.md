@@ -28,7 +28,7 @@ The Vercel functions handle two workflows:
 1. Interested events resolve an Attio Person, resolve or create their Company, ensure an Interested Deal exists,
    write source-history notes, fill blank attributes on all three records, and suppress the lead on every
    outbound platform.
-2. Cron jobs poll each provider for new touchpoints - Instantly and HeyReach every five minutes, Aircall hourly. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
+2. Cron jobs poll each provider for new touchpoints - Instantly and HeyReach every five minutes, Aircall every ten. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
 
 The three syncs do not write the same records, by design:
 
@@ -165,7 +165,7 @@ the correspondent's position, headline, location, company, and all three of HeyR
 | --- | --- | --- |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields; the route reads the lead record back for enrichment |
 | `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
-| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET hourly (`0 * * * *`); also runs the interested workflow for any call whose completion falls in the window and already carries an `AIRCALL_INTERESTED_TAGS` tag |
+| `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every ten minutes (`*/10 * * * *`); also runs the interested workflow for any call whose completion falls in the window and already carries an `AIRCALL_INTERESTED_TAGS` tag |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 
@@ -179,30 +179,58 @@ regardless; running both meant every tagged call was recorded twice. The workflo
 Each run reads every call's tags straight from the API and runs `processAircallInterested` for any call already
 tagged. Because a tag is applied after the call, a high-water cursor alone would carry a call past the check before
 its tag exists, so the interested check is not cursor-gated. Its floor is `min(cursor, now - INTERESTED_LOOKBACK_MS)`,
-with the lookback set to ten minutes.
+with the lookback set to five minutes.
 
-**This sync runs hourly, and at that cadence the ten-minute lookback does not normally bind.** The cursor sits about
-62 minutes back (the gap plus the two-minute `CURSOR_GRACE_MS`), so `min()` picks the cursor and real tag tolerance
-is ~62 minutes. The constant only takes effect when two runs land within ten minutes of each other - a manual
-trigger behind a scheduled one, or a retry - which is worth keeping it for, but it is not what sets tolerance day to
-day. Shortening the cadence below ten minutes, or widening the constant past the gap, would make it bind again.
+**This sync runs every ten minutes, and at that cadence the lookback does not bind - five minutes is a minimum, not
+the window.** The cursor sits about 12 minutes back (the gap plus the two-minute `CURSOR_GRACE_MS`), and 12 minutes
+back reaches further back than five does, so `min()` picks the cursor. Real tag tolerance day to day is therefore
+**~12 minutes**, not five. What the constant guarantees is the floor when two runs land close together - a manual
+trigger behind a scheduled one, or a retry - where the cursor is only a minute or two back and would otherwise leave
+almost no tolerance at all. Lowering it further cannot push tolerance below the cursor's ~12 minutes; only a shorter
+cadence can do that.
 
-What the hourly cursor floor gives you, measured against this workspace's tag history (63 of 67 hand-applied tags
-landed within five minutes of the call ending, three within thirty, one took 165 minutes):
+What the ~12-minute floor gives you, measured against this workspace's tag history (63 of 67 hand-applied tags landed
+within five minutes of the call ending, three within thirty, one took 165 minutes):
 
-- **Tag coverage: 66 of 67.** Only the 165-minute outlier is missed.
-- **One note per interested call.** A call is normally checked on a single run. At a five-minute cadence the
-  ten-minute lookback overlapped every interested call across two consecutive runs and wrote its notes twice by
-  design; hourly, that overlap shrinks to calls completing inside the two-minute grace band.
-- **Latency up to an hour** before a booking's deal, notes, and DNC entry reach Attio.
-- **Heavier runs.** One invocation processes an hour of calls, each touchpoint being up to eight sequential Attio
-  requests. See the note on `maxDuration` under Deployment.
+- **Tag coverage: the 63.** The three at up to thirty minutes and the 165-minute outlier are missed.
+- **One note per interested call.** A call is re-checked on every run whose floor still covers it, so at a floor
+  barely wider than the cadence it is normally checked once, occasionally twice when it lands inside the two-minute
+  grace band.
+- **Latency up to ten minutes** before a booking's deal, notes, and DNC entry reach Attio.
+- **Heavier runs.** One invocation processes up to ten minutes of new calls plus whatever backlog remains, each
+  touchpoint being up to eight sequential Attio requests. See [The run budget](#the-run-budget).
+
+This is a deliberate choice of clean notes over maximum tag coverage. The alternative is a 65-minute lookback, which
+recovers the 30-minute tags and the 165-minute outlier but writes each interested call's person and deal notes about
+six times over - the count is always `lookback / cadence`, and the deal itself is never duplicated, only the notes.
+To get wide coverage without the duplicates, lengthen the cadence rather than the lookback.
+
+### The run budget
+
+The per-call loop is sequential and a single touchpoint costs up to eight Attio requests, so throughput is roughly
+one call every three or four seconds. That is finite, and a backlog can exceed it. Left unguarded the run is killed
+by Vercel at `maxDuration`, and the kill lands *before* `saveSyncCursor` - so the run records no progress at all:
+the next run re-reads the same backlog, re-increments every counter it already incremented, and is killed again. A
+504 on this route means exactly that loop, and inflated `number_of_calls` values are its symptom.
+
+`DEFAULT_RUN_BUDGET_MS` (240s, under the 300s `maxDuration`) makes the loop stop of its own accord instead. On a
+budget stop:
+
+- The cursor is saved where the loop actually reached, so the next run resumes rather than restarts.
+- The park at `now - CURSOR_GRACE_MS` is **skipped**, because the calls the loop never reached have not been dealt
+  with and must stay above the mark.
+- The response carries `truncated: true` and `callsRemaining`, and the run logs a `[run] ... TRUNCATED` warning.
+  The HTTP status stays 200 - a partial run is a success, not a failure.
+
+A single truncated run is normal while a backlog drains. Truncation on run after run means calls are arriving faster
+than they are being processed: shorten the cadence in `vercel.json`. `AIRCALL_SYNC_BUDGET_MS` overrides the budget
+without a redeploy, for retuning against a live backlog; a malformed value falls back to the default rather than
+failing the run.
 
 If the lookback is ever retuned, two figures move together: tag tolerance, and how many times an interested call's
 notes are written, which is the lookback divided by the cadence. Having both wide coverage and no duplicates needs a
-record of which calls were already recorded, which does not exist today.
-
-Touchpoint counters are cursor-gated at any cadence and never double-counted.
+record of which calls were already recorded, which does not exist today. Touchpoint counters, by contrast, are
+cursor-gated at any cadence and never double-counted - once the cursor is actually being saved.
 
 ### Why the Aircall window reaches back two hours
 
@@ -268,6 +296,7 @@ Keep credentials in `.env.local` for local development and configure the same va
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
+| `AIRCALL_SYNC_BUDGET_MS` | Optional. Milliseconds the touchpoint loop may run before it stops and saves its place; defaults to 240000. See [The run budget](#the-run-budget) |
 | `INSTANTLY_API_KEY` | Instantly v2 API key; needs to read emails and leads, and to write blocklist entries |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key; needs to read conversations and to stop leads in campaigns |
@@ -399,12 +428,16 @@ two kinds of failure:
 
 ## Deployment
 
-`vercel.json` selects Vercel's Bun `1.x` runtime and schedules the Instantly and HeyReach syncs every five minutes and the Aircall sync hourly (`0 * * * *`). Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
+`vercel.json` selects Vercel's Bun `1.x` runtime and schedules the Instantly and HeyReach syncs every five minutes and the Aircall sync every ten (`*/10 * * * *`). Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
 
 Every function under `api/` is given `maxDuration: 300`. One touchpoint is up to eight sequential Attio requests and
 the work is unbounded by design, so at the platform default a busy window could be cut off mid-event, leaving a note
 written and its counter not. Three hundred seconds is the Pro ceiling; the project already exceeds Hobby's cron
 limits, so it cannot be running there.
+
+`maxDuration` is a backstop, not a plan. The Aircall sync stops itself at `DEFAULT_RUN_BUDGET_MS` (240s) and saves
+its cursor, because being killed at `maxDuration` discards the run entirely - see [The run budget](#the-run-budget).
+Raise `maxDuration` before raising that budget, never the other way round.
 
 Attio counter updates remain read-then-write because Attio does not expose an atomic increment operation. The sync
 handlers process events sequentially, and a failed event is passed over rather than retried, as described under
