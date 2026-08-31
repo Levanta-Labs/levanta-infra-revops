@@ -21,7 +21,7 @@ import {
 } from "./attio.js";
 import { arrayValue, errorMessage, isJsonObject, stringValue } from "./json.js";
 import {
-  dealSourceLabel,
+  automatedSourceLabel,
   leadSourceLabel,
   THIRD_PARTY_SUPPRESSION_CHANNELS,
   type Provider,
@@ -349,6 +349,27 @@ const MULTISELECT_READERS: Readonly<Record<string, ScalarReader>> = {
   domains: (value) => stringValue(value.domain) ?? stringValue(value.root_domain),
 };
 
+//---------------------------------------------------------------------------------------------------------
+//The slugs that OVERWRITE rather than fill. The standing rule below is that Attio's own data always wins; this
+//set is the deliberate exception to it, so the exception is one named list rather than a special case buried in
+//the loop.
+//
+//WHY LEAD SOURCE IS ON IT. Every other attribute here is a fact about the person - a job title, a location -
+//that a human may have corrected in the CRM and that a provider has no standing to contradict. Lead source is
+//not a fact about the person; it is a statement about THIS run: the channel that just produced the interested
+//signal. Filling it only when blank meant a person first seen on one platform kept that platform's label
+//forever, and a later interested event on another channel was recorded everywhere except the field reporting
+//reads. The value the run carries is by definition the most recent truth, so it replaces what is there.
+//
+//COST: a person worked across channels no longer preserves the FIRST source, only the latest. The full history
+//is still recoverable - every interested event writes a note titled with its own leadSourceLabel, so the
+//sequence lives on the person's and the deal's notes even though the attribute holds only the newest.
+//
+//Applies to the Person's `lead_source` and, through dealValuesFor, the Deal's. Both carry the same string,
+//automatedSourceLabel. Companies never receive this slug.
+//---------------------------------------------------------------------------------------------------------
+const ALWAYS_OVERWRITE: ReadonlySet<string> = new Set(["lead_source"]);
+
 /**
  * [LOGIC] The scalars an attribute currently holds, or null if ANY entry could not be read. All-or-nothing on
  * purpose: a partial read is what would silently delete the entries it failed to see - see mergeMultiselect.
@@ -501,14 +522,16 @@ async function writeSalvagingRejections(
 //THE write path for attributes on an interested lead's records. All three interested workflows go through here.
 //
 //The rule it exists to enforce: third-party data fills gaps in Attio and never contradicts it. Someone who
-//corrected a job title in the CRM must not find it replaced by whatever the provider still believes.
+//corrected a job title in the CRM must not find it replaced by whatever the provider still believes. The ONE
+//exception is ALWAYS_OVERWRITE, where the run's own value is the newer truth by definition.
 //
 //FLOW: 1. `target` given as a record id -> read it, because what may be written depends on what is already
-//there. 2. per candidate attribute: drop the empty ones, merge the multiselects, skip any other slug already
-//populated. 3. nothing left -> no request. 4. otherwise write what remains, salvaging what Attio will take.
+//there. 2. per candidate attribute: drop the empty ones, merge the multiselects, take the ALWAYS_OVERWRITE
+//slugs whatever Attio holds, skip any other slug already populated. 3. nothing left -> no request. 4. otherwise
+//write what remains, salvaging what Attio will take.
 //
 //USES: fetchRecord, patchRecord, recordDisplayName (lib/attio.ts); mergeMultiselect, isEmptyCandidate,
-//writeSalvagingRejections (this module).
+//ALWAYS_OVERWRITE, writeSalvagingRejections (this module).
 //[PERF] One GET when handed an id, none when handed a record. Callers holding a record they just created or
 //queried pass the record, so the common path costs a single PATCH.
 //[STABILITY] Does not throw once the record is in hand - see writeSalvagingRejections. A read that fails still
@@ -534,8 +557,9 @@ export async function updateAttioAttributes(
       continue;
     }
     //Populated means "Attio holds something here". A PATCH would replace the whole attribute rather than merge
-    //into it, so anything already present is left strictly alone.
-    if (record.populatedAttributes.has(slug)) continue;
+    //into it, so anything already present is left strictly alone - unless the slug is one this run is entitled
+    //to restate outright. See ALWAYS_OVERWRITE.
+    if (!ALWAYS_OVERWRITE.has(slug) && record.populatedAttributes.has(slug)) continue;
     fillable[slug] = value;
   }
 
@@ -550,7 +574,7 @@ export async function updateAttioAttributes(
 //A slug absent from these three objects is a slug these workflows never write.
 //---------------------------------------------------------------------------------------------------------
 
-/** [LOGIC] USES: leadSourceLabel (lib/providers.ts); toDate, withoutEmpty (this module). Pure. */
+/** [LOGIC] USES: automatedSourceLabel (lib/providers.ts); toDate, withoutEmpty (this module). Pure. */
 export function personValuesFor(lead: InterestedLead, companyId: string | null = null): AttioValues {
   const values: Record<string, unknown> = {
     email_addresses: lead.emails,
@@ -561,7 +585,8 @@ export function personValuesFor(lead: InterestedLead, companyId: string | null =
     location: lead.location,
     campaign_name: lead.campaignName,
     date_added: toDate(lead.occurredAtMs),
-    lead_source: leadSourceLabel(lead.provider),
+    //The same string the Deal carries - see automatedSourceLabel (lib/providers.ts).
+    lead_source: automatedSourceLabel(lead.provider),
   };
   if (lead.firstName || lead.lastName) {
     const firstName = lead.firstName ?? "";
@@ -590,11 +615,11 @@ export function companyValuesFor(lead: InterestedLead): AttioValues {
   });
 }
 
-/** [LOGIC] USES: dealSourceLabel (lib/providers.ts); toTimestamp, withoutEmpty (this module). Pure. */
+/** [LOGIC] USES: automatedSourceLabel (lib/providers.ts); toTimestamp, withoutEmpty (this module). Pure. */
 export function dealValuesFor(lead: InterestedLead): AttioValues {
   return withoutEmpty({
-    //Not the same string as the Person's Lead Source - see dealSourceLabel (lib/providers.ts).
-    lead_source: dealSourceLabel(lead.provider),
+    //The same string the Person carries - see automatedSourceLabel (lib/providers.ts).
+    lead_source: automatedSourceLabel(lead.provider),
     campaign_name: lead.campaignName,
     email: lead.emails[0] ?? null,
     phone_number_7: lead.phones[0] ?? null,
@@ -791,7 +816,8 @@ export interface InterestedOutcome {
 // 3. ensureInterestedDeal - reuses any deal already linked to the person whatever its stage, and only creates
 //    one when none exists, named strictly by interestedDealName.
 // 4. Note on the person and on the deal, carrying the provider's rendered history.
-// 5. updateAttioAttributes on the person and the deal - fills blanks only, never overwrites.
+// 5. updateAttioAttributes on the person and the deal - fills blanks only, save for lead source, which is
+//    restated to this run's channel whatever Attio already held. See ALWAYS_OVERWRITE.
 // 6. suppressInterestedLead - Attio DNC plus every registered outbound platform.
 //
 //ORDERING is deliberate. The company precedes the deal because it names it. The notes precede the attribute

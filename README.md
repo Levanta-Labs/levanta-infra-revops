@@ -61,7 +61,16 @@ message history into a note. Everything after that is one code path:
 attributes that are blank, so third-party data fills gaps and never contradicts the CRM. Someone who corrected
 a job title in Attio will not find it replaced by whatever the provider still believes.
 
-The one exception is the multiselect attributes - `email_addresses`, `phone_numbers`, `domains`. A PATCH replaces
+**Lead Source is the deliberate exception.** It is not a fact about the person that a human might have
+corrected - it is a statement about the run: the channel that just produced the interested signal. So it is
+written on every interested event whatever Attio already held, on the Person and on the Deal alike, and both
+carry the same string: `<Name> Cold Outreach - Automated`. The suffix marks a record these workflows produced
+without a human, which is as true of the Person as of the Deal. A person first seen on one platform therefore no longer keeps that
+platform's label forever. The cost is that the *first* source is not preserved in the attribute; the full
+sequence is still on record, because every interested event writes a note titled with its own source string. The
+list of slugs that behave this way is `ALWAYS_OVERWRITE` in `lib/interested.ts`.
+
+The other exception is the multiselect attributes - `email_addresses`, `phone_numbers`, `domains`. A PATCH replaces
 an attribute wholesale rather than appending to it, so for these the existing entries are read and sent back
 alongside the new one. A second address for a lead is additive information, and skipping the write outright is
 what previously dropped it. If any existing entry cannot be read back in full, the attribute is declined
@@ -112,8 +121,8 @@ usually for want of the one identifier it works by.
 Provider support is a register, not a set of branches. Adding one is an append plus its own extractor:
 
 1. **`lib/providers.ts`** - add an entry to `SOURCES` with its `displayName`. That single entry widens the
-   `Provider` type and derives the Lead Source and Deal Source strings (`<Name> Cold Outreach` and
-   `<Name> Cold Outreach - Automated`). If the platform also sends outbound and must be silenced, append a
+   `Provider` type and derives both the note title (`<Name> Cold Outreach`) and the source string written to
+   the Person and the Deal (`<Name> Cold Outreach - Automated`). If the platform also sends outbound and must be silenced, append a
    `SuppressionChannel` to `THIRD_PARTY_SUPPRESSION_CHANNELS`; from that moment it is suppressed for every
    provider, with no change to any route.
 2. **A provider module** - parse its payload and return an `InterestedLead` via `interestedLead()`, naming only
@@ -453,7 +462,7 @@ bun run check
 The unit suite mocks every external write and covers provider response validation, pagination, handlers, touchpoint
 event identity, Attio helpers, and Supabase cursor persistence. The shared interested workflow is covered
 separately in `tests/unit/interested.test.ts`: the attribute transforms at each bucket boundary, the never-overwrite
-rule, the multiselect merge and the cases where it declines to write, the strict deal naming, and suppression
+rule and the Lead Source exception to it, the multiselect merge and the cases where it declines to write, the strict deal naming, and suppression
 continuing across platforms after one of them fails.
 
 Run opt-in, read-only smoke tests against configured live accounts:

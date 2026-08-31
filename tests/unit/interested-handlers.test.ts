@@ -96,7 +96,7 @@ describe("interested webhook handlers", () => {
     }
   });
 
-  test("never overwrites attributes Attio already holds", async () => {
+  test("never overwrites attributes Attio already holds, save for lead source", async () => {
     //Every attribute the mapping can produce for this lead, already holding a value. The address matches the
     //one the webhook carries, so even the multiselect merge has nothing to add.
     const mock = mockAttio({
@@ -114,8 +114,14 @@ describe("interested webhook handlers", () => {
     try {
       const response = await instantlyInterested(interestedRequest(leadInterested));
       expect(response.status).toBe(200);
-      // Every candidate attribute is already populated, so no write is attempted at all.
-      expect(personPatches(mock.calls)).toHaveLength(0);
+      //Every candidate attribute is already populated, so the only thing written is the one slug this run is
+      //entitled to restate - see ALWAYS_OVERWRITE (lib/interested.ts). The Aircall label Attio held is replaced
+      //by the channel that actually produced this event, and nothing else moves.
+      const patches = personPatches(mock.calls);
+      expect(patches).toHaveLength(1);
+      expect(JSON.parse(String(patches[0]?.init?.body)).data.values).toEqual({
+        lead_source: "Instantly Cold Outreach - Automated",
+      });
     } finally {
       mock.restore();
     }
@@ -134,7 +140,7 @@ describe("interested webhook handlers", () => {
       const patches = personPatches(mock.calls);
       expect(patches).toHaveLength(1);
       const values = JSON.parse(String(patches[0]?.init?.body)).data.values;
-      expect(values.lead_source).toBe("Instantly Cold Outreach");
+      expect(values.lead_source).toBe("Instantly Cold Outreach - Automated");
       expect(values.name).toEqual([
         { first_name: "Ada", last_name: "Lovelace", full_name: "Ada Lovelace" },
       ]);
