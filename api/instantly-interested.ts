@@ -1,21 +1,18 @@
-import {
-  addPersonToList,
-  blankPersonValues,
-  createNote,
-  createPerson,
-  defaultDealOwner,
-  ensureInterestedDeal,
-  findPersonByEmail,
-  LEAD_SOURCE_LABELS,
-  LISTS,
-  patchPerson,
-  personLabel,
-  type CreatePersonValues,
-  type PersonNameInput,
-} from "../lib/attio.js";
+import { findPersonByEmail } from "../lib/attio.js";
 import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.js";
-import { fetchInstantlyEmails, type InstantlyEmail } from "../lib/instantly.js";
-import { isJsonObject, stringValue } from "../lib/json.js";
+import {
+  interestedLead,
+  recordInterestedLead,
+  type InterestedLead,
+} from "../lib/interested.js";
+import {
+  fetchInstantlyEmails,
+  fetchInstantlyLead,
+  type InstantlyEmail,
+  type InstantlyLead,
+} from "../lib/instantly.js";
+import { errorMessage, isJsonObject, stringValue } from "../lib/json.js";
+import { toE164 } from "../lib/phone.js";
 
 export interface InstantlyInterestedFields {
   readonly eventType: string;
@@ -61,24 +58,56 @@ export function formatInstantlyThread(
     .join("\n\n---\n\n");
 }
 
-function personValues(fields: InstantlyInterestedFields): CreatePersonValues {
-  //email_addresses is always present; parse guarantees it. name is omitted entirely when both parts are absent,
-  //because blankPersonValues keys off presence.
-  const values: {
-    email_addresses: readonly string[];
-    name?: readonly PersonNameInput[];
-  } = { email_addresses: [fields.email] };
-  if (fields.firstName || fields.lastName) {
-    const firstName = fields.firstName ?? "";
-    const lastName = fields.lastName ?? "";
-    values.name = [{ first_name: firstName, last_name: lastName, full_name: `${firstName} ${lastName}`.trim() }];
-  }
-  return values;
+//---------------------------------------------------------------------------------------------------------
+//The lead as the shared workflow sees it: the webhook body, plus whatever the lead record adds.
+//The webhook is thin - an event type, an address, sometimes a name and a campaign. Everything else Instantly
+//knows about this person (job title, LinkedIn URL, phone, industry, headcount, revenue, location, the company's
+//postal address) lives on the lead record under the campaign's custom variables, which is why the route reads
+//it back before mapping. Webhook values win where both carry the same field: the webhook describes the event
+//that just happened, the record describes the row as uploaded.
+//USES: interestedLead (lib/interested.ts), toE164 (lib/phone.ts). Pure.
+//---------------------------------------------------------------------------------------------------------
+export function instantlyLead(
+  fields: InstantlyInterestedFields,
+  enriched: InstantlyLead | null,
+  occurredAtMs: number,
+): InterestedLead {
+  return interestedLead("instantly", {
+    emails: [fields.email],
+    //Instantly stores a phone as it was uploaded, punctuated or not; toE164 drops anything that is not a
+    //dialable number rather than writing a fragment into the CRM.
+    phones: [toE164(enriched?.phone ?? null)].filter((phone): phone is string => phone !== null),
+    firstName: fields.firstName ?? enriched?.firstName ?? null,
+    lastName: fields.lastName ?? enriched?.lastName ?? null,
+    linkedin: enriched?.linkedin ?? null,
+    jobTitle: enriched?.jobTitle ?? null,
+    location: enriched?.location ?? null,
+    companyName: fields.companyName ?? enriched?.companyName ?? null,
+    companyDomain: enriched?.companyDomain ?? null,
+    companyAddress: enriched?.companyAddress ?? null,
+    employeeCount: enriched?.employeeCount ?? null,
+    annualRevenue: enriched?.annualRevenue ?? null,
+    industry: enriched?.industry ?? null,
+    website: enriched?.website ?? null,
+    campaignName: fields.campaignName,
+    occurredAtMs,
+  });
 }
 
-function dealName(fields: InstantlyInterestedFields): string {
-  if (fields.companyName) return `${fields.companyName} - Interested`;
-  return `${fields.firstName ?? ""} ${fields.lastName ?? ""}`.trim() || "New Interested Deal";
+/**
+ * [DEBUG] Enrichment must never fail the event: the webhook alone is enough to record the lead, so a lookup
+ * failure is logged and swallowed rather than raised.
+ * USES: fetchInstantlyLead (lib/instantly.ts), errorMessage (lib/json.ts).
+ */
+async function enrichFromInstantly(email: string): Promise<InstantlyLead | null> {
+  try {
+    return await fetchInstantlyLead(email);
+  } catch (error) {
+    console.warn(
+      `[route] instantly-interested: lead lookup for ${email} failed, so only the webhook's own fields are used - ${errorMessage(error)}`,
+    );
+    return null;
+  }
 }
 
 //---------------------------------------------------------------------------------------------------------
@@ -88,14 +117,17 @@ function dealName(fields: InstantlyInterestedFields): string {
 // 1. hasWebhookSecret (lib/http.ts) - compare the x-webhook-secret header against INSTANTLY_WEBHOOK_SECRET.
 // 2. parseInstantlyInterestedWebhook - require event_type and lead_email.
 // 3. Ignore anything that is not lead_interested; Instantly sends opens and replies to the same URL.
-// 4. Resolve the person by email (lib/attio.ts), creating one when there is no match.
-// 5. ensureInterestedDeal - reuses any deal already linked to the person, creates one only when none exists.
-// 6. fetchInstantlyEmails (lib/instantly.ts) for the full thread, rendered by formatInstantlyThread.
-// 7. Note on the person and on the deal, patchPerson with blankPersonValues, add to the DNC list.
+// 4. Read the lead record back for the fields the webhook does not carry. Best-effort - see enrichFromInstantly.
+// 5. recordInterestedLead (lib/interested.ts) - the sequence every provider shares. Instantly contributes the
+//    person lookup (by address) and the thread note.
 //
 //[SECURITY] Step 1 precedes the body read, so an unauthenticated caller never reaches the parser.
-//[STABILITY] Steps 5-7 are separate Attio calls with no transaction. A throw partway leaves earlier writes
+//[STABILITY] Step 5 is a series of Attio calls with no transaction. A throw partway leaves earlier writes
 //committed and returns 500; Instantly's retry would then repeat them, adding duplicate notes.
+//[DEBUG] `emailCount` is assigned inside the history thunk because only that closure sees the thread. The
+//thunk is awaited inside recordInterestedLead before this function reads it back, so the count is settled.
+//USES: hasWebhookSecret, json, requestJson, serverError (lib/http.ts); findPersonByEmail (lib/attio.ts);
+//fetchInstantlyEmails (lib/instantly.ts); recordInterestedLead (lib/interested.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function POST(request: Request): Promise<Response> {
   if (!hasWebhookSecret(request, "INSTANTLY_WEBHOOK_SECRET")) {
@@ -112,32 +144,32 @@ export async function POST(request: Request): Promise<Response> {
     }
     console.log(`[route] instantly-interested: handling lead_interested for ${fields.email}`);
 
-    let person = await findPersonByEmail(fields.email);
-    if (!person) person = await createPerson(personValues(fields));
-    const personId = person.id.record_id;
-    const personName = personLabel(person);
-    const dealId = await ensureInterestedDeal(
-      person,
-      dealName(fields),
-      defaultDealOwner(),
-    );
-    //Unbounded by time - the whole thread for this lead, paginated. Bounded in practice by one lead's volume.
-    const emails = await fetchInstantlyEmails({ leadEmail: fields.email });
-    const history = formatInstantlyThread(emails, fields.campaignName);
-    const title = LEAD_SOURCE_LABELS.instantly;
-    await createNote("people", personId, title, history, personName);
-    await createNote("deals", dealId, title, history);
-    //blankPersonValues strips any attribute Attio already holds, so this can only fill gaps.
-    await patchPerson(
-      personId,
-      blankPersonValues(person, { ...personValues(fields), lead_source: title }),
-      personName,
-    );
-    await addPersonToList(personId, LISTS.DNC, personName);
+    const enriched = await enrichFromInstantly(fields.email);
+    let emailCount = 0;
+
+    const outcome = await recordInterestedLead({
+      lead: instantlyLead(fields, enriched, Date.now()),
+      subject: "instantly-interested",
+      findPerson: () => findPersonByEmail(fields.email),
+      history: async () => {
+        //Unbounded by time - the whole thread for this lead, paginated. Bounded in practice by one lead's volume.
+        const emails = await fetchInstantlyEmails({ leadEmail: fields.email });
+        emailCount = emails.length;
+        return formatInstantlyThread(emails, fields.campaignName);
+      },
+    });
+
     console.log(
-      `[route] instantly-interested: completed - person ${personName}, deal ${dealId}, ${emails.length} email(s) summarised`,
+      `[route] instantly-interested: ${emailCount} email(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
     );
-    return json({ success: true, personId, dealId });
+    return json({
+      success: true,
+      personId: outcome.personId,
+      dealId: outcome.dealId,
+      companyId: outcome.companyId,
+      suppression: outcome.suppression.outcomes,
+      ...(outcome.suppression.failures.length > 0 ? { suppressionErrors: outcome.suppression.failures } : {}),
+    });
   } catch (error) {
     return serverError("Instantly interested webhook error", error);
   }

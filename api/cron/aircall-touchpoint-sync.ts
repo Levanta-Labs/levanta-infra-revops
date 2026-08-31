@@ -1,4 +1,5 @@
-import { fetchAircallCalls, toE164, type AircallCall } from "../../lib/aircall.js";
+import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.js";
+import { toE164 } from "../../lib/phone.js";
 import {
   interestedTagSet,
   logInterestedDecision,
@@ -108,7 +109,7 @@ export function aircallCursorEvent(call: AircallCall): CursorEvent {
 //only needs the count; the Company carries the note as the roll-up view.
 //FLOW: 1. normalise the number to E.164. 2. match a Person on it. 3. require Master TAM membership.
 //4. bump the Person counter. 5. if a Company is linked, note it and bump the Company counter.
-//USES: toE164 (lib/aircall.ts); findPersonByPhone, isPersonInList, incrementCounter, createNote,
+//USES: toE164 (lib/phone.ts); findPersonByPhone, isPersonInList, incrementCounter, createNote,
 //personCompanyId, personCounterSlug, companyCounterSlug (lib/attio.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function processAircallTouchpoint(call: AircallCall): Promise<ProcessingOutcome> {

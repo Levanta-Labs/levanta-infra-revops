@@ -41,19 +41,32 @@ const leadInterested = {
   campaign_name: "Outbound",
 };
 
-/** Mocks a found Person whose listed attributes already hold a value in Attio. */
+//---------------------------------------------------------------------------------------------------------
+//Mocks a found Person whose listed attributes already hold a value in Attio, plus every other call the shared
+//workflow makes: the company lookup, the deal read-back, the notes, and the suppression across all platforms.
+//`populated` is the Person's attribute values as Attio would return them - an empty array meaning blank.
+//---------------------------------------------------------------------------------------------------------
 function mockAttio(populated: Record<string, unknown>) {
-  return installFetchMock((url) => {
+  return installFetchMock((url, init) => {
+    const method = init?.method ?? "GET";
     if (url.includes("objects/people/records/query")) {
-      return jsonResponse({
-        data: [{ id: { record_id: "person-1" }, values: populated }],
-      });
+      return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: populated }] });
     }
-    if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
+    //No company matches, so the workflow either creates one or records none.
+    if (url.includes("objects/companies/records/query")) return jsonResponse({ data: [] });
+    if (url.includes("objects/") && method === "PATCH") return jsonResponse({ data: {} });
+    if (url.includes("objects/companies/records")) {
+      return jsonResponse({ data: { id: { record_id: "company-1" }, values: { name: [{ value: "Engines Ltd" }] } } });
+    }
+    //Covers both the read-back of a reused deal and the creation of a new one.
+    if (url.includes("objects/deals/records")) {
+      return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
+    }
     if (url.includes("/notes")) return jsonResponse({ data: {} });
     if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
-    if (url.includes("objects/people/records/person-1")) return jsonResponse({ data: {} });
-    if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" } } });
+    if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
+    if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
+    if (url.includes("api.heyreach.io")) return jsonResponse({ items: [], hasNextPage: false });
     throw new Error(`Unexpected fetch: ${url}`);
   });
 }
@@ -84,10 +97,18 @@ describe("interested webhook handlers", () => {
   });
 
   test("never overwrites attributes Attio already holds", async () => {
+    //Every attribute the mapping can produce for this lead, already holding a value. The address matches the
+    //one the webhook carries, so even the multiselect merge has nothing to add.
     const mock = mockAttio({
-      email_addresses: [{ email_address: "existing@example.com" }],
+      email_addresses: [{ email_address: "ada@example.com" }],
       name: [{ full_name: "A. L. Byron" }],
       lead_source: [{ value: "Aircall Cold Outreach" }],
+      job_title: [{ value: "Countess" }],
+      description: [{ value: "Wrote the first program" }],
+      location: [{ value: "London" }],
+      linkedin: [{ value: "https://linkedin.com/in/byron" }],
+      campaign_name: [{ value: "An earlier campaign" }],
+      date_added: [{ value: "2020-01-01" }],
       associated_deals: [{ target_record_id: "deal-1" }],
     });
     try {

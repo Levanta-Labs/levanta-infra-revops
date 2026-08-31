@@ -1,4 +1,5 @@
 import { reportConfigEmail, reportConfigValue, requiredEnv } from "./env.js";
+import type { Provider } from "./providers.js";
 import { ATTIO_BASE, attioHeaders, credentialHint } from "./endpoints.js";
 import {
   arrayValue,
@@ -16,13 +17,6 @@ export const LISTS = {
   DNC: "dnc",
 } as const;
 
-export type Provider = "aircall" | "instantly" | "heyreach";
-
-export const LEAD_SOURCE_LABELS: Record<Provider, string> = {
-  aircall: "Aircall Cold Outreach",
-  instantly: "Instantly Cold Outreach",
-  heyreach: "HeyReach Cold Outreach",
-};
 export type AttioObject = "people" | "companies" | "deals";
 
 //Interfaces==============================================================================================
@@ -32,35 +26,40 @@ export interface AttioRecordReference {
   readonly target_record_id: string;
 }
 
-export interface AttioPerson {
+/** Attribute values on their way INTO Attio, keyed by slug. Built by the mappers in lib/interested.ts. */
+export type AttioValues = Readonly<Record<string, unknown>>;
+
+//---------------------------------------------------------------------------------------------------------
+//Any Attio record, of any object, in the two forms the codebase needs: the attribute values as Attio returned
+//them, and the set of slugs currently holding anything at all.
+//populatedAttributes is type-agnostic on purpose. Attio wraps every attribute in an array whatever its type, so
+//a non-empty array is the only "has a value" test that works across text, references, selects, and counters
+//alike. updateAttioAttributes (lib/interested.ts) is built on it, and is what stops a write overwriting.
+//---------------------------------------------------------------------------------------------------------
+export interface AttioRecord {
   readonly id: {
     readonly record_id: string;
   };
+  //As Attio returned them: each attribute an array of value objects whose shape follows its type - `{ value }`
+  //for text, `{ email_address }` for an address, `{ option: { title } }` for a select. Read these through the
+  //extractors in lib/interested.ts rather than reaching in directly.
+  readonly rawValues: JsonObject;
+  readonly populatedAttributes: ReadonlySet<string>;
+}
+
+/** A person, with the three attributes the interested and touchpoint workflows navigate by parsed out. */
+export interface AttioPerson extends AttioRecord {
   readonly values: {
     readonly associated_deals: readonly AttioRecordReference[];
     readonly company: readonly AttioRecordReference[];
     readonly name: readonly { readonly full_name: string | null }[];
   };
-  // Attio returns every attribute as an array, so a non-empty array means "has a value"
-  // regardless of the attribute's type. Used to fill only blanks and never overwrite.
-  readonly populatedAttributes: ReadonlySet<string>;
 }
 
 export interface PersonNameInput {
   readonly first_name: string;
   readonly last_name: string;
   readonly full_name: string;
-}
-
-export interface CreatePersonValues {
-  readonly email_addresses?: readonly string[];
-  readonly phone_numbers?: readonly string[];
-  readonly linkedin?: string;
-  readonly name?: readonly PersonNameInput[];
-}
-
-export interface PatchPersonValues extends CreatePersonValues {
-  readonly lead_source?: string;
 }
 
 //============================================================================================================
@@ -126,18 +125,31 @@ function parseReferences(values: JsonObject, key: string): readonly AttioRecordR
 
 //#region master methode
 //---------------------------------------------------------------------------------------------------------
-//Turns one raw Attio person record into the shape the rest of the codebase uses.
-//FLOW: 1. require id.record_id and values. 2. read the linked deals and company as references. 3. read names.
-//4. record which attribute slugs hold anything at all, for blankPersonValues.
-//Step 4 is type-agnostic on purpose: Attio wraps every attribute in an array whatever its type, so a non-empty
-//array is the only "has a value" test that works across text, references, and counters alike.
+//Turns one raw Attio record of any object into the shape the rest of the codebase uses.
+//FLOW: 1. require id.record_id and values. 2. keep the values verbatim. 3. record which slugs hold anything.
+//Step 3 is the whole basis of never-overwrite: see AttioRecord.populatedAttributes.
 //---------------------------------------------------------------------------------------------------------
-export function parseAttioPerson(value: unknown): AttioPerson {
-  if (!isJsonObject(value)) throw new Error("Attio returned an invalid person record");
+export function parseAttioRecord(value: unknown): AttioRecord {
+  if (!isJsonObject(value)) throw new Error("Attio returned an invalid record");
   const id = objectValue(value, "id");
   const values = objectValue(value, "values");
   const recordId = id ? stringValue(id.record_id) : null;
-  if (!recordId || !values) throw new Error("Attio person record is missing id or values");
+  if (!recordId || !values) throw new Error("Attio record is missing id or values");
+
+  const populatedAttributes = new Set(
+    Object.keys(values).filter((slug) => arrayValue(values, slug).length > 0),
+  );
+  return { id: { record_id: recordId }, rawValues: values, populatedAttributes };
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Turns one raw Attio person record into the shape the rest of the codebase uses.
+//FLOW: 1. parseAttioRecord for the generic half. 2. read the linked deals and company as references, and the
+//names, because those three are what the workflows navigate by rather than merely write.
+//---------------------------------------------------------------------------------------------------------
+export function parseAttioPerson(value: unknown): AttioPerson {
+  const record = parseAttioRecord(value);
+  const values = record.rawValues;
 
   const names = arrayValue(values, "name")
     .map((name) => {
@@ -146,38 +158,14 @@ export function parseAttioPerson(value: unknown): AttioPerson {
     })
     .filter((name): name is { readonly full_name: string | null } => name !== null);
 
-  const populatedAttributes = new Set(
-    Object.keys(values).filter((slug) => arrayValue(values, slug).length > 0),
-  );
-
   return {
-    id: { record_id: recordId },
+    ...record,
     values: {
       associated_deals: parseReferences(values, "associated_deals"),
       company: parseReferences(values, "company"),
       name: names,
     },
-    populatedAttributes,
   };
-}
-
-/**
- * Keeps only the candidate values whose attribute is currently blank on the person,
- * so third-party data fills gaps without ever overwriting what Attio already holds.
- */
-export function blankPersonValues(
-  person: AttioPerson,
-  candidate: PatchPersonValues,
-): PatchPersonValues {
-  const fillable: Record<string, unknown> = {};
-  for (const [slug, value] of Object.entries(candidate)) {
-    if (value === undefined) continue;
-    //Populated means "Attio holds something here". A PATCH would replace the whole attribute, not merge into
-    //it, so anything already present is left strictly alone.
-    if (person.populatedAttributes.has(slug)) continue;
-    fillable[slug] = value;
-  }
-  return fillable as PatchPersonValues;
 }
 //#endregion
 
@@ -264,7 +252,7 @@ async function withAction<T>(action: string, run: () => Promise<T>): Promise<T> 
 }
 
 /** Creates a person and returns it parsed, so the caller has both the new ID and its populated-attribute set. */
-export async function createPerson(values: CreatePersonValues): Promise<AttioPerson> {
+export async function createPerson(values: AttioValues): Promise<AttioPerson> {
   //Not withAction: the log line needs the created record's name, which only exists after the response parses.
   try {
     const response = await attioFetch("/objects/people/records", {
@@ -280,24 +268,88 @@ export async function createPerson(values: CreatePersonValues): Promise<AttioPer
   }
 }
 
-/** Writes the given attributes. Callers pass blankPersonValues output, so this never overwrites existing data. */
-export async function patchPerson(
-  personId: string,
-  values: PatchPersonValues,
-  personName: string = personId,
+/** Reads one record whole, so a caller can see what it already holds before deciding what to write. */
+export async function fetchRecord(object: AttioObject, recordId: string): Promise<AttioRecord> {
+  const response = await attioFetch(`/objects/${object}/records/${recordId}`);
+  return parseAttioRecord(responseData(response));
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The one write path for attributes on any record. Deliberately dumb: it writes exactly what it is handed.
+//Deciding WHAT may be written - which is the never-overwrite rule - belongs to updateAttioAttributes
+//(lib/interested.ts), which is the only thing that should call this. Every caller goes through there so the
+//rule cannot be bypassed by accident.
+//An empty patch is a no-op that still logs: "nothing needed writing" is a result, and silence is not.
+//---------------------------------------------------------------------------------------------------------
+export async function patchRecord(
+  object: AttioObject,
+  recordId: string,
+  values: AttioValues,
+  recordName: string = recordId,
 ): Promise<void> {
   const slugs = Object.keys(values);
-  //An empty patch means every candidate attribute was already populated. Skip the request, log the reason.
   if (slugs.length === 0) {
-    console.log(`[action] person ${personName} not updated - no attributes needed writing`);
+    console.log(`[action] ${object} ${recordName} not updated - no attributes needed writing`);
     return;
   }
-  await withAction(`person ${personName} updated: ${slugs.join(", ")}`, () =>
-    attioFetch(`/objects/people/records/${personId}`, {
+  await withAction(`${object} ${recordName} updated: ${slugs.join(", ")}`, () =>
+    attioFetch(`/objects/${object}/records/${recordId}`, {
       method: "PATCH",
       body: JSON.stringify({ data: { values } }),
     }),
   );
+}
+
+//=============================================================================================================
+//Companies. Before this existed no interested workflow resolved one, so a deal opened for a brand-new lead
+//carried no company and the touchpoint crons had nothing to hang a company note or counter on.
+//=============================================================================================================
+
+/** One filtered company query. Domain is the strong identifier; name is the fallback and matches exactly. */
+async function findCompany(attribute: string, value: string | null): Promise<AttioRecord | null> {
+  if (!value) {
+    console.log(`[lookup] company by ${attribute}: skipped - no value to search for`);
+    return null;
+  }
+  const response = await attioFetch("/objects/companies/records/query", {
+    method: "POST",
+    body: JSON.stringify({ filter: { [attribute]: value }, limit: 1 }),
+  });
+  const data = responseData(response);
+  if (!Array.isArray(data)) throw new Error("Attio company query returned invalid data");
+  if (data[0] === undefined) {
+    console.log(`[lookup] company by ${attribute} ${JSON.stringify(value)}: no match`);
+    return null;
+  }
+  const company = parseAttioRecord(data[0]);
+  console.log(
+    `[lookup] company by ${attribute} ${JSON.stringify(value)}: matched ${recordDisplayName(company) ?? company.id.record_id}`,
+  );
+  return company;
+}
+
+export function findCompanyByDomain(domain: string | null): Promise<AttioRecord | null> {
+  return findCompany("domains", domain);
+}
+
+export function findCompanyByName(name: string | null): Promise<AttioRecord | null> {
+  return findCompany("name", name);
+}
+
+/** Creates a company and returns it parsed, so the caller has the new ID and its populated-attribute set. */
+export async function createCompany(values: AttioValues): Promise<AttioRecord> {
+  try {
+    const response = await attioFetch("/objects/companies/records", {
+      method: "POST",
+      body: JSON.stringify({ data: { values } }),
+    });
+    const company = parseAttioRecord(responseData(response));
+    console.log(`[action] company created: ${recordDisplayName(company) ?? company.id.record_id}`);
+    return company;
+  } catch (error) {
+    console.error(`[action] FAILED - company could not be created: ${errorMessage(error)}`);
+    throw error;
+  }
 }
 
 //---------------------------------------------------------------------------------------------------------
@@ -363,13 +415,13 @@ export async function createNote(
   );
 }
 
-/** Reads one counter attribute off a fetched record. Absent means zero; present but non-numeric is a config error. */
-function parseCounterValue(value: unknown, attributeSlug: string): number {
-  const data = responseData(value);
-  if (!isJsonObject(data)) throw new Error("Attio record response is invalid");
-  const values = objectValue(data, "values");
-  if (!values) throw new Error("Attio record values are missing");
-  const first = arrayValue(values, attributeSlug)[0];
+/**
+ * [LOGIC] Reads one counter attribute off an already-parsed record. An absent attribute means zero - a record
+ * that has never been counted starts at nothing. Present but non-numeric is a configuration error, not a zero:
+ * it means the slug names some other kind of attribute, and counting from zero would overwrite it.
+ */
+function counterValue(record: AttioRecord, attributeSlug: string): number {
+  const first = arrayValue(record.rawValues, attributeSlug)[0];
   if (first === undefined) return 0;
   if (!isJsonObject(first)) throw new Error(`Attio counter ${attributeSlug} is invalid`);
   const counter = numberValue(first.value);
@@ -382,16 +434,12 @@ function parseCounterValue(value: unknown, attributeSlug: string): number {
  * structured (`full_name`), a company's is a plain text `value` - and either may be absent. Returns null rather
  * than throwing on any shape it does not recognise: a log line is not worth failing a write over.
  */
-function fetchedRecordName(record: unknown): string | null {
-  if (!isJsonObject(record)) return null;
-  const data = record.data;
-  if (!isJsonObject(data)) return null;
-  const values = objectValue(data, "values");
-  if (!values) return null;
-  const first = arrayValue(values, "name")[0];
+export function recordDisplayName(record: AttioRecord): string | null {
+  const first = arrayValue(record.rawValues, "name")[0];
   if (!isJsonObject(first)) return null;
   return stringValue(first.full_name) ?? stringValue(first.value);
 }
+
 
 //---------------------------------------------------------------------------------------------------------
 //Raises a counter attribute by one. Read-then-write, because Attio exposes no atomic increment.
@@ -413,9 +461,9 @@ export async function incrementCounter(
   //request of its own. Until that read returns, the caller's name is all there is to report a failure by.
   let label = recordName;
   try {
-    const record = await attioFetch(`/objects/${objectType}/records/${recordId}`);
-    label = fetchedRecordName(record) ?? recordName;
-    const current = parseCounterValue(record, attributeSlug);
+    const record = await fetchRecord(objectType, recordId);
+    label = recordDisplayName(record) ?? recordName;
+    const current = counterValue(record, attributeSlug);
     await attioFetch(`/objects/${objectType}/records/${recordId}`, {
       method: "PATCH",
       body: JSON.stringify({ data: { values: { [attributeSlug]: current + 1 } } }),
@@ -438,26 +486,31 @@ export async function incrementCounter(
 
 //---------------------------------------------------------------------------------------------------------
 //Returns the deal to attach interested history to, creating one only when the person has none.
-//FLOW: 1. person already linked to a deal -> return it. 2. otherwise create at stage Interested, owned by
-//ownerEmail, linked to the person and to their company when one exists.
+//FLOW: 1. person already linked to a deal -> fetch and return it. 2. otherwise create at stage Interested,
+//owned by ownerEmail, linked to the person and to the company the caller resolved.
 //Step 1 is deliberately stage-blind: any existing deal is reused whatever phase it sits in, so an interested
-//signal updates the live deal rather than opening a second one alongside it.
-//USES: attioFetch (this module); ownerEmail comes from defaultDealOwner below.
+//signal updates the live deal rather than opening a second one alongside it. It is also fetched whole rather
+//than returned as a bare id, because the caller's next act is to fill its blank attributes and it cannot know
+//which are blank without reading it. On the create path the POST response already carries them, so neither
+//path costs a request the caller was not going to make anyway.
+//companyId comes from the caller, not from `person`, so a company resolved for a person who had none is still
+//linked. Passing null omits the association, as before.
+//USES: attioFetch, parseAttioRecord, fetchRecord (this module); ownerEmail comes from defaultDealOwner below.
 //---------------------------------------------------------------------------------------------------------
 export async function ensureInterestedDeal(
   person: AttioPerson,
-  dealNameHint: string,
+  dealName: string,
   ownerEmail: string,
-): Promise<string> {
+  companyId: string | null,
+): Promise<AttioRecord> {
   const existing = person.values.associated_deals[0]?.target_record_id;
   if (existing) {
     console.log(`[action] deal reused: deal ${existing} is already associated with person ${personLabel(person)}`);
-    return existing;
+    //Its name is left exactly as it stands. A deal already in the pipeline has been named by whoever is working
+    //it, and the strict naming convention below governs deals this codebase opens, not deals it finds.
+    return fetchRecord("deals", existing);
   }
 
-  //A person with no linked company still gets a deal; the association is simply omitted.
-  const companyId = person.values.company[0]?.target_record_id;
-  const dealName = dealNameHint || "New Interested Deal";
   try {
     const response = await attioFetch("/objects/deals/records", {
       method: "POST",
@@ -482,15 +535,11 @@ export async function ensureInterestedDeal(
         },
       }),
     });
-    const data = responseData(response);
-    if (!isJsonObject(data)) throw new Error("Attio deal response is invalid");
-    const id = objectValue(data, "id");
-    const dealId = stringValue(id?.record_id);
-    if (!dealId) throw new Error("Attio deal response is missing record_id");
+    const deal = parseAttioRecord(responseData(response));
     console.log(
       `[action] deal created: ${JSON.stringify(dealName)} for person ${personLabel(person)}${companyId ? ` and company ${companyId}` : " with no associated company"}`,
     );
-    return dealId;
+    return deal;
   } catch (error) {
     console.error(
       `[action] FAILED - deal could not be created for person ${personLabel(person)}: ${errorMessage(error)}`,

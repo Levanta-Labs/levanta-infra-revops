@@ -1,25 +1,15 @@
-import {
-  addPersonToList,
-  blankPersonValues,
-  createNote,
-  createPerson,
-  defaultDealOwner,
-  ensureInterestedDeal,
-  findPersonByEmail,
-  findPersonByLinkedIn,
-  LEAD_SOURCE_LABELS,
-  LISTS,
-  patchPerson,
-  personLabel,
-  type CreatePersonValues,
-  type PersonNameInput,
-} from "../lib/attio.js";
+import { findPersonByEmail, findPersonByLinkedIn } from "../lib/attio.js";
 import {
   fetchHeyReachConversations,
-  stopLeadInActiveCampaigns,
   type HeyReachMessage,
+  type HeyReachProfile,
 } from "../lib/heyreach.js";
 import { hasWebhookSecret, json, requestJson, serverError } from "../lib/http.js";
+import {
+  interestedLead,
+  recordInterestedLead,
+  type InterestedLead,
+} from "../lib/interested.js";
 import { describeShape, isJsonObject, stringValue, type JsonObject } from "../lib/json.js";
 
 export interface HeyReachInterestedFields {
@@ -28,6 +18,7 @@ export interface HeyReachInterestedFields {
   readonly firstName: string | null;
   readonly lastName: string | null;
   readonly companyName: string | null;
+  readonly campaignName: string | null;
 }
 
 //The relay's payload shape is not under our control and it differs by event type: a reply event nests the lead
@@ -45,6 +36,7 @@ const EMAIL_NAMES = ["email", "emailAddress", "workEmail", "businessEmail"] as c
 const FIRST_NAME_NAMES = ["firstName", "givenName"] as const;
 const LAST_NAME_NAMES = ["lastName", "surname", "familyName"] as const;
 const COMPANY_NAMES = ["companyName", "company", "organization", "organizationName", "currentCompany"] as const;
+const CAMPAIGN_NAMES = ["campaignName", "campaign", "sequenceName"] as const;
 
 const LEAD_CONTAINER_NAMES = [
   "lead",
@@ -82,6 +74,7 @@ const EMAIL_KEYS = keySet(EMAIL_NAMES);
 const FIRST_NAME_KEYS = keySet(FIRST_NAME_NAMES);
 const LAST_NAME_KEYS = keySet(LAST_NAME_NAMES);
 const COMPANY_KEYS = keySet(COMPANY_NAMES);
+const CAMPAIGN_KEYS = keySet(CAMPAIGN_NAMES);
 const LEAD_CONTAINER_KEYS: ReadonlySet<string> = new Set(LEAD_CONTAINER_NAMES.map(normalizeKey));
 
 function namesSendingAccount(key: string): boolean {
@@ -141,6 +134,7 @@ function readFields(source: JsonObject): HeyReachInterestedFields {
     firstName: firstOf(source, FIRST_NAME_KEYS),
     lastName: firstOf(source, LAST_NAME_KEYS),
     companyName: firstOf(source, COMPANY_KEYS),
+    campaignName: firstOf(source, CAMPAIGN_KEYS),
   };
 }
 
@@ -167,6 +161,7 @@ export function parseHeyReachInterestedWebhook(value: unknown): HeyReachInterest
   );
 }
 
+/** [LOGIC] Oldest first, so the note reads top to bottom. USES: nothing. Pure. */
 export function formatHeyReachThread(messages: readonly HeyReachMessage[]): string {
   if (messages.length === 0) return "No message history found.";
   return [...messages]
@@ -175,25 +170,42 @@ export function formatHeyReachThread(messages: readonly HeyReachMessage[]): stri
     .join("\n\n---\n\n");
 }
 
-function personValues(fields: HeyReachInterestedFields): CreatePersonValues {
-  const values: {
-    linkedin?: string;
-    email_addresses?: readonly string[];
-    name?: readonly PersonNameInput[];
-  } = {};
-  if (fields.profileUrl) values.linkedin = fields.profileUrl;
-  if (fields.email) values.email_addresses = [fields.email];
-  if (fields.firstName || fields.lastName) {
-    const firstName = fields.firstName ?? "";
-    const lastName = fields.lastName ?? "";
-    values.name = [{ first_name: firstName, last_name: lastName, full_name: `${firstName} ${lastName}`.trim() }];
-  }
-  return values;
-}
+//---------------------------------------------------------------------------------------------------------
+//The lead as the shared workflow sees it: the webhook body, plus whatever the conversation's correspondent
+//profile adds.
+//That profile costs nothing extra. The route already fetches the conversation for the note, and every entry
+//carries the lead's position, headline, location, company, and all three of HeyReach's address fields - which
+//this route previously discarded by flat-mapping straight to `.messages`.
+//Webhook values win where both carry the same field: the webhook describes the event that just happened.
+//USES: interestedLead (lib/interested.ts). Pure.
+//---------------------------------------------------------------------------------------------------------
+export function heyReachLead(
+  fields: HeyReachInterestedFields,
+  profile: HeyReachProfile | null,
+  occurredAtMs: number,
+): InterestedLead {
+  //HeyReach spells an address three ways and any of them may be the only one set. Order is confidence: what
+  //the workspace entered by hand, then what HeyReach enriched, then whatever the profile itself carried.
+  const emails = [
+    fields.email,
+    profile?.customEmailAddress ?? null,
+    profile?.enrichedEmailAddress ?? null,
+    profile?.emailAddress ?? null,
+  ].filter((email): email is string => Boolean(email));
 
-function dealName(fields: HeyReachInterestedFields): string {
-  if (fields.companyName) return `${fields.companyName} - Interested`;
-  return `${fields.firstName ?? ""} ${fields.lastName ?? ""}`.trim() || "New Interested Deal";
+  return interestedLead("heyreach", {
+    emails: [...new Set(emails)],
+    linkedin: fields.profileUrl ?? profile?.profileUrl ?? null,
+    firstName: fields.firstName ?? profile?.firstName ?? null,
+    lastName: fields.lastName ?? profile?.lastName ?? null,
+    jobTitle: profile?.position ?? null,
+    //The headline is what the person says they do; `about` is the longer version. Either beats nothing.
+    description: profile?.headline ?? profile?.about ?? null,
+    location: profile?.location ?? null,
+    companyName: fields.companyName ?? profile?.companyName ?? null,
+    campaignName: fields.campaignName,
+    occurredAtMs,
+  });
 }
 
 //---------------------------------------------------------------------------------------------------------
@@ -202,17 +214,19 @@ function dealName(fields: HeyReachInterestedFields): string {
 //FLOW:
 // 1. hasWebhookSecret (lib/http.ts) - compare x-webhook-secret against HEYREACH_WEBHOOK_SECRET.
 // 2. parseHeyReachInterestedWebhook - walk the payload for the lead, whatever shape it arrived in.
-// 3. Resolve the person: LinkedIn URL first, then email, then create (lib/attio.ts).
-// 4. ensureInterestedDeal - reuses any deal already linked to the person, creates one only when none exists.
-// 5. fetchHeyReachConversations (lib/heyreach.ts) for the thread, rendered by formatHeyReachThread.
-// 6. Note on the person and on the deal, patchPerson with blankPersonValues, add to the DNC list.
-// 7. stopLeadInActiveCampaigns - the only provider-side write in the codebase; ends outbound sequencing.
+// 3. fetchHeyReachConversations (lib/heyreach.ts) for the thread, which also yields the correspondent profile
+//    the mapping enriches from. Keyed on the profile URL only; an email-only lead gets neither.
+// 4. recordInterestedLead (lib/interested.ts) - the sequence every provider shares. HeyReach contributes the
+//    person lookup (profile URL first, then address) and the thread note.
 //
 //[SECURITY] Step 1 precedes the body read, so an unauthenticated caller never reaches the parser.
-//[STABILITY] Steps 4-7 are separate calls with no transaction. A throw partway leaves earlier writes
-//committed and returns 500; a relay retry would then repeat them, adding duplicate notes.
-//KNOWN GAP: step 7 no-ops when the payload carried no profile URL, because StopLeadInCampaign is driven by
-//leadUrl. Such a lead is recorded and DNC-listed in Attio but stays in its HeyReach sequence.
+//[STABILITY] Step 4 is a series of calls with no transaction. A throw partway leaves earlier writes committed
+//and returns 500; a relay retry would then repeat them, adding duplicate notes.
+//Ending HeyReach sequencing is no longer done here: it is one channel of suppressInterestedLead, which runs
+//for every interested lead whatever platform reported it. Its known gap - a lead with no profile URL cannot be
+//stopped, because StopLeadInCampaign is driven by leadUrl - now reports itself as a skipped channel.
+//USES: hasWebhookSecret, json, requestJson, serverError (lib/http.ts); findPersonByLinkedIn, findPersonByEmail
+//(lib/attio.ts); fetchHeyReachConversations (lib/heyreach.ts); recordInterestedLead (lib/interested.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function POST(request: Request): Promise<Response> {
   if (!hasWebhookSecret(request, "HEYREACH_WEBHOOK_SECRET")) {
@@ -223,40 +237,36 @@ export async function POST(request: Request): Promise<Response> {
     console.log(
       `[route] heyreach-interested: handling ${fields.profileUrl ?? fields.email ?? "a lead with no identifier"}`,
     );
-    //URL first: it is the identifier HeyReach always carries and the one Attio stores for LinkedIn.
-    let person = await findPersonByLinkedIn(fields.profileUrl);
-    if (!person) person = await findPersonByEmail(fields.email);
-    if (!person) person = await createPerson(personValues(fields));
 
-    const personId = person.id.record_id;
-    const personName = personLabel(person);
-    const dealId = await ensureInterestedDeal(
-      person,
-      dealName(fields),
-      defaultDealOwner(),
-    );
-    //Thread lookup is keyed on the profile URL only; an email-only lead gets a note saying no history was found.
+    //Fetched before the workflow rather than inside it, because the profile it carries feeds the mapping and
+    //the mapping is the workflow's input. One request either way.
     const conversations = fields.profileUrl
       ? await fetchHeyReachConversations({ profileUrl: fields.profileUrl })
       : [];
     const messages = conversations.flatMap((conversation) => conversation.messages);
-    const history = formatHeyReachThread(messages);
-    const title = LEAD_SOURCE_LABELS.heyreach;
-    await createNote("people", personId, title, history, personName);
-    await createNote("deals", dealId, title, history);
-    //blankPersonValues strips any attribute Attio already holds, so this can only fill gaps.
-    await patchPerson(
-      personId,
-      blankPersonValues(person, { ...personValues(fields), lead_source: title }),
-      personName,
-    );
-    await addPersonToList(personId, LISTS.DNC, personName);
-    //Last, so a failure to stop sequencing cannot cost the CRM record that was already written above.
-    const campaignsStopped = await stopLeadInActiveCampaigns(fields.profileUrl, fields.email);
+    //Any conversation for this lead carries the same correspondent; the first is as good as any.
+    const profile = conversations[0]?.profile ?? null;
+
+    const outcome = await recordInterestedLead({
+      lead: heyReachLead(fields, profile, Date.now()),
+      subject: "heyreach-interested",
+      //URL first: it is the identifier HeyReach always carries and the one Attio stores for LinkedIn.
+      findPerson: async () =>
+        (await findPersonByLinkedIn(fields.profileUrl)) ?? (await findPersonByEmail(fields.email)),
+      history: async () => formatHeyReachThread(messages),
+    });
+
     console.log(
-      `[route] heyreach-interested: completed - person ${personName}, deal ${dealId}, ${messages.length} message(s) summarised, ${campaignsStopped} campaign(s) stopped`,
+      `[route] heyreach-interested: ${messages.length} message(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
     );
-    return json({ success: true, personId, dealId, campaignsStopped });
+    return json({
+      success: true,
+      personId: outcome.personId,
+      dealId: outcome.dealId,
+      companyId: outcome.companyId,
+      suppression: outcome.suppression.outcomes,
+      ...(outcome.suppression.failures.length > 0 ? { suppressionErrors: outcome.suppression.failures } : {}),
+    });
   } catch (error) {
     return serverError("HeyReach interested webhook error", error);
   }

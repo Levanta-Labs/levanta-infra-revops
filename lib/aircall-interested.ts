@@ -1,21 +1,8 @@
-import {
-  addPersonToList,
-  blankPersonValues,
-  createNote,
-  createPerson,
-  defaultDealOwner,
-  ensureInterestedDeal,
-  findPersonByEmail,
-  findPersonByPhone,
-  LEAD_SOURCE_LABELS,
-  LISTS,
-  patchPerson,
-  personLabel,
-  type CreatePersonValues,
-  type PersonNameInput,
-} from "./attio.js";
-import { toE164, type AircallCall } from "./aircall.js";
+import { findPersonByEmail, findPersonByPhone } from "./attio.js";
+import type { AircallCall } from "./aircall.js";
+import { toE164 } from "./phone.js";
 import { requiredCsvEnv } from "./env.js";
+import { interestedLead, recordInterestedLead, type InterestedLead } from "./interested.js";
 
 //=============================================================================================================
 //The Aircall interested workflow. Driven only by the touchpoint cron, which finds tagged calls by polling.
@@ -29,10 +16,12 @@ import { requiredCsvEnv } from "./env.js";
 
 export interface AircallInterestedFields {
   readonly email: string | null;
-  readonly phone: string | null;
+  //The dialled number first, then any other number on the contact. All E.164.
+  readonly phones: readonly string[];
   readonly firstName: string | null;
   readonly lastName: string | null;
   readonly companyName: string | null;
+  readonly information: string | null;
   readonly direction: string | null;
   readonly duration: number;
   readonly tags: readonly string[];
@@ -40,18 +29,43 @@ export interface AircallInterestedFields {
 }
 
 export function extractAircallFields(call: AircallCall, occurredAt: number): AircallInterestedFields {
+  //Normalised here rather than at the lookup, so the number written back to Attio is E.164 too. The dialled
+  //number leads because it is the one that identified this person; the contact's others follow.
+  const dialled = toE164(call.rawDigits);
+  const phones = [dialled, ...(call.contact?.phoneNumbers ?? [])].filter(
+    (phone): phone is string => phone !== null,
+  );
   return {
     email: call.contact?.email ?? null,
-    //Normalised here rather than at the lookup, so the number written back to Attio is E.164 too.
-    phone: toE164(call.rawDigits),
+    phones: [...new Set(phones)],
     firstName: call.contact?.firstName ?? null,
     lastName: call.contact?.lastName ?? null,
     companyName: call.contact?.companyName ?? null,
+    information: call.contact?.information ?? null,
     direction: call.direction,
     duration: call.duration,
     tags: call.tags.map((tag) => tag.name),
     occurredAt,
   };
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The call as the shared workflow sees it. Aircall supplies the least of the three providers by a wide margin:
+//no LinkedIn URL, job title, industry, headcount, or revenue exists anywhere in its API, and a name or company
+//appears only when the dialled number was already in Aircall's address book - which for a cold campaign it
+//usually is not. The remaining fields are left null and the mapping simply writes less.
+//---------------------------------------------------------------------------------------------------------
+//USES: interestedLead (lib/interested.ts). Pure.
+export function aircallLead(fields: AircallInterestedFields): InterestedLead {
+  return interestedLead("aircall", {
+    emails: fields.email ? [fields.email] : [],
+    phones: fields.phones,
+    firstName: fields.firstName,
+    lastName: fields.lastName,
+    companyName: fields.companyName,
+    description: fields.information,
+    occurredAtMs: fields.occurredAt * 1_000,
+  });
 }
 
 export function buildCallHistorySummary(fields: AircallInterestedFields): string {
@@ -64,28 +78,6 @@ export function buildCallHistorySummary(fields: AircallInterestedFields): string
   ]
     .filter((line): line is string => line !== null)
     .join("\n");
-}
-
-function personValues(fields: AircallInterestedFields): CreatePersonValues {
-  const values: {
-    email_addresses?: readonly string[];
-    phone_numbers?: readonly string[];
-    name?: readonly PersonNameInput[];
-  } = {};
-  //Each key is omitted rather than set null when absent, because blankPersonValues keys off presence.
-  if (fields.email) values.email_addresses = [fields.email];
-  if (fields.phone) values.phone_numbers = [fields.phone];
-  if (fields.firstName || fields.lastName) {
-    const firstName = fields.firstName ?? "";
-    const lastName = fields.lastName ?? "";
-    values.name = [{ first_name: firstName, last_name: lastName, full_name: `${firstName} ${lastName}`.trim() }];
-  }
-  return values;
-}
-
-function dealName(fields: AircallInterestedFields): string {
-  if (fields.companyName) return `${fields.companyName} - Interested`;
-  return `${fields.firstName ?? ""} ${fields.lastName ?? ""}`.trim() || "New Interested Deal";
 }
 
 export type InterestedResult =
@@ -143,51 +135,38 @@ export function logInterestedDecision(
 //---------------------------------------------------------------------------------------------------------
 //Records an interested call in Attio. Called by the touchpoint cron once a call's tags have matched.
 //FLOW: 1. flatten the call (extractAircallFields). 2. bail if there is no email and no phone - nothing to
-//match or create on. 3. resolve the person: email, then phone, then create. 4. ensureInterestedDeal - reuses
-//any deal already linked to the person, whatever its stage, and only creates one when none exists.
-//5. note on the person and on the deal. 6. patchPerson with blankPersonValues, which fills only attributes
-//Attio currently holds nothing for. 7. add to the DNC list so outbound stops contacting them.
-//USES: attio.ts for every write; occurredAt is epoch SECONDS (the call's ended_at).
-//[STABILITY] Steps 4-7 are separate Attio calls with no transaction. A throw partway leaves the earlier
-//writes committed; the cron catches it, counts the failure, and moves to the next call.
+//match or create on. 3. hand the rest to recordInterestedLead (lib/interested.ts), which is the same sequence
+//every provider runs. Aircall's own contributions to it are only these: how a person is looked up (email, then
+//the dialled number), and what the note says.
+//occurredAt is epoch SECONDS - the call's ended_at.
+//[STABILITY] recordInterestedLead makes a series of API calls with no transaction. A throw partway leaves the
+//earlier writes committed; the cron catches it, counts the failure, and moves to the next call.
+//USES: extractAircallFields, aircallLead, buildCallHistorySummary (this module); findPersonByEmail,
+//findPersonByPhone (lib/attio.ts); recordInterestedLead (lib/interested.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function processAircallInterested(
   call: AircallCall,
   occurredAt: number,
 ): Promise<InterestedResult> {
   const fields = extractAircallFields(call, occurredAt);
+  //The dialled number, which is also the one a lookup can match on.
+  const phone = fields.phones[0] ?? null;
   //No identifier at all: creating a person would produce an unmatchable blank record, so stop here.
-  if (!fields.email && !fields.phone) {
+  if (!fields.email && !phone) {
     console.warn(
       `[interested] poll call ${call.id}: rejected - the call carried neither an email nor a phone number, so no person can be matched or created`,
     );
     return { status: "no_contact_details" };
   }
 
-  //Email first: it is the stronger identifier. Phone is the fallback for a dialled number Aircall knows nothing about.
-  let person = await findPersonByEmail(fields.email);
-  if (!person) person = await findPersonByPhone(fields.phone);
-  if (!person) person = await createPerson(personValues(fields));
-
-  const personId = person.id.record_id;
-  const personName = personLabel(person);
-  const dealId = await ensureInterestedDeal(
-    person,
-    dealName(fields),
-    defaultDealOwner(),
-  );
-  const history = buildCallHistorySummary(fields);
-  const title = LEAD_SOURCE_LABELS.aircall;
-  await createNote("people", personId, title, history, personName);
-  await createNote("deals", dealId, title, history);
-  //blankPersonValues strips any attribute Attio already holds, so third-party data can only fill gaps.
-  await patchPerson(
-    personId,
-    blankPersonValues(person, { ...personValues(fields), lead_source: title }),
-    personName,
-  );
-  await addPersonToList(personId, LISTS.DNC, personName);
-
-  console.log(`[interested] poll call ${call.id}: completed - person ${personName}, deal ${dealId}`);
-  return { status: "done", personId, dealId };
+  const outcome = await recordInterestedLead({
+    lead: aircallLead(fields),
+    subject: `poll call ${call.id}`,
+    //Email first: it is the stronger identifier. Phone is the fallback for a dialled number Aircall knows
+    //nothing about, which for a cold campaign is the usual case.
+    findPerson: async () => (await findPersonByEmail(fields.email)) ?? (await findPersonByPhone(phone)),
+    //Aircall's history is the call itself - there is no thread to fetch, so this costs no request.
+    history: async () => buildCallHistorySummary(fields),
+  });
+  return { status: "done", personId: outcome.personId, dealId: outcome.dealId };
 }

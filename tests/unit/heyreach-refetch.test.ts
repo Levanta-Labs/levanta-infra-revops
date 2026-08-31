@@ -92,12 +92,12 @@ function heyReachMock(cursorRow?: unknown) {
     if (url.includes("objects/people/records/person-1")) {
       return init?.method === "PATCH"
         ? jsonResponse({})
-        : jsonResponse({ data: { values: { number_of_dms: [{ value: 4 }] } } });
+        : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_dms: [{ value: 4 }] } } });
     }
     if (url.includes("objects/companies/records/company-1")) {
       return init?.method === "PATCH"
         ? jsonResponse({})
-        : jsonResponse({ data: { values: { number_of_dms_6: [{ value: 9 }] } } });
+        : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_dms_6: [{ value: 9 }] } } });
     }
     if (url.includes("/notes")) return jsonResponse({});
     throw new Error(`Unexpected fetch: ${url}`);
