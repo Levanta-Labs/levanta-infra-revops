@@ -219,13 +219,51 @@ budget stop:
 - The cursor is saved where the loop actually reached, so the next run resumes rather than restarts.
 - The park at `now - CURSOR_GRACE_MS` is **skipped**, because the calls the loop never reached have not been dealt
   with and must stay above the mark.
-- The response carries `truncated: true` and `callsRemaining`, and the run logs a `[run] ... TRUNCATED` warning.
+- The response carries `truncated: true`, `stopReason`, and `callsRemaining`, and the run logs a `[run] ... STOPPED` warning.
   The HTTP status stays 200 - a partial run is a success, not a failure.
 
 A single truncated run is normal while a backlog drains. Truncation on run after run means calls are arriving faster
 than they are being processed: shorten the cadence in `vercel.json`. `AIRCALL_SYNC_BUDGET_MS` overrides the budget
 without a redeploy, for retuning against a live backlog; a malformed value falls back to the default rather than
 failing the run.
+
+### Attio rate limits, and the one failure worth retrying
+
+Attio rate-limits on request rate **and** on *query complexity* - the filtered record lookups this codebase performs
+to match a phone number or email to a Person. The touchpoint sync opens every call with one, so a busy run is exactly
+what trips the complexity limiter.
+
+`attioFetch`, the single Attio transport, now retries. Deliberately narrowly:
+
+| Status | Retried? | Why |
+| - | - | - |
+| 429 | Any method | A refused request was never processed, so repeating it cannot apply anything twice. |
+| 5xx | `GET` only | A 5xx is ambiguous - Attio may have applied the change and then failed to answer. On a `GET` there is nothing to apply. On a `POST` there is: a retried `POST /notes` duplicates the note, and Attio offers no idempotency key to prevent it. |
+| other 4xx | No | Deterministic. The same request fails the same way. |
+
+Four attempts, `Retry-After` honoured when Attio sends one and 0.5s/1s/2s backoff otherwise. Bounded, because a
+permanently throttled account has to surface rather than absorb the whole run budget in sleeps - and if it does
+absorb it, the budget stop above handles that cleanly.
+
+**Beyond the retries, a throttle before the first write no longer loses the call.** The sync's standing policy is to
+count a failed call and pass it over, never retrying, because its earlier writes are already committed and a retry
+would duplicate them. That reasoning only holds once something *has* been written. A touchpoint's first two Attio
+requests - the filtered person lookup and the Master TAM list read - write nothing, so a transient failure there was
+being discarded for no reason: the counter and note were lost and the cursor advanced past the call regardless.
+
+A transient failure in that pre-write region now raises `ThrottledBeforeWrite`, and the run stops with the cursor
+still **below** that call. The next run starts on it. Nothing is lost and nothing can double, because nothing was
+written. The response reports `stopReason: "throttled"` and the run is still a success with `failed: 0` - the work is
+deferred, not failed.
+
+Two things stay on the old pass-over path, both deliberately:
+
+- **A deterministic failure** (a 404, a bad attribute slug) anywhere. It will fail identically on every future run,
+  so stopping the run on it would wedge the sync on one unprocessable call.
+- **A transient failure from the first write onward.** `incrementCounter` opens with a read but its `PATCH` is inside
+  the same call, so a failure there cannot be told apart from one after it. Retrying would risk double-counting a
+  Person, which is the worse outcome. This is a KNOWN GAP: a 429 landing between the Person counter and the Company
+  note still loses the note and the Company counter, and says so in the log.
 
 If the lookback is ever retuned, two figures move together: tag tolerance, and how many times an interested call's
 notes are written, which is the lookback divided by the cadence. Having both wide coverage and no duplicates needs a

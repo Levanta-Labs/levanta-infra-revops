@@ -65,6 +65,25 @@ export function optionalEnv(name: string): string | null {
   return value ? value : null;
 }
 
+//---------------------------------------------------------------------------------------------------------
+//An optional TUNING variable, where absent is the normal case and the code has a default to fall back on.
+//Reported at [config] as the default in force rather than warned about: every other variable this codebase
+//reads is required, so reportEnv's "NOT SET on this deployment" is a genuine misconfiguration signal. Spending
+//that warning on a knob which is meant to be unset would teach a reader to skip past the whole class of it.
+//Use optionalEnv instead wherever absence is a problem the operator should see.
+//---------------------------------------------------------------------------------------------------------
+export function tunableEnv(name: string, defaultDescription: string): string | null {
+  if (process.env[name] === undefined) {
+    reportOnce(name, () => {
+      console.log(`[config] ${name} not set - ${defaultDescription}`);
+    });
+    return null;
+  }
+  //Present, though possibly blank or padded: the normal path reports both of those and returns null for a blank,
+  //which is the same fall-back-to-default outcome. A value stored with stray whitespace is still worth flagging.
+  return optionalEnv(name);
+}
+
 export function requiredEnv(name: string): string {
   const value = optionalEnv(name);
   if (!value) {
