@@ -14,7 +14,7 @@ import {
   toEmployeeRange,
   updateAttioAttributes,
 } from "../../lib/interested.js";
-import { dealSourceLabel, leadSourceLabel } from "../../lib/providers.js";
+import { automatedSourceLabel, leadSourceLabel } from "../../lib/providers.js";
 import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
 const envNames = ["ATTIO_API_KEY", "INSTANTLY_API_KEY", "HEYREACH_API_KEY"] as const;
@@ -51,9 +51,9 @@ describe("provider labels", () => {
     expect(leadSourceLabel("aircall")).toBe("Aircall Cold Outreach");
     expect(leadSourceLabel("instantly")).toBe("Instantly Cold Outreach");
     expect(leadSourceLabel("heyreach")).toBe("HeyReach Cold Outreach");
-    expect(dealSourceLabel("aircall")).toBe("Aircall Cold Outreach - Automated");
-    expect(dealSourceLabel("instantly")).toBe("Instantly Cold Outreach - Automated");
-    expect(dealSourceLabel("heyreach")).toBe("HeyReach Cold Outreach - Automated");
+    expect(automatedSourceLabel("aircall")).toBe("Aircall Cold Outreach - Automated");
+    expect(automatedSourceLabel("instantly")).toBe("Instantly Cold Outreach - Automated");
+    expect(automatedSourceLabel("heyreach")).toBe("HeyReach Cold Outreach - Automated");
   });
 });
 
@@ -182,7 +182,7 @@ describe("what a create sends to Attio", () => {
     expect(personValuesFor(thin)).toEqual({
       phone_numbers: ["+15555550123"],
       date_added: "2025-08-28",
-      lead_source: "Aircall Cold Outreach",
+      lead_source: "Aircall Cold Outreach - Automated",
     });
     expect(companyValuesFor(interestedLead("aircall", { companyName: "Acme" }))).toEqual({ name: "Acme" });
     expect(dealValuesFor(interestedLead("aircall", {}))).toEqual({
@@ -227,10 +227,26 @@ describe("updating Attio attributes", () => {
     try {
       await updateAttioAttributes(
         "people",
-        record({ lead_source: [{ value: "Aircall Cold Outreach" }], job_title: [] }),
-        { lead_source: "Instantly Cold Outreach", job_title: "Countess" },
+        record({ description: [{ value: "Wrote the first program" }], job_title: [] }),
+        { description: "Analyst", job_title: "Countess" },
       );
       expect(patchBody(mock.calls)).toEqual({ job_title: "Countess" });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //The deliberate exception to the rule the two tests above pin. See ALWAYS_OVERWRITE (lib/interested.ts).
+  test("restates lead source over what Attio already holds", async () => {
+    const mock = installFetchMock(() => jsonResponse({ data: {} }));
+    try {
+      await updateAttioAttributes(
+        "people",
+        record({ lead_source: [{ value: "Aircall Cold Outreach" }], job_title: [{ value: "Analyst" }] }),
+        { lead_source: "Instantly Cold Outreach", job_title: "Countess" },
+      );
+      //Lead source is replaced by this run's channel; the job title beside it is still left alone.
+      expect(patchBody(mock.calls)).toEqual({ lead_source: "Instantly Cold Outreach" });
     } finally {
       mock.restore();
     }
@@ -336,7 +352,8 @@ describe("updating Attio attributes", () => {
       linkedin: "https://linkedin.com/in/ada",
       campaign_name: "Q3 Founders",
       date_added: "2026-08-28",
-      lead_source: "Instantly Cold Outreach",
+      //The Person carries the same "- Automated" string as the Deal below.
+      lead_source: "Instantly Cold Outreach - Automated",
       company: { target_object: "companies", target_record_id: "company-1" },
       name: [{ first_name: "Ada", last_name: "Lovelace", full_name: "Ada Lovelace" }],
     });

@@ -19,7 +19,7 @@ import { stopLeadInActiveCampaigns } from "./heyreach.js";
 //#region sources
 //---------------------------------------------------------------------------------------------------------
 //Every platform that can report interest. `displayName` is the only thing a new entry has to decide, and it is
-//load-bearing: the Lead Source and Deal Source strings written into Attio are derived from it, so it must be
+//load-bearing: the source strings written into Attio and the note titles are derived from it, so it must be
 //spelled exactly as the business wants to read it in a report. Changing one afterwards changes what new
 //records say without changing what old ones already say.
 //
@@ -46,8 +46,9 @@ export function providerDisplayName(provider: Provider): string {
 }
 
 /**
- * [LOGIC] What a Person's Lead Source says. One derivation for every provider, so a fourth inherits the
- * convention rather than adding a fourth hand-written string that could disagree with the other three.
+ * [LOGIC] The bare channel name - "<Name> Cold Outreach". One derivation for every provider, so a fourth
+ * inherits the convention rather than adding a fourth hand-written string that could disagree with the other
+ * three. This is the note TITLE and the stem automatedSourceLabel builds on; nothing writes it to an attribute.
  * USES: providerDisplayName (this module). Pure.
  */
 export function leadSourceLabel(provider: Provider): string {
@@ -55,12 +56,16 @@ export function leadSourceLabel(provider: Provider): string {
 }
 
 /**
- * [LOGIC] What a Deal's Deal Source says - deliberately not the same string as the Person's Lead Source. A deal
- * records how it was opened, and every deal these workflows open was opened without a human: the "- Automated"
- * suffix is what distinguishes it in reporting from the same channel worked by hand.
+ * [LOGIC] The source string written into Attio, on the Person and on the Deal alike. Every record these
+ * workflows touch was produced without a human, and the "- Automated" suffix is what distinguishes it in
+ * reporting from the same channel worked by hand - which is as true of the Person as it is of the Deal, so both
+ * carry this rather than the Person carrying the bare channel name.
+ *
+ * NOT the same as leadSourceLabel, which is now the bare channel and is used only to TITLE the notes. A note
+ * heading is read by a human in context, where the suffix says nothing the surrounding note does not.
  * USES: leadSourceLabel (this module). Pure.
  */
-export function dealSourceLabel(provider: Provider): string {
+export function automatedSourceLabel(provider: Provider): string {
   return `${leadSourceLabel(provider)} - Automated`;
 }
 //#endregion
