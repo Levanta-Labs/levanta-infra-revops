@@ -29,7 +29,7 @@ import {
 } from "../../lib/cursors.js";
 import { errorMessage } from "../../lib/json.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
-import { reportConfigValue, tunableEnv } from "../../lib/env.js";
+import { budgetSeconds, startRunBudget } from "../../lib/run-budget.js";
 
 const SYNC_KEY = "aircall-touchpoints";
 //An outcome tag is applied after the call, sometimes minutes after, so a cursor alone can carry a call past the
@@ -75,34 +75,6 @@ const INTERESTED_LOOKBACK_MS = 5 * 60 * 1_000;
 //A longer call is dropped in full - no touchpoint, no tag - and dropped SILENTLY: it never reaches the fetch,
 //so no counter, log line, or failure records that it existed.
 const MAX_CALL_DURATION_MS = 2 * 60 * 60 * 1_000;
-
-//[STABILITY] How long the per-call loop may keep working before it stops of its own accord and saves what it has.
-//Vercel kills this function at the maxDuration in vercel.json (300s), and a kill lands BEFORE saveSyncCursor, so a
-//run that overruns records no progress at all: the next run re-reads the same backlog, re-increments every counter
-//it already incremented, and overruns again. That is a permanent loop, and it is what a 504 on this route means.
-//This budget converts the overrun into a clean partial run - the cursor is saved where the loop stopped and the
-//remainder is picked up next run - so throughput becomes a matter of how fast the backlog drains, not of whether
-//anything is written at all.
-//[PERF] The margin below maxDuration has to cover the slowest single call still in flight when the budget expires
-//(seven sequential Attio requests) plus the cursor save and the response. Raise maxDuration before raising this.
-const DEFAULT_RUN_BUDGET_MS = 240 * 1_000;
-
-/** The budget, overridable by AIRCALL_SYNC_BUDGET_MS so a stuck backlog can be retuned without a redeploy. */
-function runBudgetMs(): number {
-  const raw = tunableEnv("AIRCALL_SYNC_BUDGET_MS", `using the ${DEFAULT_RUN_BUDGET_MS / 1_000}s default`);
-  if (!raw) return DEFAULT_RUN_BUDGET_MS;
-  const parsed = Number(raw);
-  //[STABILITY] A malformed value falls back rather than throwing. Losing the override is a tuning problem; losing
-  //the run is a data problem, and this variable is unset in normal operation anyway.
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    console.warn(
-      `[config] AIRCALL_SYNC_BUDGET_MS is not a positive number (${JSON.stringify(raw)}) - using the ${DEFAULT_RUN_BUDGET_MS / 1_000}s default`,
-    );
-    return DEFAULT_RUN_BUDGET_MS;
-  }
-  reportConfigValue("AIRCALL_SYNC_BUDGET_MS", raw);
-  return parsed;
-}
 
 //---------------------------------------------------------------------------------------------------------
 //Raised when a touchpoint was throttled or hit a server error BEFORE it had written anything to Attio.
@@ -226,7 +198,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
 
 //---------------------------------------------------------------------------------------------------------
 //Vercel Cron entry point, every ten minutes (`*/10 * * * *`). Runs two independent passes over one shared read
-//of Aircall, under a wall-clock budget - see DEFAULT_RUN_BUDGET_MS for why the cadence is what it is.
+//of Aircall, under a wall-clock budget - see lib/run-budget.ts for why the cadence is what it is.
 //
 //FLOW:
 // 1. isAuthorizedCron (lib/http.ts) - reject anything without the CRON_SECRET bearer.
@@ -245,7 +217,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
 //    cursor is the wider of the two and so is what min() picks; the lookback is the backstop for runs that
 //    land close together - see INTERESTED_LOOKBACK_MS.
 // 6. advanceCursor past each handled call, whether or not its writes succeeded.
-// 6a. Stop the loop if it is still going at runBudgetMs(), or if a call was throttled before writing anything,
+// 6a. Stop the loop if it is still going at the run budget, or if a call was throttled before writing anything,
 //     leaving the cursor at the last call actually handled.
 // 7. advanceCursorTo(upperBound - CURSOR_GRACE_MS) and persist - the park is SKIPPED on either stop, since the
 //     calls the loop never reached are not dealt with and must stay above the mark.
@@ -288,8 +260,7 @@ export async function GET(request: Request): Promise<Response> {
     //[STABILITY] The wall clock the loop stops at. Measured from upperBoundMs rather than a fresh Date.now(),
     //because upperBoundMs is read at the top of the handler and so the budget covers the Aircall pagination too -
     //a wide backlog spends real time there before the first call is ever processed.
-    const budgetMs = runBudgetMs();
-    const deadlineMs = upperBoundMs + budgetMs;
+    const budget = startRunBudget(upperBoundMs, "AIRCALL_SYNC_BUDGET_MS");
     //Number of calls the loop reached before it stopped, so a partial run can report what it left behind.
     let examinedCount = 0;
     //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
@@ -300,7 +271,7 @@ export async function GET(request: Request): Promise<Response> {
       //[STABILITY] Checked before the call rather than after, so the budget is what remains for a whole call and
       //not what remains after one has already overrun it. Stopping here leaves `cursor` exactly where the last
       //completed call put it; everything past this point is untouched and still above the mark next run.
-      if (Date.now() >= deadlineMs) {
+      if (budget.expired()) {
         stopReason = "budget";
         break;
       }
@@ -348,7 +319,7 @@ export async function GET(request: Request): Promise<Response> {
       //Leaving the cursor at the last completed call is what makes the next run resume instead of restart.
       console.warn(
         stopReason === "budget"
-          ? `[run] aircall sync: stopped after ${Math.round(budgetMs / 1_000)}s of a ${calls.length}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${callsRemaining > examinedCount ? " More is left than was done - if that repeats, calls are arriving faster than they are processed and the cron cadence in vercel.json wants shortening." : ""}`
+          ? `[run] aircall sync: stopped after ${budgetSeconds(budget)}s of a ${calls.length}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${callsRemaining > examinedCount ? " More is left than was done - if that repeats, calls are arriving faster than they are processed and the cron cadence in vercel.json wants shortening." : ""}`
           : `[run] aircall sync: stopped by Attio throttling with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the call that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`,
       );
     } else {

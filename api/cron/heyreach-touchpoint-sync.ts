@@ -27,6 +27,7 @@ import {
 } from "../../lib/heyreach.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
 import { errorMessage } from "../../lib/json.js";
+import { budgetSeconds, startRunBudget } from "../../lib/run-budget.js";
 
 const SYNC_KEY = "heyreach-touchpoints";
 
@@ -117,8 +118,9 @@ export async function processHeyReachTouchpoint(
 //Vercel Cron entry point, every five minutes.
 //FLOW: 1. isAuthorizedCron (lib/http.ts). 2. getSyncCursor (lib/cursors.ts). 3. fetchHeyReachConversations
 //(lib/heyreach.ts). 4. heyReachTouchpointEvents flattens them to a chronological message stream. 5. per
-//message, skip anything at or below the mark, else processHeyReachTouchpoint. 6. advance the mark. 7. park at
-//(now - CURSOR_GRACE_MS) and persist.
+//message, skip anything at or below the mark, else processHeyReachTouchpoint. 6. advance the mark.
+//6a. stop at the run budget if still going. 7. park at (now - CURSOR_GRACE_MS) and persist - the park is
+//SKIPPED on a budget stop, since the messages the loop never reached must stay above the mark.
 //[PERF] HeyReach applies from/to with DAY granularity, so a five-minute run receives every conversation
 //touched since UTC midnight, each with its full message list, and hashes every message before the cursor
 //rejects it. Cost grows through the day. Skipping conversations with no activity past the mark would avoid
@@ -138,8 +140,22 @@ export async function GET(request: Request): Promise<Response> {
     const events = await heyReachTouchpointEvents(conversations);
     const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
     const failures: string[] = [];
+    //[STABILITY] See lib/run-budget.ts. Without this, an overrun is killed by Vercel before saveSyncCursor and
+    //the run's whole progress is discarded, so the next run redoes it and re-increments every counter. The
+    //[PERF] note above makes this sync the likeliest to need it: its cost grows through the UTC day.
+    const budget = startRunBudget(upperBoundMs, "HEYREACH_SYNC_BUDGET_MS");
+    //Messages the loop reached before it stopped, so a partial run can report what it left behind.
+    let examinedCount = 0;
+    let stoppedOnBudget = false;
 
     for (const event of events) {
+      //Checked before the message rather than after, so the budget is what remains for a whole one. Stopping
+      //here leaves `cursor` where the last handled message put it; everything past stays above the mark.
+      if (budget.expired()) {
+        stoppedOnBudget = true;
+        break;
+      }
+      examinedCount += 1;
       //Everything at or below the mark was handled on an earlier run - this is the authoritative guard.
       if (!isAfterCursor(cursor, event.cursor)) continue;
       try {
@@ -156,11 +172,21 @@ export async function GET(request: Request): Promise<Response> {
       cursor = advanceCursor(cursor, event.cursor);
     }
 
-    //[STABILITY] Park short of now. A message HeyReach has not yet published is picked up next run, not skipped.
-    cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
+    const messagesRemaining = events.length - examinedCount;
+    if (stoppedOnBudget) {
+      //[STABILITY] Do NOT park at now. Parking claims everything up to that moment was dealt with, and the
+      //messages the loop never reached were not - they would be skipped forever. Leaving the cursor where the
+      //loop stopped is what makes the next run resume instead of restart.
+      console.warn(
+        `[run] heyreach sync: stopped after ${budgetSeconds(budget)}s of a ${events.length}-message stream with ${messagesRemaining} still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${messagesRemaining > examinedCount ? " More is left than was done - if that repeats, messages are arriving faster than they are processed." : ""}`,
+      );
+    } else {
+      //[STABILITY] Park short of now. A message HeyReach has not yet published is picked up next run, not skipped.
+      cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
+    }
     await saveSyncCursor(cursor);
     console.log(
-      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) returned, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) returned, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${stoppedOnBudget ? `STOPPED with ${messagesRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
@@ -169,6 +195,9 @@ export async function GET(request: Request): Promise<Response> {
       ...results,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),
+      //[DEBUG] A stopped run is a success - it wrote everything it reached and saved its place.
+      truncated: stoppedOnBudget,
+      ...(stoppedOnBudget ? { messagesRemaining } : {}),
       //[DEBUG] Errors are returned as well as logged, so a manual run reports failures without a log search.
       ...(failures.length > 0 ? { errors: failures } : {}),
     };

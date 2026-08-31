@@ -20,6 +20,8 @@ const envNames = [
   "ATTIO_PERSON_HEYREACH_COUNTER_SLUG",
   "ATTIO_COMPANY_AIRCALL_COUNTER_SLUG",
   "AIRCALL_SYNC_BUDGET_MS",
+  "INSTANTLY_SYNC_BUDGET_MS",
+  "HEYREACH_SYNC_BUDGET_MS",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
@@ -653,6 +655,84 @@ describe("cron handlers", () => {
       const response = await heyReachSync(cronRequest());
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ success: true, messagesFound: 0 });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Instantly stops on the run budget and leaves the cursor where the loop reached", async () => {
+    //The same failure the Aircall sync hit: saveSyncCursor runs after the loop, so a run killed at maxDuration
+    //records nothing and the next one redoes it, re-incrementing every counter. These two syncs have lower
+    //volume, not a different shape, so they get the same stop.
+    process.env.INSTANTLY_SYNC_BUDGET_MS = "2";
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const createdAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const mock = installFetchMock(async (url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "instantly-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      //Real elapsed time, because the budget is wall-clock and every other mock here answers instantly.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return jsonResponse({
+        items: [1, 2].map((id) => ({
+          id: `email-${id}`,
+          timestamp_created: createdAt,
+          ue_type: 1,
+          is_auto_reply: false,
+          lead: `lead${id}@example.com`,
+        })),
+        next_starting_after: null,
+      });
+    });
+    try {
+      const response = await instantlySync(cronRequest());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ success: true, truncated: true, processed: 0, emailsRemaining: 2 });
+      //Not parked at now: the emails the loop never reached must stay above the mark.
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("HeyReach stops on the run budget and leaves the cursor where the loop reached", async () => {
+    //HeyReach is the likeliest of the three to need this: it re-reads every conversation touched since UTC
+    //midnight on every run, so its cost grows through the day.
+    process.env.HEYREACH_SYNC_BUDGET_MS = "2";
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const sentAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const mock = installFetchMock(async (url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "heyreach-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return jsonResponse({
+        items: [
+          {
+            id: "conversation-1",
+            linkedInAccountId: 7,
+            lastMessageAt: sentAt,
+            correspondentProfile: { linkedin_id: "ada", profileUrl: "https://linkedin.com/in/ada" },
+            messages: [1, 2].map((id) => ({
+              id: `message-${id}`,
+              sender: "user",
+              body: `hello ${id}`,
+              createdAt: sentAt,
+            })),
+          },
+        ],
+        totalCount: 1,
+      });
+    });
+    try {
+      const response = await heyReachSync(cronRequest());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ success: true, truncated: true, processed: 0 });
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
     } finally {
       mock.restore();
     }

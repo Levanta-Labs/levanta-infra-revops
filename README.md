@@ -207,25 +207,38 @@ To get wide coverage without the duplicates, lengthen the cadence rather than th
 
 ### The run budget
 
-The per-call loop is sequential and a single touchpoint costs up to eight Attio requests, so throughput is roughly
-one call every three or four seconds. That is finite, and a backlog can exceed it. Left unguarded the run is killed
-by Vercel at `maxDuration`, and the kill lands *before* `saveSyncCursor` - so the run records no progress at all:
-the next run re-reads the same backlog, re-increments every counter it already incremented, and is killed again. A
-504 on this route means exactly that loop, and inflated `number_of_calls` values are its symptom.
+**All three syncs share this**, in `lib/run-budget.ts`. Each one is a sequential per-event loop that saves its cursor
+once, after the loop. A single touchpoint costs up to eight Attio requests, so throughput is roughly one event every
+three or four seconds - finite, and a backlog can exceed it. Left unguarded the run is killed by Vercel at
+`maxDuration`, and the kill lands *before* `saveSyncCursor`, so the run records **no progress at all**: the next run
+re-reads the same backlog, re-increments every counter it already incremented, and is killed again. A 504 on a sync
+route means exactly that loop, and inflated counter values are its symptom.
 
 `DEFAULT_RUN_BUDGET_MS` (240s, under the 300s `maxDuration`) makes the loop stop of its own accord instead. On a
 budget stop:
 
 - The cursor is saved where the loop actually reached, so the next run resumes rather than restarts.
-- The park at `now - CURSOR_GRACE_MS` is **skipped**, because the calls the loop never reached have not been dealt
+- The park at `now - CURSOR_GRACE_MS` is **skipped**, because the events the loop never reached have not been dealt
   with and must stay above the mark.
-- The response carries `truncated: true`, `stopReason`, and `callsRemaining`, and the run logs a `[run] ... STOPPED` warning.
-  The HTTP status stays 200 - a partial run is a success, not a failure.
+- The response carries `truncated: true` and a count of what is left (`callsRemaining` / `emailsRemaining` /
+  `messagesRemaining`), and the run logs a `[run] ... STOPPED` warning. The HTTP status stays 200 - a partial run is
+  a success, not a failure. The Aircall sync additionally reports `stopReason`, since it can also stop on a throttle.
 
-A single truncated run is normal while a backlog drains. Truncation on run after run means calls are arriving faster
-than they are being processed: shorten the cadence in `vercel.json`. `AIRCALL_SYNC_BUDGET_MS` overrides the budget
-without a redeploy, for retuning against a live backlog; a malformed value falls back to the default rather than
-failing the run.
+Aircall reached the limit first, on volume; the other two have the identical shape and so the identical risk. HeyReach
+is arguably the most exposed of the three - see the `[PERF]` note on its handler, where cost grows through the UTC day
+because every run re-reads every conversation touched since midnight.
+
+A single truncated run is normal while a backlog drains. Truncation run after run means events arrive faster than
+they are processed. Each sync takes its own override - `AIRCALL_SYNC_BUDGET_MS`, `INSTANTLY_SYNC_BUDGET_MS`,
+`HEYREACH_SYNC_BUDGET_MS` - for retuning against a live backlog without a redeploy; a malformed value falls back to
+the default rather than failing the run.
+
+> **The cadence must exceed the budget.** A run may legitimately take the whole 240s, and nothing guards against two
+> invocations of one sync running at once - they would read the same cursor and double-count every event between
+> them. The current cadences (`*/10` for Aircall, `*/5` for the other two) leave headroom; `*/5` against a 240s
+> budget leaves only one minute of it. Shortening a cadence towards the budget means lowering that sync's budget
+> with it.
+
 
 ### Attio rate limits, and the one failure worth retrying
 
@@ -334,7 +347,7 @@ Keep credentials in `.env.local` for local development and configure the same va
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Company counter slug for HeyReach DMs |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
-| `AIRCALL_SYNC_BUDGET_MS` | Optional. Milliseconds the touchpoint loop may run before it stops and saves its place; defaults to 240000. See [The run budget](#the-run-budget) |
+| `AIRCALL_SYNC_BUDGET_MS` / `INSTANTLY_SYNC_BUDGET_MS` / `HEYREACH_SYNC_BUDGET_MS` | Optional, one per sync. Milliseconds that sync's loop may run before it stops and saves its place; each defaults to 240000. See [The run budget](#the-run-budget) |
 | `INSTANTLY_API_KEY` | Instantly v2 API key; needs to read emails and leads, and to write blocklist entries |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key; needs to read conversations and to stop leads in campaigns |
@@ -473,8 +486,8 @@ the work is unbounded by design, so at the platform default a busy window could 
 written and its counter not. Three hundred seconds is the Pro ceiling; the project already exceeds Hobby's cron
 limits, so it cannot be running there.
 
-`maxDuration` is a backstop, not a plan. The Aircall sync stops itself at `DEFAULT_RUN_BUDGET_MS` (240s) and saves
-its cursor, because being killed at `maxDuration` discards the run entirely - see [The run budget](#the-run-budget).
+`maxDuration` is a backstop, not a plan. All three syncs stop themselves at `DEFAULT_RUN_BUDGET_MS` (240s) and save
+their cursor, because being killed at `maxDuration` discards the run entirely - see [The run budget](#the-run-budget).
 Raise `maxDuration` before raising that budget, never the other way round.
 
 Attio counter updates remain read-then-write because Attio does not expose an atomic increment operation. The sync
