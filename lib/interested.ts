@@ -704,17 +704,22 @@ export async function resolveInterestedCompany(
 }
 
 //---------------------------------------------------------------------------------------------------------
-//What a deal this codebase opens is called. Strictly "<company> - Interested", with no other form.
-//The convention is strict so these deals are recognisable as a set and sort together, and so a person's name
-//never becomes a deal name: a deal belongs to a company even when only one contact there is known.
+//What a deal this codebase opens is called. Strictly the company name, with no other form.
+//The convention is strict so a person's name never becomes a deal name: a deal belongs to a company even when
+//only one contact there is known.
 //"Unknown Company" is used when neither Attio nor the provider names one, which is honest and, more usefully,
 //greppable - those are exactly the deals needing a human to say who they are with.
+//The name carries no marker of how the deal was opened. It used to read "<company> - Interested", which made
+//these deals recognisable as a set from the name alone; that is now carried by the deal's `lead_source`
+//instead, which every one of them gets - see automatedSourceLabel (lib/providers.ts). Reporting reads the
+//attribute, and a human reading the pipeline sees the company they are dealing with rather than a suffix
+//repeated down the whole column.
 //Deals that already existed are never renamed - see ensureInterestedDeal.
 //USES: nothing. Pure.
 //---------------------------------------------------------------------------------------------------------
 export function interestedDealName(companyName: string | null): string {
   const name = companyName?.trim();
-  return `${name ? name : "Unknown Company"} - Interested`;
+  return name ? name : "Unknown Company";
 }
 //#endregion
 
