@@ -111,6 +111,10 @@ export async function GET(request: Request): Promise<Response> {
     const budget = startRunBudget(upperBoundMs, "INSTANTLY_SYNC_BUDGET_MS");
     //Emails the loop reached before it stopped, so a partial run can report what it left behind.
     let examinedCount = 0;
+    //[DEBUG] Of those, the ones the cursor rejected as handled on an earlier run. Counted so the summary's
+    //figures account for the whole window: without it a run that fetched forty and processed three reads as
+    //though it silently dropped thirty-seven, when they were re-read on purpose and correctly passed over.
+    let beforeCursorCount = 0;
     let stoppedOnBudget = false;
 
     for (const email of emails) {
@@ -123,7 +127,10 @@ export async function GET(request: Request): Promise<Response> {
       examinedCount += 1;
       const event = instantlyCursorEvent(email);
       //Everything at or below the mark was handled on an earlier run - this is the sole duplicate guard.
-      if (!isAfterCursor(cursor, event)) continue;
+      if (!isAfterCursor(cursor, event)) {
+        beforeCursorCount += 1;
+        continue;
+      }
       try {
         const outcome = await processInstantlyTouchpoint(email);
         results[outcome] += 1;
@@ -152,11 +159,13 @@ export async function GET(request: Request): Promise<Response> {
     }
     await saveSyncCursor(cursor);
     console.log(
-      `[run] instantly sync: ${emails.length} email(s) in window, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${stoppedOnBudget ? `STOPPED with ${emailsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] instantly sync: ${emails.length} email(s) in window, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${stoppedOnBudget ? `STOPPED with ${emailsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
       emailsFound: emails.length,
+      //Part of emailsFound rather than extra to it: the slice an earlier run had already dealt with.
+      beforeCursor: beforeCursorCount,
       ...results,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),

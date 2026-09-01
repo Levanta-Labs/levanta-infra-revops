@@ -126,8 +126,16 @@ export const THIRD_PARTY_SUPPRESSION_CHANNELS: readonly SuppressionChannel[] = [
         //campaign lookup would accept the address. Closing this needs the leadMemberId - see lib/heyreach.ts.
         return { status: "skipped", reason: "the lead carried no LinkedIn profile URL to stop" };
       }
-      const stopped = await stopLeadInActiveCampaigns(targets.profileUrl, targets.email);
-      return { status: "suppressed", detail: `${stopped} campaign(s) stopped` };
+      const { inCampaigns, removedFrom } = await stopLeadInActiveCampaigns(
+        targets.profileUrl,
+        targets.email,
+      );
+      //Both numbers, because either alone misreads. "0 campaign(s) stopped" sounded like a campaign had been
+      //left running, when nothing here ever halts a campaign: it withdraws one lead from the ones still live.
+      return {
+        status: "suppressed",
+        detail: `lead is in ${inCampaigns} campaign(s), removed from ${removedFrom}`,
+      };
     },
   },
 ];
