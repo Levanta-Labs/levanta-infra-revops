@@ -146,6 +146,10 @@ export async function GET(request: Request): Promise<Response> {
     const budget = startRunBudget(upperBoundMs, "HEYREACH_SYNC_BUDGET_MS");
     //Messages the loop reached before it stopped, so a partial run can report what it left behind.
     let examinedCount = 0;
+    //[DEBUG] Of those, the ones the cursor rejected as handled on an earlier run. On this sync that is most of
+    //them by design - see the [PERF] note above, where a day-granular fetch re-reads every conversation touched
+    //since UTC midnight - so the summary states it rather than leaving the shortfall to be inferred.
+    let beforeCursorCount = 0;
     let stoppedOnBudget = false;
 
     for (const event of events) {
@@ -157,7 +161,10 @@ export async function GET(request: Request): Promise<Response> {
       }
       examinedCount += 1;
       //Everything at or below the mark was handled on an earlier run - this is the authoritative guard.
-      if (!isAfterCursor(cursor, event.cursor)) continue;
+      if (!isAfterCursor(cursor, event.cursor)) {
+        beforeCursorCount += 1;
+        continue;
+      }
       try {
         const outcome = await processHeyReachTouchpoint(event);
         results[outcome] += 1;
@@ -186,12 +193,14 @@ export async function GET(request: Request): Promise<Response> {
     }
     await saveSyncCursor(cursor);
     console.log(
-      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) returned, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${stoppedOnBudget ? `STOPPED with ${messagesRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] heyreach sync: ${conversations.length} conversation(s) and ${events.length} message(s) returned, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${stoppedOnBudget ? `STOPPED with ${messagesRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
       conversationsScanned: conversations.length,
       messagesFound: events.length,
+      //Part of messagesFound rather than extra to it: the slice an earlier run had already dealt with.
+      beforeCursor: beforeCursorCount,
       ...results,
       failed: failures.length,
       cursorTimestamp: new Date(cursor.timestampMs).toISOString(),

@@ -56,6 +56,31 @@ message history into a note. Everything after that is one code path:
 | 4. Notes | The provider's rendered history, on the Person and on the Deal |
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
+| 7. Transcript | The whole run written back to the Person as a note - see below |
+
+### Every interested run leaves a transcript on the Person
+
+Step 7 posts one further note to the Person, titled
+`run logs for automated integration (<Platform> marked as interested)`. It carries whether the Person existed
+before the run, what Attio held then, every line the run printed, and what Attio held afterwards. The question
+asked after the fact is never "what happened in invocation `dpl_xyz`" but "why does *this* person look like
+this", and that is a question about a record - so the answer lives on the record rather than expiring with the
+Vercel log.
+
+Nothing had to be instrumented to produce it. `lib/run-log.ts` mirrors `console` for the duration of one run,
+so the existing log lines are the single source and cannot drift from the transcript. Capture is scoped per
+lead, which is what keeps the several interested calls in one Aircall invocation apart, and what keeps the
+touchpoint crons - which share `lib/attio.ts` but never open a scope - out of it entirely.
+
+The whole feature is `lib/run-log.ts`, its test, and four lines in `recordInterestedLead`; deleting those
+removes it and changes nothing else. It builds the transcript as a file in memory - a name, a type, and bytes -
+so emailing or posting it later is the same call, not a rewrite. It costs two Attio requests per interested
+lead (one read-back, one note) and never throws into a run: a transcript that cannot be written is logged and
+abandoned, because it is diagnostics attached to an event Attio has already committed.
+
+**A note on what it contains.** The transcript reproduces the run's log lines verbatim, and those carry the
+business identifiers a lookup searched on - an address, a number, a profile URL. That is personal data, and
+putting it on the record widens who can read it to everyone with access to that Person in Attio.
 
 **Nothing overwrites.** `updateAttioAttributes` reads what a record already holds and writes only the
 attributes that are blank, so third-party data fills gaps and never contradicts the CRM. Someone who corrected
@@ -437,10 +462,10 @@ Secret values are never logged.
 | `[interested]` | The Aircall interested workflow, naming the call and who it was with. Always `poll`: the cron is the only caller. Every call the check sees produces a decision line listing every tag it carried, whether or not any matched, and on a miss the configured set it was compared against; a run reporting nothing interested is therefore readable as "these calls, these tags, no match" rather than as silence. A match is followed by the person and deal it finished with, or by the reason it could not: no way to reach a person (the call carried neither an email nor a phone number), or a failure passed over |
 | `[lookup]` | Each person, company, and deal search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list. A company line also says when the person was already linked to one, or when neither Attio nor the provider names one and the deal will be named for an unknown company. An Instantly lead lookup names which enrichment fields arrived, by field name only. The deal line reports both outcomes - how many deals the person already had and which is being reused, or that they had none and one is being created - because "checked and found none" and "never checked" must not read alike |
 | `[action]` | Each write and its outcome: person or company created, a record updated with the attribute list, a record left untouched because every target attribute was already populated, deal created, deal reused, note added, blocklist entry added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |
-| `[suppress]` | One line per outbound platform - suppressed, skipped with the identifier it lacked, or `FAILED` with the reason - then a summary naming every platform and its outcome. A failure here is reported, not raised: the Attio record was already written |
+| `[suppress]` | One line per outbound platform - suppressed, skipped with the identifier it lacked, or `FAILED` with the reason - then a summary naming every platform and its outcome. A failure here is reported, not raised: the Attio record was already written. The HeyReach line carries two figures, how many campaigns the lead is in and how many of those still live ones they were withdrawn from, because no campaign is ever halted and a single count read as though one had been |
 | `[attio]` | An attribute was not written and the event continued anyway: a multiselect left alone because its existing entries could not all be read back, so a replacing write would have risked deleting real data; or a value Attio rejected, named individually, with a count of what was written and what was dropped |
 | `[event]` | Why one polled touchpoint was skipped: no phone or lead email on the record, no Attio person matched, or the person is not on the Master TAM list. An Aircall line names the touchpoint process, to separate it from the interested check running over the same call |
-| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor. Aircall reports two counts, because its fetch is deliberately wider than its scope: `fetched` is everything the two-hour reach-back returned, `scope` is the subset completing at or after the floor the run acts on. Only the second is expected to match the processed and interested figures; the response body carries the same pair as `callsFound` and `callsInScope` |
+| `[run]` | One summary per sync: how many records were in the window, how many were processed, skipped, off-TAM, or failed and passed over, and the new cursor. Aircall reports two counts, because its fetch is deliberately wider than its scope: `fetched` is everything the two-hour reach-back returned, `scope` is the subset completing at or after the floor the run acts on. Only the second is expected to match the processed and interested figures; the response body carries the same pair as `callsFound` and `callsInScope`. Every sync also states how many records in its window came from before the cursor and were passed over as already counted, so the line accounts for the whole window rather than leaving the shortfall to be inferred; the response bodies carry it as `beforeCursor`. On HeyReach that figure is normally most of the window, because its fetch is day-granular - see the `[PERF]` note in the sync |
 
 A `401` from a cron route means the guard rejected the request, not that the function failed. The `[auth]` line
 states which case applied. Note that Vercel only attaches the `authorization` header once `CRON_SECRET` exists in

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { POST as instantlyInterested } from "../../api/instantly-interested.js";
-import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
+import { historyNoteCalls, installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
 const envNames = [
   "ATTIO_API_KEY",
@@ -157,9 +157,9 @@ describe("interested webhook handlers", () => {
     });
     try {
       await instantlyInterested(interestedRequest(leadInterested));
-      const noteParents = mock.calls
-        .filter((call) => call.input.includes("/notes"))
-        .map((call) => JSON.parse(String(call.init?.body)).data.parent_object);
+      const noteParents = historyNoteCalls(mock.calls).map(
+        (call) => JSON.parse(String(call.init?.body)).data.parent_object,
+      );
       expect(noteParents).toEqual(["people", "deals"]);
     } finally {
       mock.restore();

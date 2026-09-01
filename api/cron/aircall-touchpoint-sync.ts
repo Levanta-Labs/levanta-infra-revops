@@ -263,6 +263,10 @@ export async function GET(request: Request): Promise<Response> {
     const budget = startRunBudget(upperBoundMs, "AIRCALL_SYNC_BUDGET_MS");
     //Number of calls the loop reached before it stopped, so a partial run can report what it left behind.
     let examinedCount = 0;
+    //[DEBUG] Of those, the ones the TOUCHPOINT gate rejected as handled on an earlier run. Touchpoints only:
+    //the interested gate above runs on reach, not on the cursor, so a call counted here may still have been
+    //checked for tags. Counted so the summary accounts for the window instead of leaving a silent shortfall.
+    let beforeCursorCount = 0;
     //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
     //at now - so they are one value rather than two flags that could disagree.
     let stopReason: "budget" | "throttled" | null = null;
@@ -284,7 +288,10 @@ export async function GET(request: Request): Promise<Response> {
         if (await processInterestedTag(call, interestedTags, failures)) interestedCount += 1;
       }
       //Touchpoint gate. Everything at or below the mark has already been counted on an earlier run.
-      if (!isAfterCursor(cursor, event)) continue;
+      if (!isAfterCursor(cursor, event)) {
+        beforeCursorCount += 1;
+        continue;
+      }
       try {
         const outcome = await processAircallTouchpoint(call);
         results[outcome] += 1;
@@ -328,13 +335,15 @@ export async function GET(request: Request): Promise<Response> {
     }
     await saveSyncCursor(cursor);
     console.log(
-      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${stopReason ? `STOPPED (${stopReason}) with ${callsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
+      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${stopReason ? `STOPPED (${stopReason}) with ${callsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
     );
     const body = {
       success: failures.length === 0,
       //callsFound is the whole fetch including the reach-back; callsInScope is what the run could act on.
       callsFound: calls.length,
       callsInScope: inScopeCount,
+      //Part of callsFound rather than extra to it: the slice an earlier run had already counted as touchpoints.
+      beforeCursor: beforeCursorCount,
       ...results,
       interested: interestedCount,
       failed: failures.length,

@@ -219,7 +219,7 @@ describe("HeyReach client", () => {
     }
   });
 
-  test("mocks destructive campaign stops and only targets active leads", async () => {
+  test("mocks destructive campaign stops, only targets active leads, and reports both counts", async () => {
     const mock = installFetchMock((_url, _init, index) =>
       index === 0
         ? jsonResponse({
@@ -231,9 +231,10 @@ describe("HeyReach client", () => {
         : new Response(null, { status: 200 }),
     );
     try {
+      //Two campaigns list the lead, one of them still live: the pair the suppression line reports.
       expect(
         await stopLeadInActiveCampaigns("https://linkedin.com/in/ada", "ada@example.com"),
-      ).toBe(1);
+      ).toEqual({ inCampaigns: 2, removedFrom: 1 });
       expect(mock.calls).toHaveLength(2);
       expect(mock.calls[0]?.input).toEndWith("/campaign/GetCampaignsForLead");
       expect(mock.calls[1]?.input).toEndWith("/campaign/StopLeadInCampaign");

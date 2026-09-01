@@ -179,6 +179,18 @@ export async function heyReachMessageId(
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+//---------------------------------------------------------------------------------------------------------
+//What one suppression did, in the two numbers that differ. `inCampaigns` is every campaign HeyReach lists this
+//lead in, live or spent; `removedFrom` is the live subset the lead was actually withdrawn from. Neither counts
+//campaigns halted - a campaign is never stopped here, it carries on running for everyone else in it.
+//Both are reported because they answer different questions: `inCampaigns` at zero means HeyReach has never had
+//this lead, while `inCampaigns` high with `removedFrom` at zero means it had them and they had already run out.
+//---------------------------------------------------------------------------------------------------------
+export interface CampaignStopResult {
+  readonly inCampaigns: number;
+  readonly removedFrom: number;
+}
+
 interface HeyReachCampaign {
   readonly campaignId: number;
   readonly campaignStatus: string;
@@ -198,8 +210,10 @@ function parseCampaign(value: unknown): HeyReachCampaign {
 
 //---------------------------------------------------------------------------------------------------------
 //Ends outbound sequencing for a lead who has said yes. The only provider-side write in the codebase.
-//FLOW: 1. no profile URL -> 0, see below. 2. list the lead's campaigns. 3. keep those where both the campaign
-//and the lead's place in it are still live. 4. stop each. 5. return how many were stopped.
+//Scoped to the one lead: StopLeadInCampaign withdraws them from a campaign, it does not halt the campaign.
+//FLOW: 1. no profile URL -> zeroes, see below. 2. list the lead's campaigns. 3. keep those where both the
+//campaign and the lead's place in it are still live. 4. stop each. 5. return both counts - see
+//CampaignStopResult for why the total and the withdrawn subset are reported separately.
 //[STABILITY] A failed stop throws and is not retried; the caller has already written the CRM record.
 //KNOWN GAP: step 1 returns early because StopLeadInCampaign is driven by leadUrl, which an email-only lead
 //does not supply. The lookup at step 2 would accept the email; the stop at step 4 would not. Such a lead stays
@@ -208,8 +222,8 @@ function parseCampaign(value: unknown): HeyReachCampaign {
 export async function stopLeadInActiveCampaigns(
   profileUrl: string | null,
   email: string | null,
-): Promise<number> {
-  if (!profileUrl) return 0;
+): Promise<CampaignStopResult> {
+  if (!profileUrl) return { inCampaigns: 0, removedFrom: 0 };
   const response = await fetch(`${HEYREACH_BASE}/campaign/GetCampaignsForLead`, {
     method: "POST",
     headers: heyreachHeaders(),
@@ -220,12 +234,13 @@ export async function stopLeadInActiveCampaigns(
     throw new Error(`HeyReach campaign lookup failed ${response.status}: ${JSON.stringify(body)}${credentialHint("heyreach", response.status)}`);
   }
   if (!isJsonObject(body)) throw new Error("HeyReach campaigns response is invalid");
+  //Every campaign that lists the lead, before any liveness filter - the total the caller reports against.
+  const listed = arrayValue(body, "items").map(parseCampaign);
   //Both dimensions must be live. A paused campaign still counts: it can be resumed and would resume messaging.
   //A lead already finished or replied-out of a campaign has nothing left to stop.
   const activeCampaignStatuses = new Set(["IN_PROGRESS", "PAUSED", "STARTING"]);
   const activeLeadStatuses = new Set(["Pending", "InSequence", "Paused"]);
-  const campaigns = arrayValue(body, "items")
-    .map(parseCampaign)
+  const campaigns = listed
     .filter(
       (campaign) =>
         activeCampaignStatuses.has(campaign.campaignStatus) &&
@@ -244,5 +259,5 @@ export async function stopLeadInActiveCampaigns(
       );
     }
   }
-  return campaigns.length;
+  return { inCampaigns: listed.length, removedFrom: campaigns.length };
 }
