@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.js";
 import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.js";
 import { GET as instantlySync } from "../../api/cron/instantly-touchpoint-sync.js";
-import { installFetchMock, jsonResponse } from "./test-utils.js";
+import { historyNoteCalls, installFetchMock, jsonResponse } from "./test-utils.js";
 
 const envNames = [
   "SUPABASE_URL",
@@ -189,7 +189,7 @@ describe("cron handlers", () => {
 
       //A deal, a note on the person and on the deal, and the DNC listing - the full interested workflow.
       expect(mock.calls.some((call) => call.input.includes("objects/deals/records"))).toBe(true);
-      expect(mock.calls.filter((call) => call.input.includes("/notes"))).toHaveLength(2);
+      expect(historyNoteCalls(mock.calls)).toHaveLength(2);
       expect(mock.calls.some((call) => call.input.includes("/lists/dnc/entries"))).toBe(true);
     } finally {
       mock.restore();

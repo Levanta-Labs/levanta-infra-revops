@@ -28,6 +28,9 @@ import {
   type SuppressionChannel,
   type SuppressionTargets,
 } from "./providers.js";
+//[RUN LOG] Additive diagnostics, self-contained in lib/run-log.ts. This import and the four lines it is used on
+//in recordInterestedLead are the feature's entire footprint in this module.
+import { runLogCompany, runLogTarget, snapshotBefore, withRunLog } from "./run-log.js";
 
 //=============================================================================================================
 //What the three interested workflows have in common.
@@ -835,16 +838,25 @@ export interface InterestedOutcome {
 //dealValuesFor, updateAttioAttributes, suppressInterestedLead (this module).
 //The caller supplies findPerson and history; nothing else about a provider is visible from here.
 //[DEBUG] Ends with one line naming the person, deal, and company, so an event reads as a single result.
+//[RUN LOG] Wrapped in a transcript scope, which writes what happened here back to the Person as a note. It is
+//additive and self-contained: see lib/run-log.ts. Removing it is this wrapper plus three lines below.
 //---------------------------------------------------------------------------------------------------------
 export async function recordInterestedLead(workflow: InterestedWorkflow): Promise<InterestedOutcome> {
+  return withRunLog(workflow.lead.provider, () => runInterestedLead(workflow));
+}
+
+async function runInterestedLead(workflow: InterestedWorkflow): Promise<InterestedOutcome> {
   const { lead, subject } = workflow;
 
   let person = await workflow.findPerson();
+  snapshotBefore(person);
   if (!person) person = await createPerson(personValuesFor(lead));
   const personId = person.id.record_id;
   const personName = personLabel(person);
+  runLogTarget(personId, personName);
 
   const company = await resolveInterestedCompany(lead, person);
+  runLogCompany(company);
   const deal = await ensureInterestedDeal(
     person,
     interestedDealName(company?.name ?? null),

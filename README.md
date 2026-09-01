@@ -56,6 +56,31 @@ message history into a note. Everything after that is one code path:
 | 4. Notes | The provider's rendered history, on the Person and on the Deal |
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
+| 7. Transcript | The whole run written back to the Person as a note - see below |
+
+### Every interested run leaves a transcript on the Person
+
+Step 7 posts one further note to the Person, titled
+`run logs for automated integration (<Platform> marked as interested)`. It carries whether the Person existed
+before the run, what Attio held then, every line the run printed, and what Attio held afterwards. The question
+asked after the fact is never "what happened in invocation `dpl_xyz`" but "why does *this* person look like
+this", and that is a question about a record - so the answer lives on the record rather than expiring with the
+Vercel log.
+
+Nothing had to be instrumented to produce it. `lib/run-log.ts` mirrors `console` for the duration of one run,
+so the existing log lines are the single source and cannot drift from the transcript. Capture is scoped per
+lead, which is what keeps the several interested calls in one Aircall invocation apart, and what keeps the
+touchpoint crons - which share `lib/attio.ts` but never open a scope - out of it entirely.
+
+The whole feature is `lib/run-log.ts`, its test, and four lines in `recordInterestedLead`; deleting those
+removes it and changes nothing else. It builds the transcript as a file in memory - a name, a type, and bytes -
+so emailing or posting it later is the same call, not a rewrite. It costs two Attio requests per interested
+lead (one read-back, one note) and never throws into a run: a transcript that cannot be written is logged and
+abandoned, because it is diagnostics attached to an event Attio has already committed.
+
+**A note on what it contains.** The transcript reproduces the run's log lines verbatim, and those carry the
+business identifiers a lookup searched on - an address, a number, a profile URL. That is personal data, and
+putting it on the record widens who can read it to everyone with access to that Person in Attio.
 
 **Nothing overwrites.** `updateAttioAttributes` reads what a record already holds and writes only the
 attributes that are blank, so third-party data fills gaps and never contradicts the CRM. Someone who corrected
