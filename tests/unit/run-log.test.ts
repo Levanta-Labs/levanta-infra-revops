@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { recordInterestedLead, interestedLead } from "../../lib/interested.js";
-import { runLogArtifact, withRunLog } from "../../lib/run-log.js";
+import { findPersonByEmail } from "../../lib/attio.js";
+import { interestedLead, recordInterestedLead } from "../../lib/interested.js";
+import { runLogArtifacts, runLogRecord, withRunLog } from "../../lib/run-log.js";
 import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
 //=============================================================================================================
-//The run transcript (lib/run-log.ts). Additive diagnostics, so what is asserted here is that it records the
-//run faithfully AND that it cannot damage one: outside a scope it is inert, and inside one every way it can
-//fail is swallowed.
+//The run transcript (lib/run-log.ts). Additive diagnostics, so what is asserted here is that it reports the
+//run faithfully AND that it cannot damage one: outside a scope it is inert, inside one every way it can fail
+//is swallowed, and it costs no Attio read of its own.
 //=============================================================================================================
 
 const envNames = ["ATTIO_API_KEY", "ATTIO_DEFAULT_DEAL_OWNER", "INSTANTLY_API_KEY", "HEYREACH_API_KEY"] as const;
@@ -27,37 +28,51 @@ afterEach(() => {
   }
 });
 
-//The Person as Attio returns it after the run - the state the transcript reads back and reports.
-const PERSON_AFTER = {
-  id: { record_id: "person-1" },
-  values: {
-    name: [{ first_name: "Ada", last_name: "Lovelace", full_name: "Ada Lovelace" }],
-    email_addresses: [{ email_address: "ada@example.com" }],
-    phone_numbers: [{ original_phone_number: "+15555550123" }],
-    company: [{ target_record_id: "company-1" }],
-    job_title: [{ value: "Engineer" }],
-    lead_source: [{ option: { title: "Instantly Cold Outreach - Automated" } }],
-    //Holds nothing, so it must not appear in either state.
-    linkedin: [],
-  },
+//Attio as it stands before the run: a person, a company, and a deal that all already exist. The deal is the
+//interesting one - it is mid-pipeline, which is the case the transcript exists to make legible.
+const PERSON_BEFORE = {
+  name: [{ first_name: "Ada", last_name: "Lovelace", full_name: "Ada Lovelace" }],
+  email_addresses: [{ email_address: "ada@example.com" }],
+  company: [{ target_record_id: "company-1" }],
+  associated_deals: [{ target_record_id: "deal-1" }],
+  lead_source: [{ option: { title: "HeyReach Cold Outreach - Automated" } }],
+  job_title: [],
+};
+const COMPANY_BEFORE = { name: [{ value: "Engines Ltd" }], domains: [{ domain: "engines.example" }] };
+const DEAL_BEFORE = {
+  name: [{ value: "Engines Ltd - Interested" }],
+  stage: [{ status: { title: "Negotiation" } }],
+  lead_source: [{ option: { title: "HeyReach Cold Outreach - Automated" } }],
+  moved_to_interested_at: [{ value: "2026-06-14T09:31:00.000Z" }],
 };
 
 //---------------------------------------------------------------------------------------------------------
-//Every Attio and platform call one interested run makes. `found` is what the person lookup returns - null for
-//a lead Attio has never seen, which is the branch that must report no previous state.
+//Every call one interested run makes. `person` null is the lead Attio has never seen, and `linkedCompany`
+//false the lead with no company to resolve - the two branches that change what the transcript reports.
 //---------------------------------------------------------------------------------------------------------
-function mockRun(found: Record<string, unknown> | null) {
+function mockRun(options: { person?: Record<string, unknown> | null; linkedCompany?: boolean } = {}) {
+  const person = options.person === undefined ? PERSON_BEFORE : options.person;
+  const linkedCompany = options.linkedCompany ?? true;
   return installFetchMock((url, init) => {
     const method = init?.method ?? "GET";
     if (url.includes("objects/people/records/query")) {
-      return jsonResponse({ data: found ? [{ id: { record_id: "person-1" }, values: found }] : [] });
+      return jsonResponse({ data: person ? [{ id: { record_id: "person-1" }, values: person }] : [] });
     }
     if (url.includes("objects/companies/records/query")) return jsonResponse({ data: [] });
     if (url.includes("objects/") && method === "PATCH") return jsonResponse({ data: {} });
-    //The transcript's own read-back of the person, and the create when the lookup found nobody.
-    if (url.includes("objects/people/records")) return jsonResponse({ data: PERSON_AFTER });
+    if (url.includes("objects/companies/records/company-1")) {
+      return jsonResponse({ data: { id: { record_id: "company-1" }, values: COMPANY_BEFORE } });
+    }
+    if (url.includes("objects/deals/records/deal-1")) {
+      return jsonResponse({ data: { id: { record_id: "deal-1" }, values: DEAL_BEFORE } });
+    }
+    if (url.includes("objects/people/records")) {
+      return jsonResponse({ data: { id: { record_id: "person-1" }, values: person ?? {} } });
+    }
     if (url.includes("objects/companies/records")) {
-      return jsonResponse({ data: { id: { record_id: "company-1" }, values: { name: [{ value: "Engines Ltd" }] } } });
+      return jsonResponse({
+        data: { id: { record_id: linkedCompany ? "company-1" : "company-2" }, values: { name: [{ value: "Engines Ltd" }] } },
+      });
     }
     if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
     if (url.includes("/notes")) return jsonResponse({ data: {} });
@@ -69,145 +84,210 @@ function mockRun(found: Record<string, unknown> | null) {
   });
 }
 
-function run(overrides: { readonly findsPerson: boolean; readonly history?: () => Promise<string> }) {
+function run(options: { companyName?: string | null; history?: () => Promise<string> } = {}) {
   return recordInterestedLead({
     lead: interestedLead("instantly", {
       emails: ["ada@example.com"],
+      phones: ["+15125550134"],
       firstName: "Ada",
       lastName: "Lovelace",
-      companyName: "Engines Ltd",
+      jobTitle: "Head of Engineering",
+      companyName: options.companyName === undefined ? "Engines Ltd" : options.companyName,
+      campaignName: "Q3 Outbound",
       occurredAtMs: Date.UTC(2026, 8, 1),
     }),
     subject: "run-log test",
-    findPerson: async () =>
-      overrides.findsPerson
-        ? ({
-            id: { record_id: "person-1" },
-            rawValues: { name: [{ full_name: "Ada Lovelace" }], company: [{ target_record_id: "company-1" }] },
-            populatedAttributes: new Set(["name", "company"]),
-            values: { associated_deals: [], company: [{ target_record_id: "company-1" }], name: [{ full_name: "Ada Lovelace" }] },
-          })
-        : null,
-    history: overrides.history ?? (async () => "the thread"),
+    findPerson: () => findPersonByEmail("ada@example.com"),
+    history: options.history ?? (async () => "the thread"),
   });
 }
 
-/** The transcript note, which is the only note titled "run logs ...". Null when the run posted none. */
-function transcript(calls: readonly FetchCall[]): { title: string; content: string; parent: string } | null {
+interface Transcript {
+  readonly parent: string;
+  readonly recordId: string;
+  readonly title: string;
+  readonly content: string;
+}
+
+/** Every note titled "run logs ...", which is the transcript and nothing else. */
+function transcripts(calls: readonly FetchCall[]): readonly Transcript[] {
+  const found: Transcript[] = [];
   for (const call of calls) {
     if (!call.input.includes("/notes")) continue;
     const body = JSON.parse(String(call.init?.body)) as {
-      data: { title: string; content: string; parent_object: string };
+      data: { title: string; content: string; parent_object: string; parent_record_id: string };
     };
-    if (body.data.title.startsWith("run logs")) {
-      return { title: body.data.title, content: body.data.content, parent: body.data.parent_object };
-    }
+    if (!body.data.title.startsWith("run logs")) continue;
+    found.push({
+      parent: body.data.parent_object,
+      recordId: body.data.parent_record_id,
+      title: body.data.title,
+      content: body.data.content,
+    });
   }
-  return null;
+  return found;
 }
 
+function section(content: string, heading: string, next: string | null): string {
+  const start = content.indexOf(heading);
+  return content.slice(start, next ? content.indexOf(next) : undefined);
+}
+
+const previousState = (content: string) => section(content, "**Previous state**", "**Run logs**");
+const runLogs = (content: string) => section(content, "**Run logs**", "**State after run**");
+const afterState = (content: string) => section(content, "**State after run**", null);
+
+/** A record stub, for the scope tests that have no workflow to run. */
+const STUB = { id: { record_id: "stub-1" }, rawValues: {}, populatedAttributes: new Set<string>() };
+
 describe("run transcript", () => {
-  test("posts one note to the person, titled for the platform that reported the interest", async () => {
-    const mock = mockRun({ name: [{ full_name: "Ada Lovelace" }] });
+  test("posts one note per record touched, titled for the platform that reported the interest", async () => {
+    const mock = mockRun();
     try {
-      await run({ findsPerson: true });
-      const note = transcript(mock.calls);
-      expect(note?.parent).toBe("people");
-      expect(note?.title).toBe("run logs for automated integration (Instantly marked as interested)");
+      await run();
+      const notes = transcripts(mock.calls);
+      expect(notes.map((note) => note.parent)).toEqual(["people", "companies", "deals"]);
+      expect(notes.map((note) => note.recordId)).toEqual(["person-1", "company-1", "deal-1"]);
+      for (const note of notes) {
+        expect(note.title).toBe("run logs for automated integration (Instantly marked as interested)");
+      }
     } finally {
       mock.restore();
     }
   });
 
-  test("reports a person Attio already held, and the state it held", async () => {
-    const mock = mockRun({ name: [{ full_name: "Ada Lovelace" }] });
+  test("carries one run log, identical on all three, which nothing had to be instrumented to produce", async () => {
+    const mock = mockRun();
     try {
-      await run({ findsPerson: true });
-      const content = transcript(mock.calls)?.content ?? "";
-      expect(content).toContain("Record did exist before run.");
-      const previous = content.slice(content.indexOf("**Previous state**"), content.indexOf("**Run logs**"));
-      expect(previous).toContain("name: Ada Lovelace");
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("reports no previous state for a person the run created", async () => {
-    const mock = mockRun(null);
-    try {
-      await run({ findsPerson: false });
-      const content = transcript(mock.calls)?.content ?? "";
-      expect(content).toContain("Record did not exist before run.");
-      expect(content.slice(content.indexOf("**Previous state**"), content.indexOf("**Run logs**"))).toContain("none");
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("reads the person back afterwards and renders every attribute type it holds", async () => {
-    const mock = mockRun({ name: [{ full_name: "Ada Lovelace" }] });
-    try {
-      await run({ findsPerson: true });
-      const content = transcript(mock.calls)?.content ?? "";
-      const after = content.slice(content.indexOf("**State after run**"));
-      expect(after).toContain("name: Ada Lovelace");
-      expect(after).toContain("email addresses: ada@example.com");
-      expect(after).toContain("phone numbers: +15555550123");
-      expect(after).toContain("job title: Engineer");
-      expect(after).toContain("lead source: Instantly Cold Outreach - Automated");
-      //The run's own company, so the reference reads as a name rather than the record id it is stored as.
-      expect(after).toContain("company: Engines Ltd");
-      //Attributes holding nothing are omitted, so what changed is not buried.
-      expect(after).not.toContain("linkedin");
-    } finally {
-      mock.restore();
-    }
-  });
-
-  test("carries the run's own log lines, which nothing had to be instrumented to produce", async () => {
-    const mock = mockRun({ name: [{ full_name: "Ada Lovelace" }] });
-    try {
-      await run({ findsPerson: true });
-      const content = transcript(mock.calls)?.content ?? "";
-      const logs = content.slice(content.indexOf("**Run logs**"), content.indexOf("**State after run**"));
+      await run();
+      const notes = transcripts(mock.calls);
+      const logs = notes.map((note) => runLogs(note.content));
       //Printed by lib/attio.ts and lib/interested.ts respectively - neither knows this feature exists.
-      expect(logs).toContain('[action] note added to deals deal-1 ("Instantly Cold Outreach")');
-      expect(logs).toContain("[interested] run-log test: completed");
-      //Timestamped, so the transcript reads as a sequence rather than a heap.
-      expect(logs).toMatch(/\[\d{2}:\d{2}:\d{2}\.\d{3}] \[action]/);
+      expect(logs[0]).toContain('[action] note added to deals deal-1 ("Instantly Cold Outreach")');
+      expect(logs[0]).toContain("[interested] run-log test: completed");
+      expect(logs[0]).toMatch(/\[\d{2}:\d{2}:\d{2}\.\d{3}] \[action]/);
+      //One run, so one account of it. Rendering per note would let each pick up the note written before it.
+      expect(logs[1]).toBe(logs[0] ?? "");
+      expect(logs[2]).toBe(logs[0] ?? "");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("derives the state after the run instead of reading any record back", async () => {
+    const mock = mockRun();
+    try {
+      await run();
+      const reads = mock.calls.filter(
+        (call) => (call.init?.method ?? "GET") === "GET" && call.input.includes("objects/"),
+      );
+      //Exactly the two the workflow already made for its own purposes - the linked company and the reused
+      //deal. The person came from the lookup query, and nothing is read back afterwards.
+      expect(reads.map((call) => call.input.split("/records/")[1])).toEqual(["company-1", "deal-1"]);
+
+      const person = transcripts(mock.calls)[0]?.content ?? "";
+      //Written this run, and reported without a read to confirm it.
+      expect(afterState(person)).toContain("job title: Head of Engineering");
+      expect(afterState(person)).toContain("campaign name: Q3 Outbound");
+      //Labelled for what it is: what the run left, not a reading of Attio.
+      expect(person).toContain("**State after run** (as this run left it)");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("reports what each record held before, from its own record and not the person's", async () => {
+    const mock = mockRun();
+    try {
+      await run();
+      const [person, company, deal] = transcripts(mock.calls);
+      expect(previousState(person?.content ?? "")).toContain("email addresses: ada@example.com");
+      expect(previousState(company?.content ?? "")).toContain("domains: engines.example");
+      expect(previousState(deal?.content ?? "")).toContain("stage: Negotiation");
+      //Each reports itself, so no record's note carries another's attributes.
+      expect(previousState(company?.content ?? "")).not.toContain("email addresses");
+      for (const note of [person, company, deal]) {
+        expect(note?.content).toContain("Record did exist before run.");
+      }
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("shows a reused deal keeping its stage and date while its lead source is restated", async () => {
+    //The asymmetry the transcript exists to surface: an interested event on a deal already in the pipeline
+    //moves the source to this run's channel but leaves the stage and the original interested date alone.
+    const mock = mockRun();
+    try {
+      await run();
+      const deal = transcripts(mock.calls)[2]?.content ?? "";
+      expect(previousState(deal)).toContain("lead source: HeyReach Cold Outreach - Automated");
+      expect(afterState(deal)).toContain("lead source: Instantly Cold Outreach - Automated");
+      expect(afterState(deal)).toContain("stage: Negotiation");
+      expect(afterState(deal)).toContain("moved to interested at: 2026-06-14T09:31:00.000Z");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("reports no previous state for records the run created", async () => {
+    const mock = mockRun({ person: null });
+    try {
+      await run();
+      const [person, , deal] = transcripts(mock.calls);
+      expect(person?.content).toContain("Record did not exist before run.");
+      expect(previousState(person?.content ?? "")).toContain("none");
+      //A person Attio has never seen has no associated deal either, so one is opened for them.
+      expect(deal?.content).toContain("Record did not exist before run.");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("writes no company note when no company could be resolved", async () => {
+    //The cold Aircall case: nothing to look a company up by and nothing to create one from.
+    const mock = mockRun({ person: { name: [{ full_name: "Ada Lovelace" }] } });
+    try {
+      await run({ companyName: null });
+      expect(transcripts(mock.calls).map((note) => note.parent)).toEqual(["people", "deals"]);
     } finally {
       mock.restore();
     }
   });
 
   test("still posts the transcript when the run fails partway", async () => {
-    const mock = mockRun({ name: [{ full_name: "Ada Lovelace" }] });
+    const mock = mockRun();
     try {
-      //A throw after the person is resolved: the run is lost, but its transcript is exactly what is wanted.
       await expect(
-        run({ findsPerson: true, history: async () => { throw new Error("the thread could not be fetched"); } }),
+        run({ history: async () => { throw new Error("the thread could not be fetched"); } }),
       ).rejects.toThrow("the thread could not be fetched");
-      expect(transcript(mock.calls)?.parent).toBe("people");
+      //The person and the deal were both resolved before the throw, so both are owed their transcript.
+      expect(transcripts(mock.calls).map((note) => note.parent)).toEqual(["people", "companies", "deals"]);
     } finally {
       mock.restore();
     }
   });
 
-  test("a failure posting the transcript does not fail the run", async () => {
+  test("a failure posting one transcript costs neither the others nor the run", async () => {
+    let notes = 0;
     const mock = installFetchMock((url, init) => {
       const method = init?.method ?? "GET";
       if (url.includes("objects/people/records/query")) {
-        return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: { name: [{ full_name: "Ada" }] } }] });
+        return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: PERSON_BEFORE }] });
       }
       if (url.includes("objects/companies/records/query")) return jsonResponse({ data: [] });
       if (url.includes("objects/") && method === "PATCH") return jsonResponse({ data: {} });
-      if (url.includes("objects/people/records")) return jsonResponse({ data: PERSON_AFTER });
-      if (url.includes("objects/companies/records")) {
-        return jsonResponse({ data: { id: { record_id: "company-1" }, values: {} } });
+      if (url.includes("objects/companies/records/company-1")) {
+        return jsonResponse({ data: { id: { record_id: "company-1" }, values: COMPANY_BEFORE } });
       }
-      if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
-      //Every note is refused, the transcript's included.
-      if (url.includes("/notes")) return jsonResponse({ error: "nope" }, 500);
+      if (url.includes("objects/deals/records/deal-1")) {
+        return jsonResponse({ data: { id: { record_id: "deal-1" }, values: DEAL_BEFORE } });
+      }
+      if (url.includes("/notes")) {
+        notes += 1;
+        //The history notes pass; the person's transcript is refused and the rest must still be attempted.
+        return notes === 3 ? jsonResponse({ error: "nope" }, 500) : jsonResponse({ data: {} });
+      }
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
       if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
       if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
@@ -215,9 +295,8 @@ describe("run transcript", () => {
       throw new Error(`Unexpected fetch: ${url}`);
     });
     try {
-      //The history note raises first, so the run fails on its own account - what matters is that the
-      //transcript's own 500 is not what surfaces, and does not replace it.
-      await expect(run({ findsPerson: true })).rejects.not.toThrow("run logs");
+      await run();
+      expect(transcripts(mock.calls).map((note) => note.parent)).toEqual(["people", "companies", "deals"]);
     } finally {
       mock.restore();
     }
@@ -226,20 +305,22 @@ describe("run transcript", () => {
   test("collects nothing outside a run, so the touchpoint crons are untouched", async () => {
     //lib/attio.ts is equally the crons' code. Their prints happen with no scope open and must go nowhere.
     console.log("[event] a touchpoint print, outside any interested run");
-    expect(runLogArtifact(null)).toBeNull();
+    expect(runLogArtifacts()).toEqual([]);
   });
 
   test("keeps overlapping runs' lines apart, as the Aircall sync's several leads per invocation are", async () => {
     //Two scopes open at once, interleaved across an await, each seeing only its own prints.
     const [first, second] = await Promise.all([
       withRunLog("aircall", async () => {
+        runLogRecord("people", STUB, true, "First");
         console.log("belongs to the first run");
         await new Promise((resolve) => setTimeout(resolve, 5));
-        return runLogArtifact(null)?.body ?? "";
+        return runLogArtifacts()[0]?.body ?? "";
       }),
       withRunLog("heyreach", async () => {
+        runLogRecord("people", STUB, true, "Second");
         console.log("belongs to the second run");
-        return runLogArtifact(null)?.body ?? "";
+        return runLogArtifacts()[0]?.body ?? "";
       }),
     ]);
     expect(first).toContain("belongs to the first run");

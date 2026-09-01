@@ -56,31 +56,52 @@ message history into a note. Everything after that is one code path:
 | 4. Notes | The provider's rendered history, on the Person and on the Deal |
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
-| 7. Transcript | The whole run written back to the Person as a note - see below |
+| 7. Transcript | The whole run written back to the Person, the Company and the Deal as a note - see below |
 
-### Every interested run leaves a transcript on the Person
+### Every interested run leaves a transcript on the records it touched
 
-Step 7 posts one further note to the Person, titled
-`run logs for automated integration (<Platform> marked as interested)`. It carries whether the Person existed
-before the run, what Attio held then, every line the run printed, and what Attio held afterwards. The question
-asked after the fact is never "what happened in invocation `dpl_xyz`" but "why does *this* person look like
+Step 7 posts one further note to the Person, to the Company, and to the Deal, all titled
+`run logs for automated integration (<Platform> marked as interested)`. Each carries whether *that* record
+existed before the run, what it held then, every line the run printed, and what it held after. The question
+asked after the fact is never "what happened in invocation `dpl_xyz`" but "why does *this* record look like
 this", and that is a question about a record - so the answer lives on the record rather than expiring with the
-Vercel log.
+Vercel log. The transcript is identical in all three, because it is one run; only the two states differ.
 
-Nothing had to be instrumented to produce it. `lib/run-log.ts` mirrors `console` for the duration of one run,
-so the existing log lines are the single source and cannot drift from the transcript. Capture is scoped per
-lead, which is what keeps the several interested calls in one Aircall invocation apart, and what keeps the
+It is most useful on a Deal that already existed. An interested event on a deal mid-pipeline restates its lead
+source to this run's channel but leaves its stage and its original `moved_to_interested_at` alone, and the two
+states put that side by side:
+
+```
+Previous state                          State after run (as this run left it)
+stage: Negotiation                      stage: Negotiation
+lead source: HeyReach Cold Outreach…    lead source: Instantly Cold Outreach - Automated
+moved to interested at: 2026-06-14      moved to interested at: 2026-06-14T09:31:00.000Z
+```
+
+Nothing had to be instrumented to produce the log. `lib/run-log.ts` mirrors `console` for the duration of one
+run, so the existing log lines are the single source and cannot drift from the transcript. Capture is scoped
+per lead, which is what keeps the several interested calls in one Aircall invocation apart, and what keeps the
 touchpoint crons - which share `lib/attio.ts` but never open a scope - out of it entirely.
 
-The whole feature is `lib/run-log.ts`, its test, and four lines in `recordInterestedLead`; deleting those
-removes it and changes nothing else. It builds the transcript as a file in memory - a name, a type, and bytes -
-so emailing or posting it later is the same call, not a rewrite. It costs two Attio requests per interested
-lead (one read-back, one note) and never throws into a run: a transcript that cannot be written is logged and
-abandoned, because it is diagnostics attached to an event Attio has already committed.
+**The after state is derived, not re-read.** `patchRecord` has three call sites, all inside
+`writeSalvagingRejections`, which only `updateAttioAttributes` calls - so an attribute on any of these records
+can only change through a create whose response is already in hand, or through a write that reports what it
+wrote. Composing the two gives the state the run left behind without asking Attio for it, which is why three
+records cost three requests rather than six. What it cannot see is Attio's own hand: a value normalised on
+write, a derived attribute, an automation reacting to the write, or a human editing mid-run. The heading says
+`(as this run left it)` rather than claiming to be a reading of Attio, because that is what it is.
+
+The whole feature is `lib/run-log.ts`, its test, and the blocks marked `//debug note in attio=` in
+`lib/interested.ts`; deleting those removes it and changes nothing else. It builds each transcript as a file in
+memory - a name, a type, and bytes - so emailing or posting them later is the same call, not a rewrite. It
+costs three Attio requests per interested lead, one note per record, and never throws into a run: each note is
+written independently and a transcript that cannot be posted is logged and abandoned, because it is
+diagnostics attached to an event Attio has already committed.
 
 **A note on what it contains.** The transcript reproduces the run's log lines verbatim, and those carry the
-business identifiers a lookup searched on - an address, a number, a profile URL. That is personal data, and
-putting it on the record widens who can read it to everyone with access to that Person in Attio.
+business identifiers a lookup searched on - an address, a number, a profile URL. That is personal data, and it
+now sits on the Company and the Deal as well as the Person, so anyone with access to any of the three can read
+it.
 
 **Nothing overwrites.** `updateAttioAttributes` reads what a record already holds and writes only the
 attributes that are blank, so third-party data fills gaps and never contradicts the CRM. Someone who corrected
