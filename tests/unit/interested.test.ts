@@ -17,13 +17,14 @@ import {
 import { automatedSourceLabel, leadSourceLabel } from "../../lib/providers.js";
 import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
-const envNames = ["ATTIO_API_KEY", "INSTANTLY_API_KEY", "HEYREACH_API_KEY"] as const;
+const envNames = ["ATTIO_API_KEY", "INSTANTLY_API_KEY", "HEYREACH_API_KEY", "OUTFOUND_API_KEY"] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
 beforeEach(() => {
   process.env.ATTIO_API_KEY = "attio-key";
   process.env.INSTANTLY_API_KEY = "instantly-key";
   process.env.HEYREACH_API_KEY = "heyreach-key";
+  process.env.OUTFOUND_API_KEY = "outfound-key";
 });
 
 afterEach(() => {
@@ -465,13 +466,13 @@ describe("salvaging a rejected attribute write", () => {
 describe("naming a new deal", () => {
   //Strict convention: nothing but the company name and the suffix, so these deals sort together.
   test("names a deal after its company", () => {
-    expect(interestedDealName("Engines Ltd")).toBe("Engines Ltd - Interested");
+    expect(interestedDealName("Engines Ltd")).toBe("Engines Ltd");
   });
 
   test("names an unknown company when neither Attio nor the provider has one", () => {
-    expect(interestedDealName(null)).toBe("Unknown Company - Interested");
-    expect(interestedDealName("")).toBe("Unknown Company - Interested");
-    expect(interestedDealName("   ")).toBe("Unknown Company - Interested");
+    expect(interestedDealName(null)).toBe("Unknown Company");
+    expect(interestedDealName("")).toBe("Unknown Company");
+    expect(interestedDealName("   ")).toBe("Unknown Company");
   });
 });
 
@@ -491,6 +492,14 @@ describe("suppressing an interested lead", () => {
         return jsonResponse({ items: [{ campaignId: 7, campaignStatus: "IN_PROGRESS", leadStatus: "InSequence" }] });
       }
       if (url.includes("StopLeadInCampaign")) return jsonResponse({});
+      //Outfound has no "block this address" call, so the channel looks the lead up for a thread first.
+      if (url.includes("/prospects/lookup/conversations")) {
+        return jsonResponse({
+          lead_email: "ada@example.com",
+          clients: [{ recent_conversations: [{ id: "c1", thread_hash: "thread-1", timestamp_email: "2026-09-01T10:00:00Z" }] }],
+        });
+      }
+      if (url.includes("/mark-as-dnc")) return jsonResponse({ updated_count: 1 });
       throw new Error(`Unexpected fetch: ${url}`);
     });
     try {
@@ -499,6 +508,7 @@ describe("suppressing an interested lead", () => {
       expect(result.outcomes.map((outcome) => [outcome.platform, outcome.status])).toEqual([
         ["attio DNC list", "suppressed"],
         ["instantly blocklist", "suppressed"],
+        ["outfound DNC", "suppressed"],
         ["heyreach campaigns", "suppressed"],
       ]);
     } finally {
@@ -512,16 +522,24 @@ describe("suppressing an interested lead", () => {
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
       if (url.includes("block-lists-entries")) return jsonResponse({ error: "boom" }, 500);
       if (url.includes("GetCampaignsForLead")) return jsonResponse({ items: [] });
+      if (url.includes("/prospects/lookup/conversations")) {
+        return jsonResponse({
+          lead_email: "ada@example.com",
+          clients: [{ recent_conversations: [{ id: "c1", thread_hash: "thread-1", timestamp_email: "2026-09-01T10:00:00Z" }] }],
+        });
+      }
+      if (url.includes("/mark-as-dnc")) return jsonResponse({ updated_count: 1 });
       throw new Error(`Unexpected fetch: ${url}`);
     });
     try {
       const result = await suppressInterestedLead(targets);
       expect(result.failures).toHaveLength(1);
       expect(result.failures[0]).toContain("instantly blocklist");
-      //The Attio listing before it and the HeyReach stop after it both still ran.
+      //The Attio listing before it and the Outfound and HeyReach channels after it all still ran.
       expect(result.outcomes.map((outcome) => outcome.status)).toEqual([
         "suppressed",
         "failed",
+        "suppressed",
         "suppressed",
       ]);
     } finally {
@@ -538,6 +556,7 @@ describe("suppressing an interested lead", () => {
       expect(result.failures).toEqual([]);
       expect(result.outcomes.map((outcome) => outcome.status)).toEqual([
         "suppressed",
+        "skipped",
         "skipped",
         "skipped",
       ]);

@@ -6,6 +6,9 @@ export const ATTIO_BASE = "https://api.attio.com/v2";
 export const AIRCALL_BASE = "https://api.aircall.io/v1";
 export const INSTANTLY_BASE = "https://api.instantly.ai/api/v2";
 export const HEYREACH_BASE = "https://api.heyreach.io/api/public";
+//Outfound is a private, undocumented-in-public API. The spec it is written against is served by the deployment
+//itself, at https://api.outfound.io/openapi-client.json (rendered at /scalar/client?org=sas).
+export const OUTFOUND_BASE = "https://api.outfound.io";
 
 export function supabaseBaseUrl(): string {
   const url = requiredEnv("SUPABASE_URL");
@@ -31,6 +34,10 @@ export function aircallAuthHeader(): string {
 
 export function instantlyAuthHeader(): string {
   return `Bearer ${requiredEnv("INSTANTLY_API_KEY")}`;
+}
+
+export function outfoundAuthHeader(): string {
+  return `Bearer ${requiredEnv("OUTFOUND_API_KEY")}`;
 }
 
 export function heyreachHeaders(): HeadersInit {
@@ -67,6 +74,7 @@ const CREDENTIAL_ENV_NAMES = {
   aircall: ["AIRCALL_API_ID", "AIRCALL_API_TOKEN"],
   instantly: ["INSTANTLY_API_KEY"],
   heyreach: ["HEYREACH_API_KEY"],
+  outfound: ["OUTFOUND_API_KEY"],
   supabase: ["SUPABASE_URL", "SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY)"],
 } as const;
 

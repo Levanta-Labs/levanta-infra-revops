@@ -1,5 +1,6 @@
 import { blockInstantlyLead } from "./instantly.js";
 import { stopLeadInActiveCampaigns } from "./heyreach.js";
+import { fetchOutfoundLead, markOutfoundThreadDnc } from "./outfound.js";
 
 //=============================================================================================================
 //The register of third-party platforms. Adding a fourth is meant to be an APPEND here plus its own extractor,
@@ -8,10 +9,11 @@ import { stopLeadInActiveCampaigns } from "./heyreach.js";
 //Two registers, because a platform sits on two independent axes and a given one may be on either, both, or
 //only one:
 //
-//  SOURCES      - platforms that can report a lead as interested. Aircall, Instantly, and HeyReach all do.
+//  SOURCES      - platforms that can report a lead as interested. Aircall, Instantly, HeyReach and Outfound
+//                 all do.
 //  SUPPRESSION  - outbound platforms that must stop contacting a lead once any source reports interest.
-//                 Instantly and HeyReach are here; Aircall is NOT, because it is a phone system with no
-//                 campaign or blocklist API and nothing to call.
+//                 Instantly, HeyReach and Outfound are here; Aircall is NOT, because it is a phone system with
+//                 no campaign or blocklist API and nothing to call.
 //
 //A new platform is added to whichever registers apply. Everything downstream is derived.
 //=============================================================================================================
@@ -33,6 +35,10 @@ const SOURCES = {
   aircall: { displayName: "Aircall" },
   instantly: { displayName: "Instantly" },
   heyreach: { displayName: "HeyReach" },
+  //Outfound is a warehouse over other sequencers rather than a sender of its own, so the emails it reports were
+  //sent elsewhere. It is a source in its own right here because the mail it carries is mail no other configured
+  //provider reads - see lib/outfound.ts.
+  outfound: { displayName: "Outfound" },
 } as const;
 
 /** Derived from SOURCES, so appending an entry there is what adds a provider - there is no second list. */
@@ -116,6 +122,24 @@ export const THIRD_PARTY_SUPPRESSION_CHANNELS: readonly SuppressionChannel[] = [
       }
       await blockInstantlyLead(targets.email);
       return { status: "suppressed" };
+    },
+  },
+  {
+    platform: "outfound DNC",
+    suppress: async (targets) => {
+      if (!targets.email) {
+        return { status: "skipped", reason: "the lead carried no email address to suppress" };
+      }
+      //Outfound has no "add this address to DNC" call - only "mark this thread DNC" - so a thread has to be
+      //found before anything can be suppressed. The lookup is keyed on the address and returns every thread the
+      //lead appears in; marking one with dnc_type "email" suppresses the address across all of them.
+      const lead = await fetchOutfoundLead(targets.email);
+      const threadHash = lead?.conversations[0]?.threadHash;
+      if (!threadHash) {
+        return { status: "skipped", reason: "Outfound holds no thread for this address to mark" };
+      }
+      await markOutfoundThreadDnc(threadHash, targets.email);
+      return { status: "suppressed", detail: `via thread ${threadHash}` };
     },
   },
   {

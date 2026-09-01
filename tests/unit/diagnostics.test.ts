@@ -111,6 +111,7 @@ describe("provider credential hints", () => {
   test("points at the responsible variables on 401 and 403", () => {
     expect(credentialHint("aircall", 401)).toContain("AIRCALL_API_ID");
     expect(credentialHint("attio", 403)).toContain("ATTIO_API_KEY");
+    expect(credentialHint("outfound", 401)).toContain("OUTFOUND_API_KEY");
     expect(combined()).toContain("[credential]");
   });
 

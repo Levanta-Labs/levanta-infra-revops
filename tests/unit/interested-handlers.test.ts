@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { POST as instantlyInterested } from "../../api/instantly-interested.js";
+import { POST as outfoundInterested } from "../../api/outfound-interested.js";
 import { historyNoteCalls, installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
 
 const envNames = [
@@ -7,6 +8,8 @@ const envNames = [
   "ATTIO_DEFAULT_DEAL_OWNER",
   "INSTANTLY_API_KEY",
   "INSTANTLY_WEBHOOK_SECRET",
+  "OUTFOUND_API_KEY",
+  "OUTFOUND_WEBHOOK_SECRET",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
@@ -15,6 +18,8 @@ beforeEach(() => {
   process.env.ATTIO_DEFAULT_DEAL_OWNER = "owner@example.com";
   process.env.INSTANTLY_API_KEY = "instantly-key";
   process.env.INSTANTLY_WEBHOOK_SECRET = "hook-secret";
+  process.env.OUTFOUND_API_KEY = "outfound-key";
+  process.env.OUTFOUND_WEBHOOK_SECRET = "hook-secret";
 });
 
 afterEach(() => {
@@ -67,6 +72,24 @@ function mockAttio(populated: Record<string, unknown>) {
     if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
     if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
     if (url.includes("api.heyreach.io")) return jsonResponse({ items: [], hasNextPage: false });
+    if (url.includes("/prospects/lookup/conversations")) {
+      return jsonResponse({
+        lead_email: "ada@example.com",
+        enrichment: {
+          title: "CTO",
+          person_linkedin: "https://www.linkedin.com/in/ada",
+          company: { company_name: "Engines Ltd", company_domain: "engines.example", headcount: "51-200" },
+        },
+        clients: [
+          {
+            recent_conversations: [
+              { id: "c1", thread_hash: "t1", conversation_type: "Received", subject: "Re: hello", body: "Yes, interested.", timestamp_email: "2026-08-19T11:00:00Z" },
+            ],
+          },
+        ],
+      });
+    }
+    if (url.includes("/mark-as-dnc")) return jsonResponse({ updated_count: 1 });
     throw new Error(`Unexpected fetch: ${url}`);
   });
 }
@@ -174,6 +197,153 @@ describe("interested webhook handlers", () => {
     try {
       await instantlyInterested(interestedRequest(leadInterested));
       expect(mock.calls.some((call) => call.input.includes("/lists/dnc/entries"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
+//=============================================================================================================
+//Outfound. The route deliberately has NO category filter - which categories fire is configured on Outfound's
+//side - so what is asserted here is that everything authenticated is recorded, whatever the category says.
+//=============================================================================================================
+
+function outfoundRequest(body: unknown, secret = "hook-secret"): Request {
+  return new Request("https://example.com/api/outfound-interested", {
+    method: "POST",
+    headers: { "x-webhook-secret": secret, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+const outfoundCategorised = {
+  event_type: "Interested",
+  lead_email: "ada@example.com",
+  first_name: "Ada",
+  last_name: "Lovelace",
+  company_name: "Engines Ltd",
+  campaign_name: "Q3 Outbound",
+  timestamp: "2026-08-19T11:00:00.000Z",
+};
+
+describe("outfound interested webhook", () => {
+  test("rejects a request whose secret does not match, before reading the body", async () => {
+    const response = await outfoundInterested(outfoundRequest(outfoundCategorised, "wrong"));
+    expect(response.status).toBe(401);
+  });
+
+  test("rejects a payload with no lead_email, which there is nothing to record without", async () => {
+    const mock = mockAttio({});
+    try {
+      const response = await outfoundInterested(outfoundRequest({ event_type: "Interested" }));
+      expect(response.status).toBe(500);
+      expect(((await response.json()) as { error: string }).error).toContain("lead_email");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //The point of the design: the category list lives on Outfound, so the route must not second-guess it.
+  test("records every category alike, including ones no code here has heard of", async () => {
+    for (const eventType of ["Interested", "Meeting Booked", "Refer Request", "Some Future Tag"]) {
+      const mock = mockAttio({});
+      try {
+        const response = await outfoundInterested(
+          outfoundRequest({ ...outfoundCategorised, event_type: eventType }),
+        );
+        expect(response.status).toBe(200);
+        expect(((await response.json()) as { success: boolean }).success).toBe(true);
+      } finally {
+        mock.restore();
+      }
+    }
+  });
+
+  test("records a lead whose payload carries no category at all", async () => {
+    const mock = mockAttio({});
+    try {
+      const { event_type: _eventType, ...withoutCategory } = outfoundCategorised;
+      const response = await outfoundInterested(outfoundRequest(withoutCategory));
+      expect(response.status).toBe(200);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("writes the Outfound lead source and dates the lead by Outfound's clock, not ours", async () => {
+    const mock = mockAttio({});
+    try {
+      await outfoundInterested(outfoundRequest(outfoundCategorised));
+      const patch = personPatches(mock.calls)[0];
+      const values = (JSON.parse(String(patch?.init?.body)) as { data: { values: Record<string, unknown> } }).data.values;
+      expect(values.lead_source).toBe("Outfound Cold Outreach - Automated");
+      //The webhook's own timestamp, not Date.now() - the warehouse lags by minutes.
+      expect(values.date_added).toBe("2026-08-19");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("notes the conversation history the lookup returned", async () => {
+    const mock = mockAttio({});
+    try {
+      await outfoundInterested(outfoundRequest(outfoundCategorised));
+      const notes = historyNoteCalls(mock.calls);
+      expect(notes.length).toBeGreaterThan(0);
+      const body = JSON.stringify(notes.map((note) => JSON.parse(String(note.init?.body))));
+      expect(body).toContain("Yes, interested.");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //[STABILITY] The category is deliberately confined to the Vercel log. The run transcript (lib/run-log.ts)
+  //mirrors console output onto the Person, Company and Deal, so a category logged inside the run scope would
+  //reach all three - which is exactly what was asked not to happen. This is what holds that line.
+  test("never writes the lead category to Attio, in any note or attribute", async () => {
+    const mock = mockAttio({});
+    try {
+      await outfoundInterested(
+        outfoundRequest({ ...outfoundCategorised, event_type: "Meeting Booked" }),
+      );
+      //Every request body the run sent to Attio - notes, patches, creates, and the run transcript alike.
+      const attioBodies = mock.calls
+        .filter((call) => call.input.includes("api.attio.com"))
+        .map((call) => String(call.init?.body ?? ""))
+        .join(" | ");
+      expect(attioBodies).not.toContain("Meeting Booked");
+      //The run transcript itself is present, so this is proving absence from a note that really was written.
+      expect(attioBodies).toContain("run logs for automated integration");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //[STABILITY] The lookup supplies both the enrichment and the note, so a failure costs both - but not the event.
+  test("still records the lead when the Outfound lookup fails", async () => {
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("/prospects/lookup/conversations")) return jsonResponse({ detail: "boom" }, 500);
+      const method = init?.method ?? "GET";
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ data: [{ id: { record_id: "person-1" }, values: {} }] });
+      }
+      if (url.includes("objects/companies/records/query")) return jsonResponse({ data: [] });
+      if (url.includes("objects/") && method === "PATCH") return jsonResponse({ data: {} });
+      if (url.includes("objects/companies/records")) {
+        return jsonResponse({ data: { id: { record_id: "company-1" }, values: { name: [{ value: "Engines Ltd" }] } } });
+      }
+      if (url.includes("objects/deals/records")) {
+        return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
+      }
+      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
+      if (url.includes("api.heyreach.io")) return jsonResponse({ items: [], hasNextPage: false });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await outfoundInterested(outfoundRequest(outfoundCategorised));
+      expect(response.status).toBe(200);
     } finally {
       mock.restore();
     }

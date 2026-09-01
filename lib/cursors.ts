@@ -15,6 +15,14 @@ const DEFAULT_LOOKBACK_MS = 10 * 60 * 1_000;
 //eventIdsAtTimestamp set is retained whenever the last processed event is newer than the parked value.
 export const CURSOR_GRACE_MS = 2 * 60 * 1_000;
 
+//[STABILITY] Outfound's margin, which has to be wider than everyone else's. The other providers publish an event
+//as they record it, so two minutes covers the gap between their clock and their API. Outfound does not: it is an
+//OLAP warehouse fed by a queue, refreshed on a cadence of about three minutes, so an email that has already
+//happened is routinely not yet readable. Parking at the shared two minutes would leave the mark ahead of emails
+//still in flight, and isAfterCursor would then reject them forever when they did land - a silent, permanent loss.
+//Five minutes is that cadence with room over it. Re-reading the margin is free; parking past it is not.
+export const OUTFOUND_CURSOR_GRACE_MS = 5 * 60 * 1_000;
+
 //Interface=====================================================================================================
 
 export interface SyncCursor {
