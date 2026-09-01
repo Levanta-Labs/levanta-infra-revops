@@ -6,7 +6,7 @@
 
 # Levanta RevOps Infrastructure
 
-Levanta RevOps infrastructure keeps Attio aligned with interested-lead and sales-touchpoint activity from Aircall, Instantly, and HeyReach.
+Levanta RevOps infrastructure keeps Attio aligned with interested-lead and sales-touchpoint activity from Aircall, Instantly, HeyReach, and Outfound.
 
 ## Quickstart
 
@@ -28,14 +28,15 @@ The Vercel functions handle two workflows:
 1. Interested events resolve an Attio Person, resolve or create their Company, ensure an Interested Deal exists,
    write source-history notes, fill blank attributes on all three records, and suppress the lead on every
    outbound platform.
-2. Cron jobs poll each provider for new touchpoints - Instantly and HeyReach every five minutes, Aircall every ten. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
+2. Cron jobs poll each provider for new touchpoints - Instantly, HeyReach and Outfound every five minutes, Aircall every ten. They process only People on the Master TAM list, increment the configured counters, mirror notes to associated Companies, and persist cursor progress in Supabase.
 
-The three syncs do not write the same records, by design:
+The four syncs do not write the same records, by design:
 
 | Sync | Person note | Person counter | Company note | Company counter |
 | --- | --- | --- | --- | --- |
 | Instantly | yes | yes | yes | yes |
 | HeyReach | yes | yes | yes | yes |
+| Outfound | yes | yes | yes | yes |
 | Aircall | **no** | yes | yes | yes |
 
 An Aircall touchpoint deliberately writes no Person note, because the call and its recording already live in Aircall
@@ -52,7 +53,7 @@ message history into a note. Everything after that is one code path:
 | --- | --- |
 | 1. Person | The provider's own lookup order, creating a Person from the lead when there is no match |
 | 2. Company | The Company already linked to the Person if there is one, else found by domain then by exact name, else created - but only when a name or domain exists to create it from |
-| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company> - Interested` |
+| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company>` - the deal carries no marker of how it was opened, because `lead_source` already does |
 | 4. Notes | The provider's rendered history, on the Person and on the Deal |
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
@@ -150,7 +151,13 @@ report first is how a lead ends up pitched twice. So every interested event, wha
 | --- | --- | --- |
 | Attio | Add the Person to the DNC list | the Person |
 | Instantly | Add the address to the workspace blocklist | an email address |
+| Outfound | Mark the address do-not-contact, which Outfound then syncs down to the sending platform | an email address Outfound holds a thread for |
 | HeyReach | Stop the lead in every campaign still able to message them | a LinkedIn profile URL |
+
+Outfound is keyed on a thread rather than an address, because it has no "block this address" endpoint - only
+"mark this thread DNC", with the entry then applying to the address across every thread. So the channel looks
+the lead up first, and an address Outfound holds no thread for reports itself as skipped. It marks the address,
+never the domain: a domain-wide block would suppress every colleague of the person who just showed interest.
 
 Aircall is absent because it is a phone system with no campaign or blocklist API - there is nothing there to
 call. Aircall dialling is governed by the Attio DNC list, which is why that is the first channel and the one
@@ -162,9 +169,11 @@ route's response body rather than raised, so an unreachable platform cannot fail
 recorded. A channel reporting `skipped` is not a failure - it means the lead is not present on that platform,
 usually for want of the one identifier it works by.
 
-### Adding a fourth platform
+### Adding another platform
 
 Provider support is a register, not a set of branches. Adding one is an append plus its own extractor:
+
+Outfound was the fourth, and went in exactly this way - one `SOURCES` entry, one module, one route, one cron.
 
 1. **`lib/providers.ts`** - add an entry to `SOURCES` with its `displayName`. That single entry widens the
    `Provider` type and derives both the note title (`<Name> Cold Outreach`) and the source string written to
@@ -185,21 +194,22 @@ Nothing in the Attio mapping, the write path, the company resolution, or the dea
 
 Only fields that exist on both sides are mapped. The providers are not equally rich:
 
-| Attio target | Aircall | Instantly | HeyReach |
-| --- | --- | --- | --- |
-| Person `name`, `email_addresses` | yes | yes | yes |
-| Person `phone_numbers` | yes | yes | - |
-| Person `linkedin` | - | yes | yes |
-| Person `job_title` | - | yes | yes |
-| Person `description` | yes | - | yes |
-| Person `location` | - | yes | yes |
-| Person `campaign_name`, `date_added`, `lead_source`, `company` | yes | yes | yes |
-| Company `name` | yes | yes | yes |
-| Company `domains`, `primary_location`, `employee_range`, `estimated_arr_usd` | - | yes | - |
-| Deal `lead_source`, `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes |
-| Deal `phone_number_7` | yes | yes | - |
-| Deal `linkedin` | - | yes | yes |
-| Deal `website`, `industry`, `employees`, `revenue` | - | yes | - |
+| Attio target | Aircall | Instantly | HeyReach | Outfound |
+| --- | --- | --- | --- | --- |
+| Person `name`, `email_addresses` | yes | yes | yes | yes |
+| Person `phone_numbers` | yes | yes | - | - |
+| Person `linkedin` | - | yes | yes | yes |
+| Person `job_title` | - | yes | yes | yes |
+| Person `description` | yes | - | yes | - |
+| Person `location` | - | yes | yes | country only |
+| Person `campaign_name`, `date_added`, `lead_source`, `company` | yes | yes | yes | yes |
+| Company `name` | yes | yes | yes | yes |
+| Company `domains`, `employee_range`, `estimated_arr_usd` | - | yes | - | yes |
+| Company `primary_location` | - | yes | - | - |
+| Deal `lead_source`, `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes | yes |
+| Deal `phone_number_7` | yes | yes | - | - |
+| Deal `linkedin` | - | yes | yes | yes |
+| Deal `website`, `industry`, `employees`, `revenue` | - | yes | - | yes |
 
 Aircall is the thinnest by a wide margin: no LinkedIn URL, job title, industry, headcount, or revenue exists
 anywhere in its API, and a name or company appears only when the dialled number was already in Aircall's address
@@ -214,14 +224,24 @@ the event is still recorded from the webhook body alone.
 HeyReach's enrichment is free. The route already fetches the conversation for the note, and every entry carries
 the correspondent's position, headline, location, company, and all three of HeyReach's email fields.
 
+Outfound is nearly as rich as Instantly and asks less to get there. Its webhook already carries the name, company,
+domain, job title, LinkedIn URL, website and industry, where Instantly's carries an address and little else; one
+lookup (`GET /prospects/lookup/conversations`) then adds seniority, headcount, revenue and the company's country
+*and* returns the correspondence the note is rendered from, so a single request does what Instantly needs two for.
+Two gaps: Outfound holds no phone number anywhere, and its only location is the company's country as an ISO
+alpha-2 code - which reads correctly as a Person location but is not a postal address, so no Company
+`primary_location` is written from it.
+
 ## Webhook and cron routes
 
 | Route | Source | Expected request |
 | --- | --- | --- |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields; the route reads the lead record back for enrichment |
+| `/api/outfound-interested` | Outfound | A Webhook Relay prospect payload carrying `lead_email`. **No event type is filtered on** - which lead categories fire the relay is configured on Outfound's side, so everything authenticated is recorded |
 | `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
 | `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every ten minutes (`*/10 * * * *`); also runs the interested workflow for any call whose completion falls in the window and already carries an `AIRCALL_INTERESTED_TAGS` tag |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
+| `/api/cron/outfound-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/heyreach-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 
 ### Aircall interested leads are found by polling, not by webhook
@@ -262,7 +282,7 @@ To get wide coverage without the duplicates, lengthen the cadence rather than th
 
 ### The run budget
 
-**All three syncs share this**, in `lib/run-budget.ts`. Each one is a sequential per-event loop that saves its cursor
+**All four syncs share this**, in `lib/run-budget.ts`. Each one is a sequential per-event loop that saves its cursor
 once, after the loop. A single touchpoint costs up to eight Attio requests, so throughput is roughly one event every
 three or four seconds - finite, and a backlog can exceed it. Left unguarded the run is killed by Vercel at
 `maxDuration`, and the kill lands *before* `saveSyncCursor`, so the run records **no progress at all**: the next run
@@ -276,16 +296,34 @@ budget stop:
 - The park at `now - CURSOR_GRACE_MS` is **skipped**, because the events the loop never reached have not been dealt
   with and must stay above the mark.
 - The response carries `truncated: true` and a count of what is left (`callsRemaining` / `emailsRemaining` /
-  `messagesRemaining`), and the run logs a `[run] ... STOPPED` warning. The HTTP status stays 200 - a partial run is
-  a success, not a failure. The Aircall sync additionally reports `stopReason`, since it can also stop on a throttle.
+  `messagesRemaining` / `threadsRemaining`), and the run logs a `[run] ... STOPPED` warning. The HTTP status stays 200 - a partial run is
+  a success, not a failure. The Aircall and Outfound syncs additionally report `stopReason`, since both can also
+  stop on a throttle.
 
-Aircall reached the limit first, on volume; the other two have the identical shape and so the identical risk. HeyReach
-is arguably the most exposed of the three - see the `[PERF]` note on its handler, where cost grows through the UTC day
+Aircall reached the limit first, on volume; the others have the identical shape and so the identical risk. HeyReach
+is the most exposed on steady state - see the `[PERF]` note on its handler, where cost grows through the UTC day
 because every run re-reads every conversation touched since midnight.
+
+**Outfound budgets one step earlier than the others.** Everywhere else the provider fetch is a bounded number of
+pages and only the write loop needs guarding. Outfound's inbox lists threads *without* message bodies, so expanding
+a window into emails costs one request per thread - and a wide window (a first run, or a deliberately backfilled
+cursor) can spend the whole of `maxDuration` in that expansion alone, before a single event is written. So its
+budget opens before the expansion and stops that too. A run ending there reports `threadsExpanded` short of
+`threadsScanned` plus a `threadsRemaining` count, and - critically - still refuses to park the cursor: the threads
+it never opened hold emails it never saw, and parking would claim otherwise and skip them permanently.
+
+**Outfound also stops on a throttle** (`stopReason: "throttled"`), as the Aircall sync does. This matters more here
+than the raw request count suggests, because **the dashboard's headline rate limit is not the one that applies**.
+The Integrations screen labels the client key `100K/hr`; that is the *organization* ceiling. `GET /rate-limit`
+reports what the key itself gets, and the key in use is on the `standard` tier: **9/second, 3,000/hour**. Against a
+five-minute cadence that is roughly 250 threads per run before Outfound starts refusing, which a backlog reaches
+easily. A throttled thread wrote nothing and the cursor never passed it, so the run stops and defers rather than
+marching through the remaining backlog collecting one refusal per thread. Repeated `stopReason: "throttled"` means
+the key needs a higher tier, not a longer budget.
 
 A single truncated run is normal while a backlog drains. Truncation run after run means events arrive faster than
 they are processed. Each sync takes its own override - `AIRCALL_SYNC_BUDGET_MS`, `INSTANTLY_SYNC_BUDGET_MS`,
-`HEYREACH_SYNC_BUDGET_MS` - for retuning against a live backlog without a redeploy; a malformed value falls back to
+`HEYREACH_SYNC_BUDGET_MS`, `OUTFOUND_SYNC_BUDGET_MS` - for retuning against a live backlog without a redeploy; a malformed value falls back to
 the default rather than failing the run.
 
 > **The cadence must exceed the budget.** A run may legitimately take the whole 240s, and nothing guards against two
@@ -372,10 +410,17 @@ counters from being written, or the reverse. It needs `ATTIO_DEFAULT_DEAL_OWNER`
 latter is read before any network call, so a missing or empty list fails the run without first paying for the fetch.
 
 Both interested webhooks are configured directly in the provider, pointed at the production host
-`https://levanta-crm-overhaul.vercel.app`. Instantly and HeyReach authenticate with an `x-webhook-secret` custom
-header whose value must match the corresponding environment variable. Point providers at the production hostname,
+`https://levanta-crm-overhaul.vercel.app`. Instantly, HeyReach and Outfound authenticate with an `x-webhook-secret`
+custom header whose value must match the corresponding environment variable. Point providers at the production hostname,
 never at a deployment-specific URL, which is pinned to a single deployment. Any Aircall webhook still pointed at
 this project should be removed in Aircall: the route no longer exists and every delivery will 404.
+
+Outfound is a private API with no public documentation; the integration is written against the OpenAPI spec the
+deployment serves itself, at `https://api.outfound.io/openapi-client.json` (rendered at `/scalar/client?org=sas`).
+Its reads are slower than the other providers' - the DNC list takes about two seconds even at `page_size=1` - so the
+Outfound smoke tests carry a longer timeout than the suite default.
+Its webhook auth header is one *we* configure - the Webhook Relay lets arbitrary headers be set per endpoint - so
+`x-webhook-secret` is set there by hand rather than being a name Outfound chose.
 
 The HeyReach integration uses `GetConversationsV3` cursor pagination and the current `GetCampaignsForLead` and `StopLeadInCampaign` endpoints.
 
@@ -400,29 +445,34 @@ Keep credentials in `.env.local` for local development and configure the same va
 | `ATTIO_COMPANY_AIRCALL_COUNTER_SLUG` | Company counter slug for Aircall calls |
 | `ATTIO_COMPANY_INSTANTLY_COUNTER_SLUG` | Company counter slug for Instantly emails |
 | `ATTIO_COMPANY_HEYREACH_COUNTER_SLUG` | Company counter slug for HeyReach DMs |
+| `ATTIO_PERSON_OUTFOUND_COUNTER_SLUG` | Person counter slug for Outfound emails. Set to the same slug as the Instantly one: both count email touchpoints, on different mail |
+| `ATTIO_COMPANY_OUTFOUND_COUNTER_SLUG` | Company counter slug for Outfound emails, likewise |
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
-| `AIRCALL_SYNC_BUDGET_MS` / `INSTANTLY_SYNC_BUDGET_MS` / `HEYREACH_SYNC_BUDGET_MS` | Optional, one per sync. Milliseconds that sync's loop may run before it stops and saves its place; each defaults to 240000. See [The run budget](#the-run-budget) |
+| `AIRCALL_SYNC_BUDGET_MS` / `INSTANTLY_SYNC_BUDGET_MS` / `HEYREACH_SYNC_BUDGET_MS` / `OUTFOUND_SYNC_BUDGET_MS` | Optional, one per sync. Milliseconds that sync's loop may run before it stops and saves its place; each defaults to 240000. See [The run budget](#the-run-budget) |
 | `INSTANTLY_API_KEY` | Instantly v2 API key; needs to read emails and leads, and to write blocklist entries |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key; needs to read conversations and to stop leads in campaigns |
 | `HEYREACH_WEBHOOK_SECRET` | Secret configured on the HeyReach webhook as the `x-webhook-secret` custom header |
+| `OUTFOUND_API_KEY` | Outfound client API key, prefix included; needs to read the inbox and prospects, and to write DNC entries |
+| `OUTFOUND_WEBHOOK_SECRET` | Secret configured on the Outfound Webhook Relay as the `x-webhook-secret` custom header |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Server-side Supabase secret key; never expose it to a client |
 | `CRON_SECRET` | Vercel Cron authorization secret |
 
 Legacy Supabase JWT projects may use `SUPABASE_SERVICE_ROLE_KEY` instead of `SUPABASE_SECRET_KEY`.
 
-A fourth provider adds two more counter-slug variables, named from its provider key - see
-[Adding a fourth platform](#adding-a-fourth-platform).
+A further provider adds two more counter-slug variables, named from its provider key - see
+[Adding another platform](#adding-another-platform).
 
 ## Cursor persistence
 
-All three syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted with these stable keys:
+All four syncs use `Attio_Integrations_Touchpoint_Cursors` instead of process memory. Rows are upserted with these stable keys:
 
 - `aircall-touchpoints`
 - `instantly-touchpoints`
 - `heyreach-touchpoints`
+- `outfound-touchpoints`
 
 `cursor_timestamp` is the completed high-water mark. `cursor_value` contains a JSON array of event IDs at that exact timestamp, preventing events with identical timestamps from being lost or replayed. A missing row starts with a ten-minute lookback and is created automatically. `last_updated_at` is refreshed on every upsert.
 
@@ -431,6 +481,12 @@ are generated on the provider's clock and become readable through its API some t
 own `Date.now()` silently skipped anything landing in that gap. Re-reading two minutes costs nothing, because
 `isAfterCursor` rejects the overlap - and when the newest handled event is more recent than the parked value the
 cursor is left untouched, so its boundary ID set survives and that event is not replayed.
+
+**Outfound parks five minutes back instead of two** (`OUTFOUND_CURSOR_GRACE_MS`). The other providers publish an
+event as they record it, so two minutes covers the gap between their clock and their API. Outfound does not: it is
+an OLAP warehouse fed by a queue and refreshed on a cadence of about three minutes, so an email that has already
+happened is routinely not yet readable. Parking at the shared two minutes would leave the mark ahead of emails
+still in flight, and `isAfterCursor` would then reject them for good when they did land - a silent, permanent loss.
 
 ### A touchpoint that fails partway through
 
@@ -524,9 +580,11 @@ it was meant to check.
 Live tests do not create, update, stop, or delete anything, and they do not print returned account data. They cover
 two kinds of failure:
 
-- **Credentials.** One small page is read from Supabase, Attio, Aircall, Instantly, and HeyReach, which proves each
-  key is accepted.
-- **Schema and configuration.** All six counter slugs are checked against the live Attio attribute list for the
+- **Credentials.** One small page is read from Supabase, Attio, Aircall, Instantly, HeyReach, and Outfound, which
+  proves each key is accepted. The Outfound checks also read its DNC list, so the suppression channel is known to
+  have somewhere to write, and its `/rate-limit` endpoint, which reports the tier the touchpoint sync is spending
+  one request per thread against.
+- **Schema and configuration.** All eight counter slugs are checked against the live Attio attribute list for the
   people and companies objects, both list slugs against the workspace's lists, and `ATTIO_DEFAULT_DEAL_OWNER`
   against the workspace members. A wrong slug or a renamed list is caught here rather than on the first touchpoint
   that happens to reach it in production. `CRON_SECRET` and the three webhook secrets are checked for presence,
@@ -534,14 +592,14 @@ two kinds of failure:
 
 ## Deployment
 
-`vercel.json` selects Vercel's Bun `1.x` runtime and schedules the Instantly and HeyReach syncs every five minutes and the Aircall sync every ten (`*/10 * * * *`). Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
+`vercel.json` selects Vercel's Bun `1.x` runtime and schedules the Instantly, HeyReach and Outfound syncs every five minutes and the Aircall sync every ten (`*/10 * * * *`). Vercel also detects `bun.lock`, so dependency installation uses Bun rather than npm.
 
 Every function under `api/` is given `maxDuration: 300`. One touchpoint is up to eight sequential Attio requests and
 the work is unbounded by design, so at the platform default a busy window could be cut off mid-event, leaving a note
 written and its counter not. Three hundred seconds is the Pro ceiling; the project already exceeds Hobby's cron
 limits, so it cannot be running there.
 
-`maxDuration` is a backstop, not a plan. All three syncs stop themselves at `DEFAULT_RUN_BUDGET_MS` (240s) and save
+`maxDuration` is a backstop, not a plan. All four syncs stop themselves at `DEFAULT_RUN_BUDGET_MS` (240s) and save
 their cursor, because being killed at `maxDuration` discards the run entirely - see [The run budget](#the-run-budget).
 Raise `maxDuration` before raising that budget, never the other way round.
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.js";
 import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.js";
 import { GET as instantlySync } from "../../api/cron/instantly-touchpoint-sync.js";
+import { GET as outfoundSync } from "../../api/cron/outfound-touchpoint-sync.js";
 import { historyNoteCalls, installFetchMock, jsonResponse } from "./test-utils.js";
 
 const envNames = [
@@ -22,6 +23,10 @@ const envNames = [
   "AIRCALL_SYNC_BUDGET_MS",
   "INSTANTLY_SYNC_BUDGET_MS",
   "HEYREACH_SYNC_BUDGET_MS",
+  "OUTFOUND_API_KEY",
+  "ATTIO_PERSON_OUTFOUND_COUNTER_SLUG",
+  "ATTIO_COMPANY_OUTFOUND_COUNTER_SLUG",
+  "OUTFOUND_SYNC_BUDGET_MS",
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
@@ -40,6 +45,10 @@ beforeEach(() => {
   process.env.ATTIO_PERSON_INSTANTLY_COUNTER_SLUG = "number_of_emails";
   process.env.ATTIO_PERSON_HEYREACH_COUNTER_SLUG = "number_of_dms";
   process.env.ATTIO_COMPANY_AIRCALL_COUNTER_SLUG = "number_of_calls";
+  process.env.OUTFOUND_API_KEY = "outfound-key";
+  //Outfound reuses the Instantly email counters: both are email touchpoints, on different mail.
+  process.env.ATTIO_PERSON_OUTFOUND_COUNTER_SLUG = "number_of_emails";
+  process.env.ATTIO_COMPANY_OUTFOUND_COUNTER_SLUG = "number_of_emails";
 });
 
 afterEach(() => {
@@ -692,6 +701,212 @@ describe("cron handlers", () => {
       expect(body).toMatchObject({ success: true, truncated: true, processed: 0, emailsRemaining: 2 });
       //Not parked at now: the emails the loop never reached must stay above the mark.
       expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Outfound completes an empty read window and persists its high-water mark", async () => {
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      return jsonResponse({ items: [], next_cursor: null });
+    });
+    try {
+      const response = await outfoundSync(cronRequest());
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ success: true, threadsScanned: 0, emailsFound: 0 });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //The inbox lists threads without bodies, so every thread costs a second request. This is that expansion.
+  test("Outfound expands each thread into its own emails and counts them individually", async () => {
+    const sentAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "outfound-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("/emails")) {
+        return jsonResponse({
+          items: [
+            { id: "email-1", sender: "rep@x.com", recipient: "ada@example.com", subject: "Hi", body_plain: "one", sent_at: sentAt, type: "Sent" },
+            { id: "email-2", sender: "ada@example.com", recipient: "rep@x.com", subject: "Re: Hi", body_plain: "two", sent_at: sentAt, type: "Received" },
+            //Neither of these has happened, so neither is a touchpoint.
+            { id: "email-3", sender: "rep@x.com", recipient: "ada@example.com", subject: "Later", body_plain: "three", sent_at: sentAt, type: "Scheduled" },
+            { id: "email-4", sender: "rep@x.com", recipient: "ada@example.com", subject: "Nope", body_plain: "four", sent_at: sentAt, type: "Failed" },
+          ],
+        });
+      }
+      if (url.includes("/email-inbox/threads")) {
+        return jsonResponse({
+          items: [{ thread_hash: "thread-1", prospect_lead_email: "ada@example.com", last_email_timestamp: sentAt }],
+          next_cursor: null,
+        });
+      }
+      //No Attio person has the address, so the run reaches the counting gate and stops there.
+      if (url.includes("objects/people/records/query")) return jsonResponse({ data: [] });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await outfoundSync(cronRequest());
+      expect(response.status).toBe(200);
+      //Two of the four: Scheduled and Failed are not traffic that happened.
+      expect(await response.json()).toMatchObject({ success: true, threadsScanned: 1, emailsFound: 2, skipped: 2 });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //[STABILITY] A thread that cannot be read is reported but must not cost the window, and the cursor never
+  //passed it, so it is retried next run - unlike a failed EMAIL, which is passed over for good.
+  test("Outfound passes over a thread whose messages cannot be read", async () => {
+    const sentAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      if (url.includes("/emails")) return jsonResponse({ detail: "boom" }, 500);
+      if (url.includes("/email-inbox/threads")) {
+        return jsonResponse({
+          items: [{ thread_hash: "thread-1", prospect_lead_email: "ada@example.com", last_email_timestamp: sentAt }],
+          next_cursor: null,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await outfoundSync(cronRequest());
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toMatchObject({ success: false, threadsScanned: 1, emailsFound: 0, failed: 1 });
+      expect(String(body.errors[0])).toContain("thread-1");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //[STABILITY] Unique to this sync: the expansion is one request per thread, so the budget has to stop it too.
+  //A run killed inside an unbudgeted expansion would save no cursor at all and redo the same window forever.
+  test("Outfound stops inside the thread expansion and refuses to park the cursor", async () => {
+    process.env.OUTFOUND_SYNC_BUDGET_MS = "2";
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const sentAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const mock = installFetchMock(async (url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "outfound-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      //Real elapsed time, because the budget is wall-clock and every other mock here answers instantly.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return jsonResponse({
+        items: [{ thread_hash: "thread-1", prospect_lead_email: "ada@example.com", last_email_timestamp: sentAt }],
+        next_cursor: null,
+      });
+    });
+    try {
+      const response = await outfoundSync(cronRequest());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      //Nothing was expanded, so nothing was even seen - and the cursor must not claim otherwise.
+      expect(body).toMatchObject({ success: true, truncated: true, stopReason: "budget", threadsScanned: 1, threadsExpanded: 0, threadsRemaining: 1 });
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //[STABILITY] The Outfound client key is rate-limited per key, not per organization - the dashboard's headline
+  //number is the org ceiling. Throttling is therefore a normal condition on a backlog, and the run must stop on
+  //it rather than spend the rest of the window on requests that will also be refused.
+  test("Outfound stops when throttled instead of marching through the rest of the backlog", async () => {
+    const sentAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    let threadReads = 0;
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "outfound-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("/emails")) {
+        threadReads += 1;
+        return jsonResponse({ detail: "rate limit exceeded" }, 429);
+      }
+      if (url.includes("/email-inbox/threads")) {
+        return jsonResponse({
+          items: [1, 2, 3, 4, 5].map((id) => ({
+            thread_hash: `thread-${id}`,
+            prospect_lead_email: `lead${id}@example.com`,
+            last_email_timestamp: sentAt,
+          })),
+          next_cursor: null,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await outfoundSync(cronRequest());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ success: true, truncated: true, stopReason: "throttled", threadsRemaining: 5 });
+      //The whole point: it gave up after the FIRST refusal rather than trying all five.
+      expect(threadReads).toBe(1);
+      //A throttled thread wrote nothing, so it is not a failure - it is work deferred.
+      expect(body.failed).toBe(0);
+      //And the cursor must not be parked, or the four unopened threads would be skipped for good.
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Outfound stops on the run budget and leaves the cursor where the loop reached", async () => {
+    process.env.OUTFOUND_SYNC_BUDGET_MS = "30";
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const sentAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const mock = installFetchMock(async (url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "outfound-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      //The reads are instant, so the expansion finishes inside the budget and the LOOP is what overruns.
+      if (url.includes("/emails")) {
+        return jsonResponse({
+          items: [1, 2].map((id) => ({
+            id: `email-${id}`,
+            sender: "rep@x.com",
+            recipient: "ada@example.com",
+            subject: "Hi",
+            body_plain: "body",
+            sent_at: sentAt,
+            type: "Sent",
+          })),
+        });
+      }
+      if (url.includes("/email-inbox/threads")) {
+        return jsonResponse({
+          items: [{ thread_hash: "thread-1", prospect_lead_email: "ada@example.com", last_email_timestamp: sentAt }],
+          next_cursor: null,
+        });
+      }
+      //Real elapsed time, spent per event, so the budget expires partway through the loop.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      if (url.includes("objects/people/records/query")) return jsonResponse({ data: [] });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await outfoundSync(cronRequest());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      //Both threads expanded, but the loop only got through one of the two emails.
+      expect(body).toMatchObject({ success: true, truncated: true, stopReason: "budget", threadsExpanded: 1, emailsFound: 2, emailsRemaining: 1 });
+      //Left where the loop reached - past the email it handled, so that one is not replayed - and NOT parked at
+      //now, so the email it never reached stays above the mark and is picked up next run.
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(sentAt));
+      expect(Date.parse(body.cursorTimestamp)).toBeGreaterThan(Date.parse(cursorSavedAt));
+      expect(Date.parse(body.cursorTimestamp)).toBeLessThan(Date.now() - 60 * 1000);
     } finally {
       mock.restore();
     }

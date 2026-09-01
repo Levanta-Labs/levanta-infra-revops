@@ -23,10 +23,11 @@ import {
   toEmployeeRange,
 } from "../../lib/interested.js";
 import { arrayValue, isJsonObject, responseJson, stringValue } from "../../lib/json.js";
+import { OUTFOUND_BASE, outfoundAuthHeader } from "../../lib/endpoints.js";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
 
-const PROVIDERS: readonly Provider[] = ["aircall", "instantly", "heyreach"];
+const PROVIDERS: readonly Provider[] = ["aircall", "instantly", "heyreach", "outfound"];
 
 async function expectOk(label: string, response: Response): Promise<void> {
   if (!response.ok) {
@@ -266,6 +267,98 @@ liveTest("the Interested deal stage exists", async () => {
 //Reads only. Whether a WRITE is permitted cannot be proven without making one, and a blocklist entry is not
 //something a smoke test should leave behind.
 //---------------------------------------------------------------------------------------------------------
+//[PERF] Outfound's reads are slower than the other providers' - see the DNC note below - so every Outfound
+//smoke test that can be slow is given this rather than the 5s default.
+const OUTFOUND_TIMEOUT_MS = 20_000;
+
+liveTest("reads one Outfound inbox page", async () => {
+  await expectOk(
+    "Outfound",
+    await fetch(`${OUTFOUND_BASE}/email-inbox/threads?limit=1`, {
+      headers: { Authorization: outfoundAuthHeader() },
+    }),
+  );
+});
+
+//The DNC list is the read half of Outfound's suppression channel. As with Instantly's blocklist below, whether
+//the WRITE is permitted cannot be proven without making one, and a DNC entry is not something a smoke test
+//should leave behind on a real prospect.
+//[PERF] Given a longer timeout than the default. This endpoint answers in about two seconds even at page_size=1,
+//which is close enough to the 5s default to flake - and a smoke test that fails intermittently teaches people to
+//ignore it, which is worse than not having it.
+liveTest(
+  "the Outfound DNC list is readable, so suppression has somewhere to write",
+  async () => {
+    await expectOk(
+      "Outfound DNC",
+      await fetch(`${OUTFOUND_BASE}/dnc?page_size=1`, {
+        headers: { Authorization: outfoundAuthHeader() },
+      }),
+    );
+  },
+  OUTFOUND_TIMEOUT_MS,
+);
+
+//---------------------------------------------------------------------------------------------------------
+//The second half of every touchpoint read, and a DIFFERENT endpoint from the listing above. The inbox lists
+//threads without message bodies, so the sync fetches each thread's messages separately - a key scoped to list
+//the inbox but not to open a thread would pass the test above and still sync nothing at all.
+//Chained rather than given a fixed hash, because a thread hash is workspace data and cannot be hardcoded. A
+//workspace with no threads at all has nothing to prove here, so the read is skipped rather than failed.
+//---------------------------------------------------------------------------------------------------------
+liveTest(
+  "reads the messages inside an Outfound thread, which the touchpoint sync depends on",
+  async () => {
+    const listing = await fetch(`${OUTFOUND_BASE}/email-inbox/threads?limit=1`, {
+      headers: { Authorization: outfoundAuthHeader() },
+    });
+    await expectOk("Outfound", listing);
+    const body = await responseJson(listing);
+    const first = isJsonObject(body) ? arrayValue(body, "items")[0] : null;
+    const threadHash = isJsonObject(first) ? stringValue(first.thread_hash) : null;
+    if (!threadHash) {
+      console.log("[live] Outfound holds no threads, so there is none to open - nothing to verify here");
+      return;
+    }
+    await expectOk(
+      "Outfound thread emails",
+      await fetch(`${OUTFOUND_BASE}/email-inbox/threads/${encodeURIComponent(threadHash)}/emails`, {
+        headers: { Authorization: outfoundAuthHeader() },
+      }),
+    );
+  },
+  OUTFOUND_TIMEOUT_MS,
+);
+
+//---------------------------------------------------------------------------------------------------------
+//The interested route's single enrichment call, and the one endpoint whose failure is INVISIBLE in production:
+//enrichFromOutfound swallows a failure by design, so a key that cannot read prospects still records every
+//interested lead - just stripped of job title, headcount and revenue, and with an empty history note. Nothing
+//in the response says so. This is the check that catches it.
+//A deliverable-looking address that matches nobody is the point: what is being proven is that the endpoint
+//answers, not that any particular lead exists.
+//---------------------------------------------------------------------------------------------------------
+liveTest("the Outfound prospect lookup is readable, so an interested lead can be enriched", async () => {
+  await expectOk(
+    "Outfound prospects",
+    await fetch(
+      `${OUTFOUND_BASE}/prospects/lookup/conversations?email=${encodeURIComponent("nobody@example.invalid")}`,
+      { headers: { Authorization: outfoundAuthHeader() } },
+    ),
+  );
+});
+
+//[PERF] The key's rate-limit tier, which the touchpoint sync spends one request per thread against. A read of
+//this costs one request itself, and is the one call that says how much headroom the sync actually has.
+liveTest("reports the Outfound rate-limit tier the sync is running under", async () => {
+  await expectOk(
+    "Outfound rate limit",
+    await fetch(`${OUTFOUND_BASE}/rate-limit`, {
+      headers: { Authorization: outfoundAuthHeader() },
+    }),
+  );
+});
+
 liveTest("the Instantly blocklist is readable, so suppression has somewhere to write", async () => {
   await expectOk(
     "Instantly blocklist",
@@ -292,7 +385,7 @@ liveTest("the Instantly lead record is readable, so an interested lead can be en
 //=============================================================================================================
 
 liveTest("the request-verification secrets are configured", () => {
-  const missing = ["CRON_SECRET", "INSTANTLY_WEBHOOK_SECRET", "HEYREACH_WEBHOOK_SECRET"]
+  const missing = ["CRON_SECRET", "INSTANTLY_WEBHOOK_SECRET", "HEYREACH_WEBHOOK_SECRET", "OUTFOUND_WEBHOOK_SECRET"]
     .filter((name) => optionalEnv(name) === null);
   if (missing.length > 0) {
     throw new Error(`Not configured, so the matching routes will reject every request: ${missing.join(", ")}`);

@@ -9,6 +9,13 @@ import {
   stopLeadInActiveCampaigns,
 } from "../../lib/heyreach.js";
 import { fetchInstantlyEmails, parseInstantlyEmail } from "../../lib/instantly.js";
+import {
+  fetchOutfoundLead,
+  fetchOutfoundThreadEmails,
+  fetchOutfoundThreads,
+  parseOutfoundEmail,
+  parseOutfoundLead,
+} from "../../lib/outfound.js";
 import { installFetchMock, jsonResponse } from "./test-utils.js";
 
 const originalEnv = { ...process.env };
@@ -18,10 +25,11 @@ beforeEach(() => {
   process.env.AIRCALL_API_TOKEN = "token";
   process.env.INSTANTLY_API_KEY = "instantly";
   process.env.HEYREACH_API_KEY = "heyreach";
+  process.env.OUTFOUND_API_KEY = "outfound";
 });
 
 afterEach(() => {
-  for (const name of ["AIRCALL_API_ID", "AIRCALL_API_TOKEN", "INSTANTLY_API_KEY", "HEYREACH_API_KEY"]) {
+  for (const name of ["AIRCALL_API_ID", "AIRCALL_API_TOKEN", "INSTANTLY_API_KEY", "HEYREACH_API_KEY", "OUTFOUND_API_KEY"]) {
     const value = originalEnv[name];
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -243,6 +251,150 @@ describe("HeyReach client", () => {
         leadMemberId: null,
         leadUrl: "https://linkedin.com/in/ada",
       });
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
+//=============================================================================================================
+//Outfound. The shapes below are taken from the deployment's own OpenAPI spec
+//(https://api.outfound.io/openapi-client.json), not invented.
+//=============================================================================================================
+
+const outfoundThread = {
+  thread_hash: "thread-1",
+  prospect_lead_email: "ada@example.com",
+  prospect_first_name: "Ada",
+  prospect_last_name: "Lovelace",
+  campaign_name: "Q3 Outbound",
+  last_email_timestamp: "2026-08-19T11:54:36.149Z",
+  lead_category_name: "Interested",
+  lead_category_sentiment: "positive",
+};
+
+const outfoundEmail = {
+  id: "email-1",
+  sender: "rep@levantalabs.com",
+  recipient: "ada@example.com",
+  subject: "Quick question",
+  body_plain: "Are you the right person?",
+  body_html: "<p>Are you the right person?</p>",
+  sent_at: "2026-08-19T11:54:36.149Z",
+  created_at: "2026-08-19T11:54:40.000Z",
+  type: "Sent",
+};
+
+describe("Outfound client", () => {
+  test("reads an email, preferring the plain body and the send time", () => {
+    expect(parseOutfoundEmail(outfoundEmail, "thread-1")).toMatchObject({
+      id: "email-1",
+      threadHash: "thread-1",
+      emailType: "Sent",
+      subject: "Quick question",
+      //body_html is deliberately dropped: a note is read as prose, not markup.
+      bodyText: "Are you the right person?",
+      //sent_at, not created_at - the warehouse records an email some time after it was sent.
+      sentAt: "2026-08-19T11:54:36.149Z",
+    });
+  });
+
+  test("falls back to created_at when an email carries no send time", () => {
+    const { sent_at: _sentAt, ...withoutSentAt } = outfoundEmail;
+    expect(parseOutfoundEmail(withoutSentAt, "thread-1").sentAt).toBe("2026-08-19T11:54:40.000Z");
+  });
+
+  test("rejects an email with no id, rather than counting it under a blank key", () => {
+    expect(() => parseOutfoundEmail({ ...outfoundEmail, id: null }, "thread-1")).toThrow(/missing id/);
+  });
+
+  test("reads an unrecognised email type as unknown rather than guessing", () => {
+    expect(parseOutfoundEmail({ ...outfoundEmail, type: "Bounced" }, "thread-1").emailType).toBe("unknown");
+  });
+
+  test("follows the thread cursor and bounds the window on the email timestamp", async () => {
+    const mock = installFetchMock((_url, _init, index) =>
+      index === 0
+        ? jsonResponse({ items: [outfoundThread], next_cursor: "next" })
+        : jsonResponse({ items: [], next_cursor: null }),
+    );
+    try {
+      const threads = await fetchOutfoundThreads({
+        fromMs: Date.parse("2026-08-19T11:00:00.000Z"),
+        toMs: Date.parse("2026-08-19T12:00:00.000Z"),
+      });
+      expect(threads).toHaveLength(1);
+      expect(threads[0]?.threadHash).toBe("thread-1");
+      expect(mock.calls).toHaveLength(2);
+      //One millisecond back, so an email sitting exactly on the cursor is still returned.
+      expect(mock.calls[0]?.input).toContain("email_start_date=2026-08-19T10%3A59%3A59.999Z");
+      expect(mock.calls[0]?.input).toContain("email_end_date=2026-08-19T12%3A00%3A00.000Z");
+      expect(mock.calls[1]?.input).toContain("cursor=next");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("reads a thread's messages, tagging each with the thread it came from", async () => {
+    const mock = installFetchMock(() => jsonResponse({ items: [outfoundEmail] }));
+    try {
+      const emails = await fetchOutfoundThreadEmails("thread-1");
+      expect(emails).toHaveLength(1);
+      expect(emails[0]?.threadHash).toBe("thread-1");
+      expect(mock.calls[0]?.input).toContain("/email-inbox/threads/thread-1/emails");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("flattens enrichment and conversations across every client the lead was worked by", () => {
+    const lead = parseOutfoundLead({
+      lead_email: "ada@example.com",
+      enrichment: {
+        first_name: "Ada",
+        title: "CTO",
+        seniority: "c_suite",
+        person_linkedin: "https://www.linkedin.com/in/ada",
+        company: {
+          company_name: "Analytical Engines",
+          company_domain: "engines.example",
+          location: "GB",
+          industry: "Software",
+          headcount: "51-200",
+          revenue: "10M",
+        },
+      },
+      clients: [
+        { recent_conversations: [{ id: "c1", thread_hash: "t1", timestamp_email: "2026-08-19T10:00:00Z" }] },
+        { recent_conversations: [{ id: "c2", thread_hash: "t2", timestamp_email: "2026-08-19T11:00:00Z" }] },
+      ],
+    });
+    expect(lead).toMatchObject({
+      email: "ada@example.com",
+      jobTitle: "CTO",
+      linkedin: "https://www.linkedin.com/in/ada",
+      companyDomain: "engines.example",
+      headcount: "51-200",
+      revenue: "10M",
+    });
+    //Both clients' threads, not just the first group's.
+    expect(lead.conversations.map((conversation) => conversation.threadHash)).toEqual(["t1", "t2"]);
+  });
+
+  //[STABILITY] Enrichment is best-effort everywhere it is used, so "no such lead" must be null, not a throw.
+  test("returns null for an address Outfound has never seen", async () => {
+    const mock = installFetchMock(() => jsonResponse({ clients: [], total_clients_contacted: 0 }));
+    try {
+      expect(await fetchOutfoundLead("nobody@example.com")).toBeNull();
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("names OUTFOUND_API_KEY when Outfound rejects the credential", async () => {
+    const mock = installFetchMock(() => jsonResponse({ detail: "nope" }, 401));
+    try {
+      await expect(fetchOutfoundThreadEmails("thread-1")).rejects.toThrow(/OUTFOUND_API_KEY/);
     } finally {
       mock.restore();
     }
