@@ -1,19 +1,22 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createNote, fetchRecord, type AttioPerson, type AttioRecord } from "./attio.js";
-import { arrayValue, errorMessage, isJsonObject, numberValue, stringValue } from "./json.js";
+import { createNote, type AttioObject, type AttioRecord } from "./attio.js";
+import { arrayValue, errorMessage, isJsonObject, numberValue, stringValue, type JsonObject } from "./json.js";
 import { providerDisplayName, type Provider } from "./providers.js";
 
 //=============================================================================================================
-//A transcript of one interested run, written back to the Person it was about.
+//A transcript of one interested run, written back to every record it touched.
 //
 //WHY THIS EXISTS. Everything these workflows decide is already logged, but the log lives in Vercel, keyed by
 //invocation, and expires. The question actually asked afterwards is never "what happened in invocation
-//dpl_xyz" - it is "why does THIS person look like this". That is a question about a record, so the answer
-//belongs on the record: what Attio held before the run, every line the run printed, and what Attio held after.
+//dpl_xyz" - it is "why does THIS record look like this". That is a question about a record, so the answer
+//belongs on the record: what Attio held before the run, every line the run printed, and what it held after.
+//
+//The Person, the Company, and the Deal each get their own note. The transcript in all three is identical - it
+//is one run - and only the two states differ, each record reporting itself.
 //
 //SELF-CONTAINED BY DESIGN. This module is additive. It imports from the codebase; nothing in the codebase
-//imports from it except three one-line calls in recordInterestedLead (lib/interested.ts). Deleting this file,
-//its test, and those three lines removes the feature completely and changes nothing else.
+//imports from it except the marked one-line calls in lib/interested.ts. Deleting this file, its test, and
+//every block marked `//debug note in attio=` removes the feature completely and changes nothing else.
 //
 //INTERESTED RUNS ONLY, without any of the shared modules having to know. Capture is scoped to an open run -
 //see withRunLog - and lib/attio.ts is equally the touchpoint crons' code. Those crons never open a scope, so
@@ -26,23 +29,33 @@ import { providerDisplayName, type Provider } from "./providers.js";
 
 //#region the open run
 //---------------------------------------------------------------------------------------------------------
-//One run's transcript, being built. `before` holds the Person record as it was FOUND rather than a rendering
-//of it, because the company name that makes a reference readable is not resolved until later in the run - so
-//both states are rendered at the end, once, against the same names.
+//One record the run touched, and what it did to it.
+//
+//THE AFTER STATE IS DERIVED, NOT RE-READ. `baseline` is the record as the run first saw it and `applied` is
+//what the run then wrote to it, so the two compose into the state the run left behind - which is what a
+//read-back would have cost three further Attio requests to ask. It is exact for everything this codebase
+//does: patchRecord has three call sites, all inside writeSalvagingRejections, which only updateAttioAttributes
+//calls - so an attribute here can only change through a create whose response is `baseline`, or through a
+//write reported to runLogApplied. What it cannot see is Attio's own hand: a value normalised on write, a
+//derived attribute, an automation reacting to the write, or a human editing the record mid-run. The note says
+//"as this run left it" rather than claiming to be a reading of Attio, because that is what it is.
 //---------------------------------------------------------------------------------------------------------
+interface RunLogRecord {
+  readonly id: string;
+  readonly name: string;
+  /** Values as Attio returned them before the run. Null when the run created the record. */
+  readonly before: JsonObject | null;
+  /** The record as first seen - the same values as `before`, or the create response for a new one. */
+  readonly baseline: JsonObject;
+  /** Slug to the value this run wrote, for the slugs Attio accepted. Layered onto `baseline`. */
+  readonly applied: Record<string, unknown>;
+}
+
 interface RunLogState {
   readonly provider: Provider;
   readonly startedAtMs: number;
   readonly lines: string[];
-  /** Null until snapshotBefore runs; false there means no Person existed and there is no previous state. */
-  existedBefore: boolean | null;
-  before: AttioPerson | null;
-  /** Set by runLogTarget. Until it is, there is no record to attach a note to. */
-  personId: string | null;
-  personName: string | null;
-  /** Set by runLogCompany, purely so a company reference prints as a name rather than a record id. */
-  companyId: string | null;
-  companyName: string | null;
+  readonly records: Map<AttioObject, RunLogRecord>;
 }
 
 const RUN_LOG = new AsyncLocalStorage<RunLogState>();
@@ -51,6 +64,9 @@ const RUN_LOG = new AsyncLocalStorage<RunLogState>();
 //normal run, which prints on the order of thirty lines.
 const MAX_LINES = 500;
 const MAX_VALUE_CHARS = 200;
+
+//The order the notes are written in, which is also the order the records were resolved.
+const OBJECT_ORDER: readonly AttioObject[] = ["people", "companies", "deals"];
 //#endregion
 
 //#region mirroring the console
@@ -87,10 +103,13 @@ function stamp(): string {
 
 function record(method: MirroredMethod, parts: readonly unknown[]): void {
   const state = RUN_LOG.getStore();
-  if (!state || state.lines.length >= MAX_LINES) return;
+  if (!state || state.lines.length > MAX_LINES) return;
+  if (state.lines.length === MAX_LINES) {
+    state.lines.push(`[${stamp()}] ... transcript truncated at ${MAX_LINES} lines`);
+    return;
+  }
   const text = parts.map((part) => (part instanceof Error ? part.message : String(part))).join(" ");
   state.lines.push(`[${stamp()}] ${METHOD_PREFIX[method]}${text}`);
-  if (state.lines.length === MAX_LINES) state.lines.push(`[${stamp()}] ... transcript truncated at ${MAX_LINES} lines`);
 }
 
 function installConsoleMirror(): void {
@@ -141,7 +160,7 @@ function describeLocation(value: Record<string, unknown>): string | null {
 }
 
 //---------------------------------------------------------------------------------------------------------
-//One Attio value object as a human would read it.
+//One Attio value as a human would read it.
 //
 //Attio spells the scalar differently for every attribute type - `{ value }` for text, `{ email_address }` for
 //an address, `{ option: { title } }` for a select, `{ target_record_id }` for a reference - so this walks the
@@ -149,12 +168,15 @@ function describeLocation(value: Record<string, unknown>): string | null {
 //taught. The fallback is deliberate: an unfamiliar attribute printing as JSON is still evidence, whereas
 //dropping it silently would misreport the record as not holding it at all.
 //
-//`names` is how a reference prints as something readable. It carries the run's own company, which is the only
-//linked record whose name is known without spending a request; every other reference prints as its record id.
+//It also takes bare scalars, because a value this run WROTE is in the shape it was sent in - a plain string
+//for a text attribute - rather than the shape Attio returns it in. See afterValues.
+//
+//`names` is how a reference prints as something readable. It carries the run's own person, company, and deal,
+//which is every record it touched; any other reference prints as its record id.
 //USES: stringValue, numberValue, isJsonObject (lib/json.ts); optionTitle, describeLocation, truncate (this module).
 //---------------------------------------------------------------------------------------------------------
 function describeAttioValue(entry: unknown, names: ReadonlyMap<string, string>): string | null {
-  if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") return String(entry);
+  if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") return truncate(String(entry));
   if (!isJsonObject(entry)) return null;
 
   const named =
@@ -195,18 +217,30 @@ function describeAttioValue(entry: unknown, names: ReadonlyMap<string, string>):
 //CHANGED, and a hundred blank slugs on either side buries it.
 //USES: arrayValue (lib/json.ts); describeAttioValue, humanizeSlug (this module).
 //---------------------------------------------------------------------------------------------------------
-function renderState(record: AttioRecord | null, names: ReadonlyMap<string, string>): string {
-  if (!record) return "none";
+function renderState(values: JsonObject | null, names: ReadonlyMap<string, string>): string {
+  if (!values) return "none";
   const lines: string[] = [];
-  for (const slug of Object.keys(record.rawValues)) {
-    const entries = arrayValue(record.rawValues, slug);
-    if (entries.length === 0) continue;
-    const values = entries
+  for (const slug of Object.keys(values)) {
+    const entries = arrayValue(values, slug);
+    const rendered = entries
       .map((entry) => describeAttioValue(entry, names))
       .filter((value): value is string => value !== null && value.length > 0);
-    if (values.length > 0) lines.push(`${humanizeSlug(slug)}: ${values.join(", ")}`);
+    if (rendered.length > 0) lines.push(`${humanizeSlug(slug)}: ${rendered.join(", ")}`);
   }
   return lines.length > 0 ? lines.join("\n") : "none";
+}
+
+/**
+ * [LOGIC] The state the run left behind: what the record held when first seen, with everything the run wrote
+ * laid over the top. A written value arrives in the shape it was SENT - a bare string, an object, or an
+ * already-merged array - so a lone value is wrapped to match the array Attio would have returned it in.
+ */
+function afterValues(target: RunLogRecord): JsonObject {
+  const after: JsonObject = { ...target.baseline };
+  for (const [slug, value] of Object.entries(target.applied)) {
+    after[slug] = Array.isArray(value) ? value : [value];
+  }
+  return after;
 }
 //#endregion
 
@@ -214,30 +248,20 @@ function renderState(record: AttioRecord | null, names: ReadonlyMap<string, stri
 //---------------------------------------------------------------------------------------------------------
 //Opens a transcript for ONE interested lead and runs the workflow inside it.
 //Scoped per lead rather than per invocation on purpose: the Aircall sync records several interested calls in a
-//single invocation, and each is a separate person owed a separate note.
-//The note is written in the finally, so a run that throws still leaves its transcript on the record - which is
-//the run whose transcript is worth the most.
-//USES: installConsoleMirror, restoreConsoleMirror, writeRunLogNote (this module).
+//single invocation, and each is a separate set of records owed its own notes.
+//The notes are written in the finally, so a run that throws still leaves its transcript on whatever it had
+//already resolved - which is the run whose transcript is worth the most.
+//USES: installConsoleMirror, restoreConsoleMirror, writeRunLogNotes (this module).
 //---------------------------------------------------------------------------------------------------------
 export async function withRunLog<T>(provider: Provider, run: () => Promise<T>): Promise<T> {
-  const state: RunLogState = {
-    provider,
-    startedAtMs: Date.now(),
-    lines: [],
-    existedBefore: null,
-    before: null,
-    personId: null,
-    personName: null,
-    companyId: null,
-    companyName: null,
-  };
+  const state: RunLogState = { provider, startedAtMs: Date.now(), lines: [], records: new Map() };
   installConsoleMirror();
   try {
     return await RUN_LOG.run(state, async () => {
       try {
         return await run();
       } finally {
-        await writeRunLogNote(state);
+        await writeRunLogNotes(state);
       }
     });
   } finally {
@@ -245,125 +269,143 @@ export async function withRunLog<T>(provider: Provider, run: () => Promise<T>): 
   }
 }
 
+//---------------------------------------------------------------------------------------------------------
+//Registers a record the run touched, and takes its "before" picture.
+//
+//MUST BE CALLED BEFORE THE RECORD IS WRITTEN TO, because `record` is both the previous state and the baseline
+//the writes are layered onto. `existed` is what separates the two: a record the run created has no previous
+//state to report, but its create response is still the baseline.
+//Registering twice is ignored - the first call is the one that saw the record untouched.
+//Outside a run this does nothing, which is what keeps the touchpoint crons out of the feature.
+//---------------------------------------------------------------------------------------------------------
+export function runLogRecord(object: AttioObject, source: AttioRecord, existed: boolean, name: string): void {
+  const state = RUN_LOG.getStore();
+  if (!state || state.records.has(object)) return;
+  state.records.set(object, {
+    id: source.id.record_id,
+    name,
+    before: existed ? source.rawValues : null,
+    baseline: source.rawValues,
+    applied: {},
+  });
+}
+
 /**
- * [LOGIC] The Person as the run found it, BEFORE anything is written - null meaning no such Person existed and
- * one is about to be created. The record is kept rather than rendered; see RunLogState.
- * Outside a run this does nothing, which is what keeps the touchpoint crons out of the feature.
+ * [LOGIC] What a write actually changed. `candidate` is every value offered and `written` the slugs Attio
+ * accepted, so the two together are what the record now holds that it did not before - which is precisely what
+ * makes a read-back unnecessary. A write to a record nobody registered, or one for a different record, is
+ * ignored rather than guessed at.
  */
-export function snapshotBefore(person: AttioPerson | null): void {
-  const state = RUN_LOG.getStore();
-  if (!state) return;
-  state.existedBefore = person !== null;
-  state.before = person;
-}
-
-/** [LOGIC] The Person the transcript belongs to. Until this is called there is no record to attach a note to. */
-export function runLogTarget(personId: string, personName: string): void {
-  const state = RUN_LOG.getStore();
-  if (!state) return;
-  state.personId = personId;
-  state.personName = personName;
-}
-
-/** [LOGIC] The run's own company, so `company: <name>` reads as a name on both states instead of a record id. */
-export function runLogCompany(company: { readonly id: string; readonly name: string | null } | null): void {
-  const state = RUN_LOG.getStore();
-  if (!state) return;
-  state.companyId = company?.id ?? null;
-  state.companyName = company?.name ?? null;
+export function runLogApplied(
+  object: AttioObject,
+  recordId: string,
+  candidate: Readonly<Record<string, unknown>>,
+  written: readonly string[],
+): void {
+  const target = RUN_LOG.getStore()?.records.get(object);
+  if (!target || target.id !== recordId) return;
+  for (const slug of written) {
+    if (slug in candidate) target.applied[slug] = candidate[slug];
+  }
 }
 //#endregion
 
 //#region the transcript itself
 export interface RunLogArtifact {
+  readonly object: AttioObject;
+  readonly recordId: string;
   readonly filename: string;
   readonly contentType: string;
   readonly body: string;
 }
 
-/** [LOGIC] Every name a reference in either state can be printed as. One entry today: the run's own company. */
+/** [LOGIC] Every record the run touched, so a reference between them prints as a name rather than an id. */
 function referenceNames(state: RunLogState): ReadonlyMap<string, string> {
   const names = new Map<string, string>();
-  if (state.companyId && state.companyName) names.set(state.companyId, state.companyName);
+  for (const target of state.records.values()) names.set(target.id, target.name);
   return names;
 }
 
 //---------------------------------------------------------------------------------------------------------
-//The transcript as a file, built in memory.
+//The transcript as one file per record touched, built in memory.
 //
 //IN MEMORY BECAUSE THERE IS NOWHERE TO PUT IT. A Vercel function's filesystem is read-only bar /tmp, and /tmp
 //goes with the instance and is reachable from nothing outside it - a file written there is neither durable nor
 //retrievable. A file is a name, a type, and some bytes, and that is what this returns.
 //
 //It is also what a mail attachment or a Slack upload takes, which is the point of building it as a file at all
-//rather than formatting a note directly: the day this is emailed or posted, the same call yields the same
-//bytes the note already carries, and nothing here changes.
+//rather than formatting a note directly: the day these are emailed or posted, the same call yields the same
+//bytes the notes already carry, and nothing here changes.
 //
-//`after` is passed in rather than read from the state because reading it costs a request and the caller is
-//already holding the result. Returns null outside a run.
-//USES: renderState, referenceNames (this module); providerDisplayName (lib/providers.ts).
+//The log is rendered from ONE reading of the lines, so all three files carry the same transcript. Rendering
+//per record instead would let each note pick up the note before it being written, and three accounts of one
+//run that disagree about it are worth less than one.
+//USES: renderState, afterValues, referenceNames (this module).
 //---------------------------------------------------------------------------------------------------------
-export function runLogArtifact(after: AttioRecord | null): RunLogArtifact | null {
+export function runLogArtifacts(): readonly RunLogArtifact[] {
   const state = RUN_LOG.getStore();
-  if (!state) return null;
+  if (!state) return [];
 
   const names = referenceNames(state);
-  const existed = state.existedBefore === true;
-  const body = [
-    `Record ${existed ? "did" : "did not"} exist before run.`,
-    "",
-    "**Previous state**",
-    existed ? renderState(state.before, names) : "none",
-    "",
-    "**Run logs**",
-    state.lines.length > 0 ? state.lines.join("\n") : "none",
-    "",
-    "**State after run**",
-    //Distinguished from "none" on purpose: a record holding nothing and a record nobody could read are
-    //opposite findings, and "none" would report the second as the first.
-    after ? renderState(after, names) : "could not be read back after the run - see the transcript above",
-  ].join("\n");
-
+  const transcript = state.lines.length > 0 ? state.lines.join("\n") : "none";
   const startedAt = new Date(state.startedAtMs).toISOString().replace(/[:.]/g, "-");
-  return {
-    filename: `run-log-${state.provider}-${state.personId ?? "unknown"}-${startedAt}.txt`,
-    contentType: "text/plain; charset=utf-8",
-    body,
-  };
+
+  const artifacts: RunLogArtifact[] = [];
+  for (const object of OBJECT_ORDER) {
+    const target = state.records.get(object);
+    if (!target) continue;
+    artifacts.push({
+      object,
+      recordId: target.id,
+      filename: `run-log-${state.provider}-${object}-${target.id}-${startedAt}.txt`,
+      contentType: "text/plain; charset=utf-8",
+      body: [
+        `Record ${target.before ? "did" : "did not"} exist before run.`,
+        "",
+        "**Previous state**",
+        renderState(target.before, names),
+        "",
+        "**Run logs**",
+        transcript,
+        "",
+        //Not a claim to have re-read Attio, and labelled so - see RunLogRecord.
+        "**State after run** (as this run left it)",
+        renderState(afterValues(target), names),
+      ].join("\n"),
+    });
+  }
+  return artifacts;
 }
 
 //---------------------------------------------------------------------------------------------------------
-//Reads the Person back as the run left it and posts the transcript to it. Called once, by withRunLog.
+//Posts the transcript to every record the run touched. Called once, by withRunLog.
 //
-//[STABILITY] Swallows everything. Both halves can fail independently and neither may reach the caller: the
-//re-read because the run may have failed in a way that also breaks a read, the note because it is the last
-//write of an event Attio has already committed. A failure here is reported to the log and nothing more.
-//[DEBUG] A run that ends before a Person is resolved says so rather than passing silently - a missing note is
-//otherwise indistinguishable from a run that never happened.
-//USES: fetchRecord, createNote (lib/attio.ts); runLogArtifact (this module); providerDisplayName (lib/providers.ts).
+//[STABILITY] Each note is written independently and swallows its own failure. They are the last writes of an
+//event Attio has already committed, so one refused note may not cost the others, and none of them may reach
+//the caller. A failure is reported to the log and nothing more.
+//[DEBUG] A run that ends before any record is resolved says so rather than passing silently - a missing note
+//is otherwise indistinguishable from a run that never happened.
+//USES: createNote (lib/attio.ts); runLogArtifacts (this module); providerDisplayName (lib/providers.ts).
 //---------------------------------------------------------------------------------------------------------
-async function writeRunLogNote(state: RunLogState): Promise<void> {
-  if (!state.personId) {
+async function writeRunLogNotes(state: RunLogState): Promise<void> {
+  const artifacts = runLogArtifacts();
+  if (artifacts.length === 0) {
     console.warn(
-      `[run-log] ${state.provider}: no transcript written - the run ended before a person was resolved, so there is no record to attach it to`,
+      `[run-log] ${state.provider}: no transcript written - the run ended before any record was resolved, so there is nothing to attach it to`,
     );
     return;
   }
 
-  let after: AttioRecord | null = null;
-  try {
-    after = await fetchRecord("people", state.personId);
-  } catch (error) {
-    console.error(`[run-log] ${state.provider}: could not re-read the person after the run - ${errorMessage(error)}`);
-  }
-
-  try {
-    const artifact = runLogArtifact(after);
-    if (!artifact) return;
-    const title = `run logs for automated integration (${providerDisplayName(state.provider)} marked as interested)`;
-    await createNote("people", state.personId, title, artifact.body, state.personName ?? state.personId);
-  } catch (error) {
-    console.error(`[run-log] ${state.provider}: the transcript could not be posted - ${errorMessage(error)}`);
+  const title = `run logs for automated integration (${providerDisplayName(state.provider)} marked as interested)`;
+  for (const artifact of artifacts) {
+    try {
+      const name = state.records.get(artifact.object)?.name ?? artifact.recordId;
+      await createNote(artifact.object, artifact.recordId, title, artifact.body, name);
+    } catch (error) {
+      console.error(
+        `[run-log] ${state.provider}: the ${artifact.object} transcript could not be posted - ${errorMessage(error)}`,
+      );
+    }
   }
 }
 //#endregion

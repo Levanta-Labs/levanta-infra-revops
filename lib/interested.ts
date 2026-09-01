@@ -28,9 +28,9 @@ import {
   type SuppressionChannel,
   type SuppressionTargets,
 } from "./providers.js";
-//[RUN LOG] Additive diagnostics, self-contained in lib/run-log.ts. This import and the four lines it is used on
-//in recordInterestedLead are the feature's entire footprint in this module.
-import { runLogCompany, runLogTarget, snapshotBefore, withRunLog } from "./run-log.js";
+//debug note in attio=
+import { runLogApplied, runLogRecord, withRunLog } from "./run-log.js"; //the tool that writes down what this run did
+//===============
 
 //=============================================================================================================
 //What the three interested workflows have in common.
@@ -566,7 +566,11 @@ export async function updateAttioAttributes(
     fillable[slug] = value;
   }
 
-  return writeSalvagingRejections(object, record.id.record_id, fillable, label);
+  const result = await writeSalvagingRejections(object, record.id.record_id, fillable, label);
+  //debug note in attio=
+  runLogApplied(object, record.id.record_id, fillable, result.written); //write down which changes actually stuck
+  //===============
+  return result;
 }
 //#endregion
 
@@ -669,6 +673,9 @@ export async function resolveInterestedCompany(
     console.log(
       `[lookup] company: person is already linked to ${recordDisplayName(linked) ?? linkedId}, which the deal will be named after`,
     );
+    //debug note in attio=
+    runLogRecord("companies", linked, true, recordDisplayName(linked) ?? linkedId); //take a photo of the company before we change it
+    //===============
     await updateAttioAttributes("companies", linked, companyValuesFor(lead));
     return { id: linkedId, name: recordDisplayName(linked) };
   }
@@ -676,6 +683,9 @@ export async function resolveInterestedCompany(
   const domain = toDomain(lead.companyDomain ?? lead.website);
   const found = (await findCompanyByDomain(domain)) ?? (await findCompanyByName(lead.companyName));
   if (found) {
+    //debug note in attio=
+    runLogRecord("companies", found, true, recordDisplayName(found) ?? found.id.record_id); //take a photo of the company before we change it
+    //===============
     await updateAttioAttributes("companies", found, companyValuesFor(lead));
     return { id: found.id.record_id, name: recordDisplayName(found) };
   }
@@ -687,6 +697,9 @@ export async function resolveInterestedCompany(
     return null;
   }
   const created = await createCompany(companyValuesFor(lead));
+  //debug note in attio=
+  runLogRecord("companies", created, false, recordDisplayName(created) ?? created.id.record_id); //brand new company, so there is no before photo
+  //===============
   return { id: created.id.record_id, name: recordDisplayName(created) };
 }
 
@@ -838,25 +851,31 @@ export interface InterestedOutcome {
 //dealValuesFor, updateAttioAttributes, suppressInterestedLead (this module).
 //The caller supplies findPerson and history; nothing else about a provider is visible from here.
 //[DEBUG] Ends with one line naming the person, deal, and company, so an event reads as a single result.
-//[RUN LOG] Wrapped in a transcript scope, which writes what happened here back to the Person as a note. It is
-//additive and self-contained: see lib/run-log.ts. Removing it is this wrapper plus three lines below.
+//[RUN LOG] Every block below marked `//debug note in attio=` belongs to the transcript written back to the
+//records this touches. Additive and self-contained: see lib/run-log.ts.
 //---------------------------------------------------------------------------------------------------------
+//debug note in attio=
+//To remove the feature: delete this wrapper and rename runInterestedLead back to recordInterestedLead.
 export async function recordInterestedLead(workflow: InterestedWorkflow): Promise<InterestedOutcome> {
-  return withRunLog(workflow.lead.provider, () => runInterestedLead(workflow));
+  return withRunLog(workflow.lead.provider, () => runInterestedLead(workflow)); //start writing down everything this run does
 }
+//===============
 
 async function runInterestedLead(workflow: InterestedWorkflow): Promise<InterestedOutcome> {
   const { lead, subject } = workflow;
 
   let person = await workflow.findPerson();
-  snapshotBefore(person);
+  //debug note in attio=
+  const personWasAlreadyThere = person !== null; //did Attio know this person before we started?
+  //===============
   if (!person) person = await createPerson(personValuesFor(lead));
   const personId = person.id.record_id;
   const personName = personLabel(person);
-  runLogTarget(personId, personName);
+  //debug note in attio=
+  runLogRecord("people", person, personWasAlreadyThere, personName); //take a photo of the person before we change them
+  //===============
 
   const company = await resolveInterestedCompany(lead, person);
-  runLogCompany(company);
   const deal = await ensureInterestedDeal(
     person,
     interestedDealName(company?.name ?? null),
@@ -864,6 +883,9 @@ async function runInterestedLead(workflow: InterestedWorkflow): Promise<Interest
     company?.id ?? null,
   );
   const dealId = deal.id.record_id;
+  //debug note in attio=
+  runLogRecord("deals", deal, person.values.associated_deals.length > 0, recordDisplayName(deal) ?? dealId); //take a photo of the deal before we change it
+  //===============
 
   const history = await workflow.history();
   const title = leadSourceLabel(lead.provider);
