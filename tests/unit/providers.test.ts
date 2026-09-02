@@ -396,10 +396,51 @@ describe("Outfound client", () => {
   });
 
   //[STABILITY] Enrichment is best-effort everywhere it is used, so "no such lead" must be null, not a throw.
-  test("returns null for an address Outfound has never seen", async () => {
-    const mock = installFetchMock(() => jsonResponse({ clients: [], total_clients_contacted: 0 }));
+  //The body below is the LIVE response for an address that cannot exist, copied verbatim. Note that lead_email
+  //is echoed back regardless - testing that field would report a match for every address ever asked about.
+  test("returns null for an address Outfound has never seen, despite it echoing the address back", async () => {
+    const mock = installFetchMock(() =>
+      jsonResponse({
+        lead_email: "nobody@example.invalid",
+        enrichment: null,
+        clients: [],
+        total_clients_contacted: 0,
+        has_replies: false,
+      }),
+    );
     try {
-      expect(await fetchOutfoundLead("nobody@example.com")).toBeNull();
+      expect(await fetchOutfoundLead("nobody@example.invalid")).toBeNull();
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //Either half alone is something worth having, so neither may be read as a miss.
+  test("treats a lead with conversations but no enrichment as a match", async () => {
+    const mock = installFetchMock(() =>
+      jsonResponse({
+        lead_email: "ada@example.com",
+        enrichment: null,
+        clients: [{ recent_conversations: [{ id: "c1", thread_hash: "t1", timestamp_email: "2026-08-19T10:00:00Z" }] }],
+      }),
+    );
+    try {
+      const lead = await fetchOutfoundLead("ada@example.com");
+      expect(lead?.conversations).toHaveLength(1);
+      //And that thread hash is what the suppression channel keys on, so a miss here would silently stop
+      //Outfound ever being suppressed for a lead it does hold.
+      expect(lead?.conversations[0]?.threadHash).toBe("t1");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("treats a lead with enrichment but no conversations as a match", async () => {
+    const mock = installFetchMock(() =>
+      jsonResponse({ lead_email: "ada@example.com", enrichment: { title: "CTO", company: {} }, clients: [] }),
+    );
+    try {
+      expect((await fetchOutfoundLead("ada@example.com"))?.jobTitle).toBe("CTO");
     } finally {
       mock.restore();
     }
