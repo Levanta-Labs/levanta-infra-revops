@@ -359,6 +359,18 @@ export function parseOutfoundLead(value: unknown): OutfoundLead {
 //The lead behind an address, or null when Outfound holds none.
 //Unlike the Instantly equivalent this needs no exact-match guard: the endpoint is keyed on the address rather
 //than being a fuzzy search, so it cannot return a different person at the same company.
+//
+//A MISS IS NOT A 404, AND NOT AN EMPTY BODY EITHER. The endpoint ECHOES the address it was asked about, so
+//`lead_email` is populated whether or not Outfound has ever seen it. Verified against the live API:
+//
+//    GET /prospects/lookup/conversations?email=nobody@example.invalid
+//    {"lead_email":"nobody@example.invalid","enrichment":null,"clients":[],"total_clients_contacted":0,...}
+//
+//So the miss is detected on the two fields that carry the substance: no enrichment, and no client has ever
+//held a conversation. Either one alone means Outfound knows something worth having.
+//[DEBUG] This distinction is diagnostic only - every caller treats null and an all-null lead identically, so
+//getting it wrong changed no behaviour, only the log. It is still worth getting right: a line reading "matched"
+//for an address nothing matched sends whoever is debugging a missing enrichment to the wrong place entirely.
 //[STABILITY] Enrichment plus history. Every caller treats null as "nothing extra to add", never as a failure,
 //so a lead Outfound cannot find is still recorded from the webhook body alone.
 //USES: outfoundFetch, parseOutfoundLead (this module).
@@ -367,8 +379,10 @@ export async function fetchOutfoundLead(email: string): Promise<OutfoundLead | n
   const params = new URLSearchParams({ email });
   const body = await outfoundFetch(`/prospects/lookup/conversations?${params}`);
   if (!isJsonObject(body)) throw new Error("Outfound lead lookup response is invalid");
-  //An address Outfound has never seen comes back without a lead_email rather than as a 404.
-  if (!stringValue(body.lead_email)) {
+  //The echoed lead_email proves nothing, so it is not what is tested - see above.
+  const hasEnrichment = objectValue(body, "enrichment") !== null;
+  const hasClients = arrayValue(body, "clients").length > 0;
+  if (!hasEnrichment && !hasClients) {
     console.log(`[lookup] outfound lead ${email}: no match, so nothing is enriched from Outfound`);
     return null;
   }
