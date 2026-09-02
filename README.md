@@ -417,8 +417,31 @@ this project should be removed in Aircall: the route no longer exists and every 
 
 Outfound is a private API with no public documentation; the integration is written against the OpenAPI spec the
 deployment serves itself, at `https://api.outfound.io/openapi-client.json` (rendered at `/scalar/client?org=sas`).
-Its reads are slower than the other providers' - the DNC list takes about two seconds even at `page_size=1` - so the
-Outfound smoke tests carry a longer timeout than the suite default.
+Its reads are slower than the other providers', and erratically so - the DNC list has been measured at 2.2s, 2.5s
+and 14.7s on three consecutive calls at `page_size=1` - so the Outfound smoke tests carry longer timeouts than the
+suite default.
+
+**Its thread listing 500s on a timezone-aware date.** `GET /email-inbox/threads` answers
+`{"detail":"An unexpected error occurred while listing email threads."}` for any `email_start_date` or
+`email_end_date` carrying a designator - both the `Z` that `Date#toISOString` appends and an explicit `+00:00` do
+it, on either bound, with or without the other. A naive datetime is accepted:
+
+| Sent | |
+| --- | --- |
+| `2026-09-02T13:58:30Z` | **500** |
+| `2026-09-02T13:58:30+00:00` | **500** |
+| `2026-09-02T13:58:30` | 200 |
+| `2026-09-02T13:58:30.198` | 200 |
+
+That is the signature of a timezone-aware value being compared against a naive database column, so the column is
+UTC and `outfoundNaiveUtc` sends UTC with the designator dropped - a workaround for an upstream bug, not a
+formatting preference. Remove it only once Outfound accepts an offset, and re-check both bounds when doing so.
+
+This shipped broken and reached production, because the smoke test read `?limit=1` with no window while the sync
+reads a bounded one. There is now a live test that calls the listing the way the cron actually calls it.
+
+`limit` is also capped server-side: the endpoint answers `"limit": 50` however much is asked for, so
+`THREAD_PAGE_LIMIT` is 50 to match what is served rather than what would be preferred.
 Its webhook auth header is one *we* configure - the Webhook Relay lets arbitrary headers be set per endpoint - so
 `x-webhook-secret` is set there by hand rather than being a name Outfound chose.
 

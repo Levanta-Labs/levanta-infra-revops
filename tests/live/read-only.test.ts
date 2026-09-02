@@ -24,6 +24,7 @@ import {
 } from "../../lib/interested.js";
 import { arrayValue, isJsonObject, responseJson, stringValue } from "../../lib/json.js";
 import { OUTFOUND_BASE, outfoundAuthHeader } from "../../lib/endpoints.js";
+import { outfoundNaiveUtc } from "../../lib/outfound.js";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
 
@@ -271,6 +272,14 @@ liveTest("the Interested deal stage exists", async () => {
 //smoke test that can be slow is given this rather than the 5s default.
 const OUTFOUND_TIMEOUT_MS = 20_000;
 
+//[PERF] The DNC list is slower again, and erratically so - measured at 2.2s, 2.5s and 14.7s on three
+//consecutive calls at page_size=1, and it has timed out past 20s. That reads like a cold start rather than a
+//large list. Given its own ceiling because an intermittently failing smoke test teaches people to ignore the
+//whole suite, which costs more than the seconds this occasionally spends.
+//Production never reads this endpoint - suppression writes through mark-as-dnc - so the latency is a nuisance
+//here rather than a risk there. Worth knowing anyway, since the write shares the subsystem.
+const OUTFOUND_DNC_TIMEOUT_MS = 60_000;
+
 liveTest("reads one Outfound inbox page", async () => {
   await expectOk(
     "Outfound",
@@ -292,6 +301,31 @@ liveTest(
     await expectOk(
       "Outfound DNC",
       await fetch(`${OUTFOUND_BASE}/dnc?page_size=1`, {
+        headers: { Authorization: outfoundAuthHeader() },
+      }),
+    );
+  },
+  OUTFOUND_DNC_TIMEOUT_MS,
+);
+
+//---------------------------------------------------------------------------------------------------------
+//The listing AS THE CRON ACTUALLY CALLS IT - bounded by a time window, which the test above is not.
+//This exists because the unbounded read passed while the real one was returning HTTP 500 in production: a
+//timezone-aware bound makes this endpoint fail, and nothing that only reads `?limit=1` would ever notice.
+//Any regression in outfoundNaiveUtc, or a change of mind upstream, fails here rather than in a cron run.
+//---------------------------------------------------------------------------------------------------------
+liveTest(
+  "reads an Outfound inbox page bounded by a time window, the way the sync does",
+  async () => {
+    const nowMs = Date.now();
+    const params = new URLSearchParams({
+      limit: "1",
+      email_start_date: outfoundNaiveUtc(nowMs - 10 * 60 * 1_000),
+      email_end_date: outfoundNaiveUtc(nowMs),
+    });
+    await expectOk(
+      "Outfound windowed inbox",
+      await fetch(`${OUTFOUND_BASE}/email-inbox/threads?${params}`, {
         headers: { Authorization: outfoundAuthHeader() },
       }),
     );
