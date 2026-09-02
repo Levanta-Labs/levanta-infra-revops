@@ -11,6 +11,7 @@ import {
 import { fetchInstantlyEmails, parseInstantlyEmail } from "../../lib/instantly.js";
 import {
   fetchOutfoundLead,
+  outfoundNaiveUtc,
   fetchOutfoundThreadEmails,
   fetchOutfoundThreads,
   parseOutfoundEmail,
@@ -312,6 +313,17 @@ describe("Outfound client", () => {
     expect(parseOutfoundEmail({ ...outfoundEmail, type: "Bounced" }, "thread-1").emailType).toBe("unknown");
   });
 
+  //[STABILITY] Not cosmetic. A timezone designator makes the thread listing answer HTTP 500 - see
+  //outfoundNaiveUtc. This is the regression guard for that workaround.
+  test("formats a window bound as naive UTC, because a designator makes the endpoint 500", () => {
+    const ms = Date.parse("2026-09-02T13:58:30.198Z");
+    expect(outfoundNaiveUtc(ms)).toBe("2026-09-02T13:58:30.198");
+    expect(outfoundNaiveUtc(ms)).not.toContain("Z");
+    expect(outfoundNaiveUtc(ms)).not.toContain("+");
+    //UTC, not local: a bare local time would shift every window by the runner's offset without erroring.
+    expect(Date.parse(`${outfoundNaiveUtc(ms)}Z`)).toBe(ms);
+  });
+
   test("follows the thread cursor and bounds the window on the email timestamp", async () => {
     const mock = installFetchMock((_url, _init, index) =>
       index === 0
@@ -326,9 +338,11 @@ describe("Outfound client", () => {
       expect(threads).toHaveLength(1);
       expect(threads[0]?.threadHash).toBe("thread-1");
       expect(mock.calls).toHaveLength(2);
-      //One millisecond back, so an email sitting exactly on the cursor is still returned.
-      expect(mock.calls[0]?.input).toContain("email_start_date=2026-08-19T10%3A59%3A59.999Z");
-      expect(mock.calls[0]?.input).toContain("email_end_date=2026-08-19T12%3A00%3A00.000Z");
+      //One millisecond back, so an email sitting exactly on the cursor is still returned. No trailing Z: a
+      //timezone-aware bound makes this endpoint answer 500 - see outfoundNaiveUtc.
+      expect(mock.calls[0]?.input).toContain("email_start_date=2026-08-19T10%3A59%3A59.999&");
+      expect(mock.calls[0]?.input).toContain("email_end_date=2026-08-19T12%3A00%3A00.000");
+      expect(mock.calls[0]?.input).not.toContain("%3A59.999Z");
       expect(mock.calls[1]?.input).toContain("cursor=next");
     } finally {
       mock.restore();

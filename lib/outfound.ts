@@ -161,8 +161,32 @@ export interface OutfoundThreadQuery {
   readonly toMs: number;
 }
 
-//A page size well above the API's default of 50, to spend as few round trips as possible on a wide window.
-const THREAD_PAGE_LIMIT = 100;
+//---------------------------------------------------------------------------------------------------------
+//[LOGIC] A UTC timestamp with NO timezone designator, which is the only form the thread filter accepts.
+//
+//[STABILITY] WORKING AROUND AN UPSTREAM 500. Outfound's thread listing rejects any timezone-AWARE datetime with
+//an HTTP 500 and `{"detail":"An unexpected error occurred while listing email threads."}` - both the `Z` that
+//Date#toISOString appends and an explicit `+00:00` offset do it, on either bound, with or without the other.
+//A naive datetime is accepted. That is the signature of a timezone-aware value being compared against a naive
+//database column, so the column is UTC and this sends UTC; only the designator is dropped.
+//
+//Verified by hand against the live API:
+//    2026-09-02T13:58:30Z       -> 500        2026-09-02T13:58:30        -> 200
+//    2026-09-02T13:58:30+00:00  -> 500        2026-09-02T13:58:30.198    -> 200
+//
+//Remove this ONLY once Outfound accepts an offset, and re-check both bounds when doing so. Sending a bare local
+//time here instead of UTC would silently shift every window by the server's offset, which is why the value is
+//built from toISOString rather than from any local-time formatter.
+//USES: nothing. Pure.
+//---------------------------------------------------------------------------------------------------------
+export function outfoundNaiveUtc(ms: number): string {
+  //toISOString is always UTC and always ends in "Z"; dropping that last character is the whole conversion.
+  return new Date(ms).toISOString().slice(0, -1);
+}
+
+//The API's own maximum. Asking for more is not an error and not honoured either - it answers with `limit: 50`
+//whatever is requested - so the number here matches what is actually served rather than what we would prefer.
+const THREAD_PAGE_LIMIT = 50;
 //A bound on pagination, so a cursor the API never terminates cannot spin a run until Vercel kills it. At the
 //page size above this is 20,000 threads, far past anything a five-minute window produces; reaching it means
 //something is wrong with the cursor rather than that the window is genuinely that wide.
@@ -181,6 +205,8 @@ const MAX_THREAD_PAGES = 200;
 //[STABILITY] The bound is on the email timestamp, which is what the cursor keys on too, so window and cursor
 //agree. Which of sent_at/created_at the filter reads is not documented; the grace margin absorbs the
 //difference either way, because it is wider than the gap between them can plausibly be.
+//[STABILITY] Both bounds are sent as naive UTC. A timezone designator makes this endpoint answer 500 - see
+//outfoundNaiveUtc, which is a workaround for an upstream bug and not a formatting preference.
 //USES: outfoundFetch (this module); arrayValue, stringValue (json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function fetchOutfoundThreads(
@@ -195,8 +221,8 @@ export async function fetchOutfoundThreads(
       limit: String(THREAD_PAGE_LIMIT),
       //Minus one millisecond: the bound is treated as exclusive, and an email sitting exactly on the cursor
       //timestamp must still be returned. The caller's isAfterCursor check discards it if it was already handled.
-      email_start_date: new Date(Math.max(0, query.fromMs - 1)).toISOString(),
-      email_end_date: new Date(query.toMs).toISOString(),
+      email_start_date: outfoundNaiveUtc(Math.max(0, query.fromMs - 1)),
+      email_end_date: outfoundNaiveUtc(query.toMs),
     });
     if (cursor) params.set("cursor", cursor);
 
