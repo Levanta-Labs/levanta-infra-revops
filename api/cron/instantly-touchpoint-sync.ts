@@ -18,11 +18,13 @@ import {
   isAfterCursor,
   saveSyncCursor,
   type CursorEvent,
+  type SyncCursor,
 } from "../../lib/cursors.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
 import { fetchInstantlyEmails, type InstantlyEmail } from "../../lib/instantly.js";
 import { errorMessage } from "../../lib/json.js";
 import { budgetSeconds, startRunBudget } from "../../lib/run-budget.js";
+import { cursorState, runOutcome } from "../../lib/run-summary.js";
 
 const SYNC_KEY = "instantly-touchpoints";
 
@@ -84,16 +86,35 @@ export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise
 //6. per email, skip anything at or below the mark, else processInstantlyTouchpoint. 7. advance the mark past
 //each handled email. 7a. stop at the run budget if still going. 8. park at (now - CURSOR_GRACE_MS) and
 //persist - the park is SKIPPED on a budget stop, since the emails the loop never reached must stay above the
-//mark. See lib/run-budget.ts.
+//mark. See lib/run-budget.ts. 9. report, on every exit - see the finally.
 //[STABILITY] A failed email is counted and passed over, never retried: its earlier writes are committed, so a
 //retry would duplicate them, and a permanently failing one would block the sync forever.
 //---------------------------------------------------------------------------------------------------------
 export async function GET(request: Request): Promise<Response> {
   //[SECURITY] Runs before any external call, so an unauthorized request costs nothing.
   if (!isAuthorizedCron(request)) return json({ error: "Unauthorized" }, 401);
+  const upperBoundMs = Date.now();
+  //[DEBUG] Every figure the closing summary reports lives out here rather than inside the try, so the finally
+  //can print that line on ANY exit. It used to sit after saveSyncCursor, which meant a throw anywhere - and
+  //Supabase answers a cursor read or write with a 504 often enough to matter - left the run with no summary at
+  //all. A run reporting nothing is indistinguishable in the log from a run that never fired, and the case that
+  //most needs reading is exactly the one that threw: it may have written to Attio and then lost its cursor.
+  let cursor: SyncCursor | null = null;
+  let emailCount = 0;
+  const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
+  const failures: string[] = [];
+  //Emails the loop reached before it stopped, so a partial run can report what it left behind.
+  let examinedCount = 0;
+  //[DEBUG] Of those, the ones the cursor rejected as handled on an earlier run. Counted so the summary's
+  //figures account for the whole window: without it a run that fetched forty and processed three reads as
+  //though it silently dropped thirty-seven, when they were re-read on purpose and correctly passed over.
+  let beforeCursorCount = 0;
+  let stoppedOnBudget = false;
+  let cursorSaved = false;
+  let fatal: string | null = null;
+
   try {
-    const upperBoundMs = Date.now();
-    let cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
+    cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
     const emails = [...(await fetchInstantlyEmails({ fromMs: cursor.timestampMs, toMs: upperBoundMs }))]
       //Scheduled mail has not happened yet and an auto-reply is not a human touchpoint; neither is counted.
       .filter(
@@ -104,18 +125,10 @@ export async function GET(request: Request): Promise<Response> {
         (left, right) =>
           instantlyCursorEvent(left).timestampMs - instantlyCursorEvent(right).timestampMs,
       );
-    const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
-    const failures: string[] = [];
+    emailCount = emails.length;
     //[STABILITY] See lib/run-budget.ts. Without this, an overrun is killed by Vercel before saveSyncCursor and
     //the run's whole progress is discarded, so the next run redoes it and re-increments every counter.
     const budget = startRunBudget(upperBoundMs, "INSTANTLY_SYNC_BUDGET_MS");
-    //Emails the loop reached before it stopped, so a partial run can report what it left behind.
-    let examinedCount = 0;
-    //[DEBUG] Of those, the ones the cursor rejected as handled on an earlier run. Counted so the summary's
-    //figures account for the whole window: without it a run that fetched forty and processed three reads as
-    //though it silently dropped thirty-seven, when they were re-read on purpose and correctly passed over.
-    let beforeCursorCount = 0;
-    let stoppedOnBudget = false;
 
     for (const email of emails) {
       //Checked before the email rather than after, so the budget is what remains for a whole one. Stopping here
@@ -145,25 +158,23 @@ export async function GET(request: Request): Promise<Response> {
       cursor = advanceCursor(cursor, event);
     }
 
-    const emailsRemaining = emails.length - examinedCount;
+    const emailsRemaining = emailCount - examinedCount;
     if (stoppedOnBudget) {
       //[STABILITY] Do NOT park at now. Parking claims everything up to that moment was dealt with, and the
       //emails the loop never reached were not - they would be skipped forever. Leaving the cursor where the
       //loop stopped is what makes the next run resume instead of restart.
       console.warn(
-        `[run] instantly sync: stopped after ${budgetSeconds(budget)}s of a ${emails.length}-email window with ${emailsRemaining} still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${emailsRemaining > examinedCount ? " More is left than was done - if that repeats, email is arriving faster than it is processed." : ""}`,
+        `[run] instantly sync: stopped after ${budgetSeconds(budget)}s of a ${emailCount}-email window with ${emailsRemaining} still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${emailsRemaining > examinedCount ? " More is left than was done - if that repeats, email is arriving faster than it is processed." : ""}`,
       );
     } else {
       //[STABILITY] Park short of now. An email Instantly has not yet published is picked up next run, not skipped.
       cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
     }
     await saveSyncCursor(cursor);
-    console.log(
-      `[run] instantly sync: ${emails.length} email(s) in window, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${stoppedOnBudget ? `STOPPED with ${emailsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
-    );
+    cursorSaved = true;
     const body = {
       success: failures.length === 0,
-      emailsFound: emails.length,
+      emailsFound: emailCount,
       //Part of emailsFound rather than extra to it: the slice an earlier run had already dealt with.
       beforeCursor: beforeCursorCount,
       ...results,
@@ -177,6 +188,15 @@ export async function GET(request: Request): Promise<Response> {
     };
     return json(body, failures.length > 0 ? 500 : 200);
   } catch (error) {
+    //Held for the summary below, which runs after this response is prepared and before it is sent.
+    fatal = errorMessage(error);
     return serverError("Instantly touchpoint sync error", error);
+  } finally {
+    //[DEBUG] Exactly one of these per invocation, whatever happened. A log filtered on "[run] instantly sync:"
+    //is then a complete record of the runs, and a gap in it means a run that produced no output at all - a
+    //Vercel kill at maxDuration, rather than any failure this handler was alive to see.
+    console.log(
+      `[run] instantly sync: ${emailCount} email(s) in window, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stoppedOnBudget, emailCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
+    );
   }
 }

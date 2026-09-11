@@ -1,4 +1,4 @@
-import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.js";
+import { fetchAircallCalls, formatCallDuration, type AircallCall } from "../../lib/aircall.js";
 import { toE164 } from "../../lib/phone.js";
 import {
   interestedTagSet,
@@ -26,10 +26,12 @@ import {
   isAfterCursor,
   saveSyncCursor,
   type CursorEvent,
+  type SyncCursor,
 } from "../../lib/cursors.js";
 import { errorMessage } from "../../lib/json.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
 import { budgetSeconds, startRunBudget } from "../../lib/run-budget.js";
+import { cursorState, runOutcome } from "../../lib/run-summary.js";
 
 const SYNC_KEY = "aircall-touchpoints";
 //An outcome tag is applied after the call, sometimes minutes after, so a cursor alone can carry a call past the
@@ -177,8 +179,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
   }
 
   const timestamp = new Date((call.endedAt ?? call.startedAt) * 1_000).toISOString();
-  const durationMinutes = Math.round(call.duration / 60);
-  const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${durationMinutes} min`;
+  const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${formatCallDuration(call.duration)}`;
   const title = `Aircall Touchpoint — ${timestamp}`;
   await incrementCounter("people", personId, personCounterSlug("aircall"), personName);
 
@@ -230,46 +231,58 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
 export async function GET(request: Request): Promise<Response> {
   //[SECURITY] Runs before any external call, so an unauthorized request costs nothing.
   if (!isAuthorizedCron(request)) return json({ error: "Unauthorized" }, 401);
+  const upperBoundMs = Date.now();
+  //[DEBUG] Every figure the closing summary reports lives out here rather than inside the try, so the finally
+  //can print that line on ANY exit - including one where interestedTagSet, a read, or saveSyncCursor threw.
+  //See lib/run-summary.ts.
+  let cursor: SyncCursor | null = null;
+  //The two floors this run derives, held for the summary. Null until the cursor has been read, because both
+  //are computed from it - and a run that never read a cursor never had a window to report.
+  let processFloorMs: number | null = null;
+  let fetchFromMs: number | null = null;
+  let callCount = 0;
+  const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
+  const failures: string[] = [];
+  let interestedCount = 0;
+  //[DEBUG] Most of what the fetch returns is reach, not scope: MAX_CALL_DURATION_MS pulls in an extra span of
+  //already-handled calls so that one long recent call is reachable. Counting the in-scope subset separately
+  //keeps the summary honest - without it, callsFound alone reads as though the run ignored most of its input.
+  let inScopeCount = 0;
+  //Number of calls the loop reached before it stopped, so a partial run can report what it left behind.
+  let examinedCount = 0;
+  //[DEBUG] Of those, the ones the TOUCHPOINT gate rejected as handled on an earlier run. Touchpoints only:
+  //the interested gate runs on reach, not on the cursor, so a call counted here may still have been checked
+  //for tags. Counted so the summary accounts for the window instead of leaving a silent shortfall.
+  let beforeCursorCount = 0;
+  //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
+  //at now - so they are one value rather than two flags that could disagree.
+  let stopReason: "budget" | "throttled" | null = null;
+  let cursorSaved = false;
+  let fatal: string | null = null;
+
   try {
     //[PERF] Read before any network call: a missing or empty AIRCALL_INTERESTED_TAGS throws here, so a
     //misconfigured deployment fails without first paying for the multi-hour Aircall pull it cannot use.
     //[DEBUG] Also fails once per run with a named variable, rather than once per call.
     const interestedTags = interestedTagSet();
-    const upperBoundMs = Date.now();
-    let cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
+    cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
 
     //Oldest completion this run will act on: whichever reaches further back, a cursor left behind by downtime
     //or the fixed lookback. Captured BEFORE the loop, because `cursor` advances inside it and a floor read from
     //the moving cursor would climb as the run progressed, skipping later calls in the same batch.
-    const processFloorMs = Math.min(cursor.timestampMs, upperBoundMs - INTERESTED_LOOKBACK_MS);
+    processFloorMs = Math.min(cursor.timestampMs, upperBoundMs - INTERESTED_LOOKBACK_MS);
     //Creation-time floor. See MAX_CALL_DURATION_MS - without this a long call is never seen finished in range.
-    const fetchFromMs = processFloorMs - MAX_CALL_DURATION_MS;
+    fetchFromMs = processFloorMs - MAX_CALL_DURATION_MS;
     //Aircall orders by creation time; re-sort by completion so the cursor advances monotonically.
     const calls = [...(await fetchAircallCalls(fetchFromMs, upperBoundMs))].sort(
       (left, right) => aircallCursorEvent(left).timestampMs - aircallCursorEvent(right).timestampMs,
     );
-
-    const results: Record<ProcessingOutcome, number> = { processed: 0, skipped: 0, not_tam: 0 };
-    const failures: string[] = [];
-    let interestedCount = 0;
-    //[DEBUG] Most of what the fetch returns is reach, not scope: MAX_CALL_DURATION_MS pulls in an extra span of
-    //already-handled calls so that one long recent call is reachable. Counting the in-scope subset separately
-    //keeps the summary honest - without it, callsFound alone reads as though the run ignored most of its input.
-    let inScopeCount = 0;
+    callCount = calls.length;
 
     //[STABILITY] The wall clock the loop stops at. Measured from upperBoundMs rather than a fresh Date.now(),
     //because upperBoundMs is read at the top of the handler and so the budget covers the Aircall pagination too -
     //a wide backlog spends real time there before the first call is ever processed.
     const budget = startRunBudget(upperBoundMs, "AIRCALL_SYNC_BUDGET_MS");
-    //Number of calls the loop reached before it stopped, so a partial run can report what it left behind.
-    let examinedCount = 0;
-    //[DEBUG] Of those, the ones the TOUCHPOINT gate rejected as handled on an earlier run. Touchpoints only:
-    //the interested gate above runs on reach, not on the cursor, so a call counted here may still have been
-    //checked for tags. Counted so the summary accounts for the window instead of leaving a silent shortfall.
-    let beforeCursorCount = 0;
-    //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
-    //at now - so they are one value rather than two flags that could disagree.
-    let stopReason: "budget" | "throttled" | null = null;
 
     for (const call of calls) {
       //[STABILITY] Checked before the call rather than after, so the budget is what remains for a whole call and
@@ -319,14 +332,14 @@ export async function GET(request: Request): Promise<Response> {
       cursor = advanceCursor(cursor, event);
     }
 
-    const callsRemaining = calls.length - examinedCount;
+    const callsRemaining = callCount - examinedCount;
     if (stopReason) {
       //[STABILITY] Do NOT park at now. Parking is a claim that everything up to that moment has been dealt with,
       //and on a stopped run it has not: the calls the loop never reached would be silently skipped forever.
       //Leaving the cursor at the last completed call is what makes the next run resume instead of restart.
       console.warn(
         stopReason === "budget"
-          ? `[run] aircall sync: stopped after ${budgetSeconds(budget)}s of a ${calls.length}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${callsRemaining > examinedCount ? " More is left than was done - if that repeats, calls are arriving faster than they are processed and the cron cadence in vercel.json wants shortening." : ""}`
+          ? `[run] aircall sync: stopped after ${budgetSeconds(budget)}s of a ${callCount}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${callsRemaining > examinedCount ? " More is left than was done - if that repeats, calls are arriving faster than they are processed and the cron cadence in vercel.json wants shortening." : ""}`
           : `[run] aircall sync: stopped by Attio throttling with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the call that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`,
       );
     } else {
@@ -334,13 +347,11 @@ export async function GET(request: Request): Promise<Response> {
       cursor = advanceCursorTo(cursor, upperBoundMs - CURSOR_GRACE_MS);
     }
     await saveSyncCursor(cursor);
-    console.log(
-      `[run] aircall sync: ${calls.length} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope), ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${stopReason ? `STOPPED (${stopReason}) with ${callsRemaining} left` : "complete"}, cursor now ${new Date(cursor.timestampMs).toISOString()}`,
-    );
+    cursorSaved = true;
     const body = {
       success: failures.length === 0,
       //callsFound is the whole fetch including the reach-back; callsInScope is what the run could act on.
-      callsFound: calls.length,
+      callsFound: callCount,
       callsInScope: inScopeCount,
       //Part of callsFound rather than extra to it: the slice an earlier run had already counted as touchpoints.
       beforeCursor: beforeCursorCount,
@@ -358,6 +369,19 @@ export async function GET(request: Request): Promise<Response> {
     };
     return json(body, failures.length > 0 ? 500 : 200);
   } catch (error) {
+    //Held for the summary below, which runs after this response is prepared and before it is sent.
+    fatal = errorMessage(error);
     return serverError("Aircall touchpoint sync error", error);
+  } finally {
+    //[DEBUG] Exactly one of these per invocation, whatever happened - see lib/run-summary.ts. The reach and
+    //scope floors are stated only once they exist: a run that threw at the config read or the cursor read
+    //never derived a window, and printing one would be inventing it.
+    const window =
+      processFloorMs === null || fetchFromMs === null
+        ? `${callCount} call(s) fetched, no window derived`
+        : `${callCount} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope)`;
+    console.log(
+      `[run] aircall sync: ${window}, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${runOutcome(fatal, stopReason, callCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
+    );
   }
 }

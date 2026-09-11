@@ -58,6 +58,75 @@ function parseEmailType(value: unknown): InstantlyEmailType {
   return "unknown";
 }
 
+//=============================================================================================================
+//Email bodies, as prose.
+//
+//[LOGIC] Instantly sends no plain-text body for the mail it sends itself. A campaign email arrives as
+//`body: { html }` with no `text` key at all, and only an inbound reply - carrying whatever the sender's own
+//client produced - has both. Reading `text` alone therefore left every outbound touchpoint note reading
+//"(no content)", which is most of them. The markup is unwrapped here instead.
+//=============================================================================================================
+
+//Tags whose close ends a line of prose. Everything else (<span>, <a>, <b>) is inline and leaves no break.
+const BLOCK_CLOSE = /<\/(?:p|div|tr|li|h[1-6]|table|blockquote|ul|ol|section|article|header|footer|pre)\s*>/gi;
+const LINE_BREAK = /<(?:br|hr)\b[^>]*>/gi;
+//A <head>, <style> or <script> holds machine text, never prose, so each is dropped whole rather than stripped
+//to its contents - Outlook's charset <meta> alone would otherwise leave a stray line at the top of the note.
+const NON_PROSE = /<(script|style|head)\b[^>]*>[\s\S]*?<\/\1>/gi;
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  apos: "'",
+  gt: ">",
+  lt: "<",
+  nbsp: " ",
+  quot: '"',
+};
+
+/** The named and numeric entities an email body actually uses. Anything unrecognised is left exactly as it was. */
+function decodeEntities(html: string): string {
+  return html.replace(
+    /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z]+));/g,
+    (match: string, decimal?: string, hex?: string, name?: string): string => {
+      if (decimal !== undefined || hex !== undefined) {
+        const code = Number.parseInt(decimal ?? hex ?? "", decimal !== undefined ? 10 : 16);
+        //[STABILITY] Guarded because String.fromCodePoint throws outside the Unicode range, and a malformed
+        //entity in a stranger's email must not fail the whole touchpoint.
+        return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
+      }
+      return NAMED_ENTITIES[(name ?? "").toLowerCase()] ?? match;
+    },
+  );
+}
+
+//---------------------------------------------------------------------------------------------------------
+//[LOGIC] The prose inside an HTML email body, or null when it holds none.
+//FLOW: 1. drop the non-prose elements whole. 2. turn <br> and every block close into a line break. 3. strip
+//the tags that remain. 4. decode entities - AFTER stripping, so a "&lt;div&gt;" written in the text is never
+//mistaken for a tag. 5. trim each line and collapse runs of blank ones, since markup nests and one paragraph
+//break is commonly spelled by three or four tags closing together.
+//USES: nothing. Pure.
+//---------------------------------------------------------------------------------------------------------
+export function htmlToPlainText(html: string | null): string | null {
+  if (!html) return null;
+  const text = decodeEntities(
+    html
+      .replace(NON_PROSE, " ")
+      .replace(LINE_BREAK, "\n")
+      .replace(BLOCK_CLOSE, "\n")
+      .replace(/<[^>]*>/g, ""),
+  )
+    //A non-breaking space reads as a space; left as it is, it reaches Attio as a stray glyph.
+    .replace(/\u00a0/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text.length > 0 ? text : null;
+}
+
 export function parseInstantlyEmail(value: unknown): InstantlyEmail {
   if (!isJsonObject(value)) throw new Error("Instantly returned an invalid email");
   const id = stringValue(value.id);
@@ -79,7 +148,8 @@ export function parseInstantlyEmail(value: unknown): InstantlyEmail {
     leadEmail,
     isAutoReply: value.is_auto_reply === 1,
     subject: stringValue(value.subject),
-    bodyText: stringValue(body?.text),
+    //Falls back to the HTML body, which is all Instantly sends for its own outbound mail. See htmlToPlainText.
+    bodyText: stringValue(body?.text) ?? htmlToPlainText(stringValue(body?.html)),
     threadId: stringValue(value.thread_id),
   };
 }

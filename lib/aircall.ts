@@ -154,3 +154,21 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
   //It is simply omitted; a later run reads it once Aircall marks it done.
   return calls.filter((call) => call.status === "done" && call.endedAt !== null);
 }
+
+//---------------------------------------------------------------------------------------------------------
+//A call's length for a note. Whole minutes are the wrong unit for this data: `duration` counts ring time as
+//well as talk time, and on a dialled campaign a median call runs about 18 seconds, so rounding to minutes
+//printed "0 min" on roughly seven of every eight calls and lost the only length information the note carried.
+//Seconds are always shown, and minutes only once there are any.
+//USES: nothing. Pure.
+//---------------------------------------------------------------------------------------------------------
+export function formatCallDuration(seconds: number): string {
+  //Aircall has been seen to omit duration, and parseAircallCall floors that to 0; a negative value is nonsense
+  //from the same direction. Either way there is no length to report, so say so rather than printing "0s".
+  if (!Number.isFinite(seconds) || seconds <= 0) return "unknown";
+  const whole = Math.round(seconds);
+  const minutes = Math.floor(whole / 60);
+  const remainder = whole % 60;
+  if (minutes === 0) return `${remainder}s`;
+  return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
+}
