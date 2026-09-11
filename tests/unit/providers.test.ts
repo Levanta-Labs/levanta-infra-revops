@@ -66,6 +66,25 @@ const instantlyEmail = {
   thread_id: "thread-1",
 };
 
+//Instantly composes its own outbound mail as HTML and sends no plain-text alternative - `body` really does
+//carry `html` and nothing else. Copied from a live /emails response.
+const instantlySentEmail = {
+  id: "email-2",
+  timestamp_created: "2026-09-11T14:31:04.000Z",
+  timestamp_email: "2026-09-11T14:31:04.000Z",
+  ue_type: 1,
+  is_auto_reply: 0,
+  lead: "roshen.mathew@sscgmedia.com",
+  subject: "Re: a bottle of Macallan?",
+  body: {
+    html:
+      "<div>Hi Roshen,</div><div><br /></div>" +
+      "<div>Up to 2–3× delivery capacity in &lt;3 months.</div><div><br /></div>" +
+      '<div>Cheers,<br /><br /></div><div><div>Victor Vargatu<br style="caret-color:rgb(0, 0, 0)" />CEO @ Levanta Labs Inc</div></div>',
+  },
+  thread_id: "thread-2",
+};
+
 const heyReachConversation = {
   id: "conversation-1",
   linkedInAccountId: 12,
@@ -187,6 +206,37 @@ describe("Instantly client", () => {
       leadEmail: "ada@example.com",
       bodyText: "Interested",
     });
+  });
+
+  //[STABILITY] Not cosmetic. Instantly sends `body: { html }` with no `text` key for its own outbound mail, so
+  //reading `text` alone made every sent touchpoint a note reading "(no content)". Regression guard for that.
+  test("reads a sent email's body from the HTML, which is the only body Instantly gives it", () => {
+    expect(parseInstantlyEmail(instantlySentEmail).bodyText).toBe(
+      "Hi Roshen,\n\nUp to 2\u20133\u00d7 delivery capacity in <3 months.\n\nCheers,\n\nVictor Vargatu\nCEO @ Levanta Labs Inc",
+    );
+  });
+
+  test("prefers the plain-text body when the sender's client supplied one", () => {
+    const withBoth = { ...instantlyEmail, body: { text: "Interested", html: "<div>something else</div>" } };
+    expect(parseInstantlyEmail(withBoth).bodyText).toBe("Interested");
+  });
+
+  test("reads a body holding only markup as no body at all, rather than as an empty note", () => {
+    expect(parseInstantlyEmail({ ...instantlyEmail, body: { html: "<div><br></div>" } }).bodyText).toBeNull();
+    expect(parseInstantlyEmail({ ...instantlyEmail, body: {} }).bodyText).toBeNull();
+  });
+
+  //A <head> is machine text: unstripped, Outlook's charset <meta> would head every reply note.
+  test("drops head, style and script contents instead of unwrapping them into the note", () => {
+    const html = '<html><head><meta charset="us-ascii"></head><style>p{color:red}</style><body>Hello&nbsp;there</body></html>';
+    expect(parseInstantlyEmail({ ...instantlyEmail, body: { html } }).bodyText).toBe("Hello there");
+  });
+
+  test("decodes entities after stripping tags, so escaped markup survives as text", () => {
+    const html = "<div>Use &lt;div&gt; &amp; &quot;quotes&quot; &#39;here&#39; &#x2014; fine</div>";
+    expect(parseInstantlyEmail({ ...instantlyEmail, body: { html } }).bodyText).toBe(
+      "Use <div> & \"quotes\" 'here' \u2014 fine",
+    );
   });
 
   test("uses documented timestamp, lead, ordering, and cursor parameters", async () => {
