@@ -706,6 +706,268 @@ describe("cron handlers", () => {
     }
   });
 
+  //---------------------------------------------------------------------------------------------------------
+  //[STABILITY] The claim the budget stop rests on: what a stopped run did not reach is picked up by the next
+  //run, not skipped and not counted twice. The test above proves only that the cursor is not parked at now.
+  //This one runs the handler TWICE against one persisted cursor and one Instantly window, and checks the pair:
+  //every email is noted exactly once across the two runs, and the second run re-reads and rejects the boundary
+  //email rather than re-noting it.
+  //---------------------------------------------------------------------------------------------------------
+  test("Instantly resumes a budget-stopped window on the next run, noting every email exactly once", async () => {
+    //Each email costs one deliberately slow Attio person lookup, so a budget of a few of those stops the first
+    //run part-way through rather than before it starts. How far it gets is left to the clock: the assertions
+    //below are on the invariant (nothing lost, nothing doubled), not on a particular stopping point.
+    const PER_EMAIL_MS = 120;
+    process.env.INSTANTLY_SYNC_BUDGET_MS = "200";
+
+    const emails = [4, 3, 2, 1].map((minutesAgo) => ({
+      id: `email-${5 - minutesAgo}`,
+      timestamp_created: new Date(Date.now() - minutesAgo * 60 * 1000).toISOString(),
+      timestamp_email: new Date(Date.now() - minutesAgo * 60 * 1000).toISOString(),
+      ue_type: 1,
+      is_auto_reply: 0,
+      lead: "ada@example.com",
+      subject: `Message ${5 - minutesAgo}`,
+      body: { html: `<div>Body ${5 - minutesAgo}</div>` },
+    }));
+
+    //The one row both runs share. The POST handler below writes it exactly as Supabase would, so the second
+    //run reads back what the first one actually saved rather than anything this test made up.
+    let saved = { cursor_timestamp: new Date(Date.now() - 30 * 60 * 1000).toISOString(), cursor_value: null as string | null };
+
+    const respond = async (url: string, init: RequestInit | undefined): Promise<Response> => {
+      if (url.includes("supabase.co") && init?.method === "POST") {
+        saved = JSON.parse(String(init.body)) as typeof saved;
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "instantly-touchpoints", ...saved }]);
+      }
+      if (url.includes("api.instantly.ai")) {
+        //Instantly filters the window server-side, so the second run does NOT see the emails the first one
+        //passed the cursor over - except the one sitting exactly on the mark, which the -1ms bound returns and
+        //isAfterCursor is left to reject. Mocking that faithfully is the point: it is where a duplicate would
+        //come from if the cursor's boundary handling were wrong.
+        const minTimestamp = Date.parse(new URL(url).searchParams.get("min_timestamp_created") ?? "");
+        return jsonResponse({
+          items: emails.filter((email) => Date.parse(email.timestamp_created) >= minTimestamp),
+          next_starting_after: null,
+        });
+      }
+      if (url.includes("objects/people/records/person-1/entries")) {
+        return jsonResponse({ data: [{ list_id: { slug: "master_tam_list" } }] });
+      }
+      if (url.includes("objects/people/records/query")) {
+        await new Promise((resolve) => setTimeout(resolve, PER_EMAIL_MS));
+        return jsonResponse({
+          data: [{ id: { record_id: "person-1" }, values: { company: [], name: [{ full_name: "Ada Lovelace" }] } }],
+        });
+      }
+      if (url.includes("objects/people/records/person-1")) {
+        return init?.method === "PATCH"
+          ? jsonResponse({})
+          : jsonResponse({ data: { id: { record_id: "person-1" }, values: { number_of_emails: [] } } });
+      }
+      if (url.includes("/notes")) return jsonResponse({});
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const mock = installFetchMock(respond);
+    try {
+      const first = await (await instantlySync(cronRequest())).json();
+      expect(first.truncated).toBe(true);
+      //Part-way, which is what makes this a resume rather than a repeat of the "stopped before it started" test.
+      expect(first.processed).toBeGreaterThanOrEqual(1);
+      expect(first.processed).toBeLessThan(emails.length);
+      //The mark sits on the last email it handled - not at now, and not back where it started.
+      const lastHandled = emails[first.processed - 1];
+      expect(Date.parse(saved.cursor_timestamp)).toBe(Date.parse(lastHandled!.timestamp_created));
+      expect(JSON.parse(String(saved.cursor_value))).toEqual([lastHandled!.id]);
+
+      //Second run, with the budget out of the way, starting from exactly what the first one persisted.
+      delete process.env.INSTANTLY_SYNC_BUDGET_MS;
+      const second = await (await instantlySync(cronRequest())).json();
+      expect(second.truncated).toBe(false);
+      //The boundary email comes back down the wire and is refused by the cursor, not by luck of the window.
+      expect(second.beforeCursor).toBe(1);
+      expect(second.emailsFound).toBe(emails.length - first.processed + 1);
+      //Everything the first run left behind, and nothing else.
+      expect(second.processed).toBe(emails.length - first.processed);
+
+      //The claim itself: one note per email across both runs. A lost email is a missing subject here, and a
+      //replayed one is a repeated subject - the two failures the cursor exists to prevent.
+      const titles = mock.calls
+        .filter((call) => call.input.includes("/notes"))
+        .map((call) => (JSON.parse(String(call.init?.body)) as { data: { title: string } }).data.title);
+      expect(titles).toHaveLength(emails.length);
+      expect(new Set(titles).size).toBe(emails.length);
+      for (const email of emails) {
+        expect(titles.some((title) => title.startsWith(`${email.subject} — `))).toBe(true);
+      }
+      //And the counter moved once per email, since a double count is the damage a replay actually does.
+      const patches = mock.calls.filter(
+        (call) => call.input.includes("objects/people/records/person-1") && call.init?.method === "PATCH",
+      );
+      expect(patches).toHaveLength(emails.length);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //---------------------------------------------------------------------------------------------------------
+  //[DEBUG] Every sync's summary line used to be printed after saveSyncCursor and inside the try, so any throw -
+  //and Supabase 504s on both the cursor read and the cursor write often enough to see it in a day's logs - left
+  //the run reporting nothing. A log filtered on "[run] <provider> sync:" then had holes in it that looked
+  //exactly like runs that never fired. These pin the line to every exit, and to saying which exit it was.
+  //---------------------------------------------------------------------------------------------------------
+  function captureRunLog(): { lines: string[]; restore(): void } {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    return { lines, restore: () => { console.log = original; } };
+  }
+
+  //Every sync, by the name its summary line carries. Kept as a table so a fifth provider cannot be added with
+  //the summary guarantee quietly missing from it.
+  const syncs = [
+    { name: "aircall", handler: aircallSync },
+    { name: "instantly", handler: instantlySync },
+    { name: "heyreach", handler: heyReachSync },
+    { name: "outfound", handler: outfoundSync },
+  ] as const;
+
+  for (const { name, handler } of syncs) {
+    test(`${name} still reports a run that failed at the cursor read`, async () => {
+      const log = captureRunLog();
+      const mock = installFetchMock((url) => {
+        if (url.includes("supabase.co")) return jsonResponse({ message: "Gateway Timeout" }, 504);
+        throw new Error(`Unexpected fetch: ${url}`);
+      });
+      try {
+        expect((await handler(cronRequest())).status).toBe(500);
+      } finally {
+        log.restore();
+        mock.restore();
+      }
+      const summary = log.lines.filter((line) => line.startsWith(`[run] ${name} sync:`));
+      //Exactly one, so the line stays countable: one per invocation, never two and never none.
+      expect(summary).toHaveLength(1);
+      expect(summary[0]).toContain("ABANDONED on an error");
+      expect(summary[0]).toContain("Supabase cursor read failed (504)");
+      //Nothing was read, so there is no mark to report and the line says that rather than inventing one.
+      expect(summary[0]).toContain("no cursor was ever read");
+    });
+  }
+
+  test("Aircall reports a run that threw on its config, before it ever reached the cursor", async () => {
+    //interestedTagSet runs ahead of every network call, so this is the earliest a run can die - and the one
+    //place the summary has neither a cursor nor a window to print. It still prints.
+    delete process.env.AIRCALL_INTERESTED_TAGS;
+    const log = captureRunLog();
+    const mock = installFetchMock((url) => {
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      expect((await aircallSync(cronRequest())).status).toBe(500);
+    } finally {
+      log.restore();
+      mock.restore();
+    }
+    const summary = log.lines.filter((line) => line.startsWith("[run] aircall sync:"));
+    expect(summary).toHaveLength(1);
+    expect(summary[0]).toContain("ABANDONED on an error");
+    expect(summary[0]).toContain("no window derived");
+    expect(summary[0]).toContain("no cursor was ever read");
+    //And it cost nothing: the config read is ahead of the multi-hour Aircall pull, which never happened.
+    expect(mock.calls).toHaveLength(0);
+  });
+
+  test("Instantly reports a run that wrote to Attio and then failed to save its cursor", async () => {
+    //The dangerous shape, and the reason the line names the cursor's fate rather than just printing a
+    //timestamp: the touchpoint is committed in Attio, the mark is not, so the next run notes it a second time.
+    const log = captureRunLog();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") {
+        return jsonResponse({ message: "Gateway Timeout" }, 504);
+      }
+      if (url.includes("supabase.co")) {
+        return jsonResponse([
+          {
+            sync_key: "instantly-touchpoints",
+            cursor_value: null,
+            cursor_timestamp: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+          },
+        ]);
+      }
+      if (url.includes("api.instantly.ai")) {
+        return jsonResponse({
+          items: [
+            {
+              id: "email-1",
+              timestamp_created: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+              ue_type: 1,
+              is_auto_reply: 0,
+              lead: "ada@example.com",
+              subject: "Hello",
+              body: { html: "<div>Hello</div>" },
+            },
+          ],
+          next_starting_after: null,
+        });
+      }
+      if (url.includes("objects/people/records/person-1/entries")) {
+        return jsonResponse({ data: [{ list_id: { slug: "master_tam_list" } }] });
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({
+          data: [{ id: { record_id: "person-1" }, values: { company: [], name: [{ full_name: "Ada Lovelace" }] } }],
+        });
+      }
+      if (url.includes("objects/people/records/person-1")) {
+        return init?.method === "PATCH"
+          ? jsonResponse({})
+          : jsonResponse({ data: { id: { record_id: "person-1" }, values: { number_of_emails: [] } } });
+      }
+      if (url.includes("/notes")) return jsonResponse({});
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      expect((await instantlySync(cronRequest())).status).toBe(500);
+    } finally {
+      log.restore();
+      mock.restore();
+    }
+    const summary = log.lines.filter((line) => line.startsWith("[run] instantly sync:"));
+    expect(summary).toHaveLength(1);
+    //The work it did is reported in full, which is the whole point - this is the run that most needs reading.
+    expect(summary[0]).toContain("1 email(s) in window");
+    expect(summary[0]).toContain("1 processed");
+    expect(summary[0]).toContain("cursor NOT saved");
+    expect(summary[0]).toContain("re-read next run");
+  });
+
+  test("Instantly reports a completed run the same way, with the mark it saved", async () => {
+    const log = captureRunLog();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) return jsonResponse([]);
+      return jsonResponse({ items: [], next_starting_after: null });
+    });
+    try {
+      expect((await instantlySync(cronRequest())).status).toBe(200);
+    } finally {
+      log.restore();
+      mock.restore();
+    }
+    const summary = log.lines.filter((line) => line.startsWith("[run] instantly sync:"));
+    expect(summary).toHaveLength(1);
+    expect(summary[0]).toContain("0 email(s) in window");
+    expect(summary[0]).toContain("complete");
+    expect(summary[0]).toMatch(/cursor now \d{4}-\d{2}-\d{2}T/);
+  });
+
   test("Outfound completes an empty read window and persists its high-water mark", async () => {
     const mock = installFetchMock((url, init) => {
       if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
