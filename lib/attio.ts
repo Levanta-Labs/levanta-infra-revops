@@ -109,12 +109,52 @@ function isRetryable(status: number, options: RequestInit): boolean {
 //time. 429 and 5xx are the transient set; anything else Attio returns is deterministic.
 //This is NOT about an immediate retry - attioFetch has already exhausted those by the time a caller sees an
 //error. It is for a caller deciding between "throttled, come back to this" and "this is unprocessable, move
-//on": the touchpoint sync uses it to avoid advancing its cursor past a call it was merely rate-limited out of.
+//on": every touchpoint sync uses it, through beforeAnyWrite below, to avoid advancing its cursor past an
+//event it was merely rate-limited or 500'd out of before it had written anything.
+//Not exported - beforeAnyWrite below is the only caller, and is the form every sync actually wants.
 //---------------------------------------------------------------------------------------------------------
 const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
 
-export function isTransientAttioError(error: unknown): boolean {
+function isTransientAttioError(error: unknown): boolean {
   return error instanceof AttioApiError && TRANSIENT_STATUSES.has(error.status);
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Raised when a touchpoint was throttled or hit a server error BEFORE it had written anything to Attio.
+//
+//WHY THE DISTINCTION EXISTS. Every sync's standing policy is to count a failed event and pass it over, never
+//retrying, because its earlier writes are already committed and a retry would duplicate them. That reasoning
+//holds only once something HAS been written. A 429 or a 500 on the opening lookup wrote nothing, so passing
+//the event over threw it away for no reason: the note and counter were lost and the cursor moved past it
+//regardless. Attio rate-limits on "query complexity" - the filtered lookup at the top of every touchpoint is
+//exactly what trips it - and answers with a bare 500 often enough to see several in a day, so this is the
+//common failure rather than an edge case.
+//
+//An event raising this is left ALONE: the cursor does not advance past it and the run stops, so the next run
+//retries it from the beginning. Nothing was written, so nothing can double.
+//
+//Lives here rather than in one handler because all four syncs catch it. Two `instanceof` checks against two
+//separately-declared classes would silently stop matching, which is exactly the bug this guards against.
+//---------------------------------------------------------------------------------------------------------
+export class ThrottledBeforeWrite extends Error {
+  constructor(readonly reason: unknown) {
+    super(errorMessage(reason));
+    this.name = "ThrottledBeforeWrite";
+  }
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Wraps a touchpoint step that has not yet written anything. A TRANSIENT failure there becomes
+//ThrottledBeforeWrite; a deterministic one (a 400 or 404, a bad slug, a malformed record) is re-raised
+//untouched, because retrying it on every future run would block the sync on an event that can never succeed.
+//---------------------------------------------------------------------------------------------------------
+export async function beforeAnyWrite<T>(step: () => Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    if (isTransientAttioError(error)) throw new ThrottledBeforeWrite(error);
+    throw error;
+  }
 }
 
 /** Attio's Retry-After, in ms, when it sends one. Seconds or an HTTP date; anything else is ignored. */
@@ -129,8 +169,8 @@ function retryAfterMs(response: Response): number | null {
 
 //---------------------------------------------------------------------------------------------------------
 //Single transport for every Attio call in the codebase. Nothing else calls fetch against Attio.
-//FLOW: 1. prefix the path with ATTIO_BASE. 2. merge attioHeaders (endpoints.ts) under any caller override.
-//3. parse the body with responseJson (json.ts). 4. a retryable status with attempts left -> wait and repeat.
+//FLOW: 1. prefix the path with ATTIO_BASE. 2. merge attioHeaders (lib/endpoints.ts) under any caller override.
+//3. parse the body with responseJson (lib/json.ts). 4. a retryable status with attempts left -> wait and repeat.
 //5. any other non-2xx, or the last attempt -> throw AttioApiError carrying status and body.
 //[SECURITY] The bearer token is read from env per request by attioHeaders and never cached in module state.
 //[DEBUG] credentialHint appends the env var name to a 401/403; the typed status lets incrementCounter tell a

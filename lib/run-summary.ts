@@ -18,16 +18,16 @@ import type { SyncCursor } from "./cursors.js";
 
 //---------------------------------------------------------------------------------------------------------
 //[DEBUG] How the run ended.
-//`stopped` is false or null when the loop ran to the end; true for a sync with a single stop condition; and
-//the reason itself for Aircall and Outfound, which can stop on their budget or on provider throttling and
-//want those told apart.
+//`stopped` is null when the loop ran to the end, and otherwise the reason it stopped - "budget" or
+//"throttled". All four syncs can stop either way, so all four name which it was; the two want telling apart
+//because a budget stop is a throughput problem and a throttle is a rate-limit one.
 //[LOGIC] A fatal outranks a stop. If both happened then the save is what threw, and that is the half worth
 //reading - a stop only means "resume from here next run" once its cursor has actually reached Supabase.
 //---------------------------------------------------------------------------------------------------------
-export function runOutcome(fatal: string | null, stopped: boolean | string | null, remaining: number): string {
+export function runOutcome(fatal: string | null, stopped: string | null, remaining: number): string {
   if (fatal) return `ABANDONED on an error - ${fatal}`;
   if (!stopped) return "complete";
-  return `STOPPED${typeof stopped === "string" ? ` (${stopped})` : ""} with ${remaining} left`;
+  return `STOPPED (${stopped}) with ${remaining} left`;
 }
 
 //---------------------------------------------------------------------------------------------------------

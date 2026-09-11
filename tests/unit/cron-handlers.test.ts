@@ -576,6 +576,167 @@ describe("cron handlers", () => {
     }
   });
 
+  //=========================================================================================================
+  //The same stop, on the other three syncs. Ported from Aircall after production logs showed the Instantly
+  //sync dropping touchpoints outright: Attio answered the opening lookup with a bare 500, the loop logged
+  //"FAILED and passed over", and the cursor advanced anyway - so the note and counter were lost for good and
+  //nothing recorded that the email had ever existed. A 500 is used here rather than a 429 because that is
+  //what Attio actually sent.
+  //=========================================================================================================
+
+  test("Instantly stops on an Attio 500 before any write, leaving the email above the cursor", async () => {
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const createdAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "instantly-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ status_code: 500, type: "api_error", message: "An internal server error occurred." }, 500);
+      }
+      return jsonResponse({
+        items: [1, 2].map((id) => ({
+          id: `email-${id}`,
+          timestamp_created: createdAt,
+          ue_type: 1,
+          is_auto_reply: false,
+          lead: `lead${id}@example.com`,
+        })),
+        next_starting_after: null,
+      });
+    });
+    try {
+      const body = await (await instantlySync(cronRequest())).json();
+      //Deferred, not failed: nothing was written, so the run is still a success and failed stays at zero.
+      expect(body).toMatchObject({
+        success: true,
+        truncated: true,
+        stopReason: "throttled",
+        failed: 0,
+        processed: 0,
+        emailsRemaining: 2,
+      });
+      //The cursor did NOT move past the 500'd email, and was not parked at now either.
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Instantly still passes over a deterministic lookup failure rather than stopping forever", async () => {
+    //The other half of the distinction, as on Aircall. A 404 fails identically every run, so deferring it
+    //would wedge the sync on one unprocessable email.
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const createdAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "instantly-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("objects/people/records/query")) return jsonResponse({ error: "gone" }, 404);
+      return jsonResponse({
+        items: [{ id: "email-1", timestamp_created: createdAt, ue_type: 1, is_auto_reply: false, lead: "lead1@example.com" }],
+        next_starting_after: null,
+      });
+    });
+    try {
+      const response = await instantlySync(cronRequest());
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toMatchObject({ truncated: false, failed: 1 });
+      expect(body).not.toHaveProperty("stopReason");
+      //Passed over means the cursor moved past it, and the run then parked short of now.
+      expect(Date.parse(body.cursorTimestamp)).toBeGreaterThan(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("HeyReach stops on an Attio 500 before any write, leaving the message above the cursor", async () => {
+    const sentAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "heyreach-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ status_code: 500, type: "api_error", message: "An internal server error occurred." }, 500);
+      }
+      return jsonResponse({
+        items: [
+          {
+            id: "conversation-1",
+            linkedInAccountId: 7,
+            lastMessageAt: sentAt,
+            correspondentProfile: { linkedin_id: "ada", profileUrl: "https://linkedin.com/in/ada" },
+            messages: [1, 2].map((id) => ({ id: `message-${id}`, sender: "user", body: `hello ${id}`, createdAt: sentAt })),
+          },
+        ],
+        totalCount: 1,
+        hasNextPage: false,
+        nextCursor: null,
+      });
+    });
+    try {
+      const body = await (await heyReachSync(cronRequest())).json();
+      expect(body).toMatchObject({
+        success: true,
+        truncated: true,
+        stopReason: "throttled",
+        failed: 0,
+        processed: 0,
+      });
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("Outfound stops on an Attio 500 before any write, leaving the email above the cursor", async () => {
+    //Distinct from the OutfoundRateLimitError stop above: that one is Outfound refusing to hand over a thread,
+    //this one is Attio refusing the person lookup once the thread has already been read.
+    const sentAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const cursorSavedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const mock = installFetchMock((url, init) => {
+      if (url.includes("supabase.co") && init?.method === "POST") return new Response(null, { status: 204 });
+      if (url.includes("supabase.co")) {
+        return jsonResponse([{ sync_key: "outfound-touchpoints", cursor_value: null, cursor_timestamp: cursorSavedAt }]);
+      }
+      if (url.includes("objects/people/records/query")) {
+        return jsonResponse({ status_code: 500, type: "api_error", message: "An internal server error occurred." }, 500);
+      }
+      if (url.includes("/emails")) {
+        return jsonResponse({
+          items: [
+            { id: "email-1", sender: "rep@x.com", recipient: "ada@example.com", subject: "Hi", body_plain: "one", sent_at: sentAt, type: "Sent" },
+          ],
+        });
+      }
+      if (url.includes("/email-inbox/threads")) {
+        return jsonResponse({
+          items: [{ thread_hash: "thread-1", prospect_lead_email: "ada@example.com", last_email_timestamp: sentAt }],
+          next_cursor: null,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const body = await (await outfoundSync(cronRequest())).json();
+      expect(body).toMatchObject({
+        success: true,
+        truncated: true,
+        stopReason: "throttled",
+        failed: 0,
+        processed: 0,
+      });
+      expect(Date.parse(body.cursorTimestamp)).toBe(Date.parse(cursorSavedAt));
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("Aircall still passes over a deterministic lookup failure rather than stopping forever", async () => {
     //The other half of the distinction. A 404 will fail identically on every future run, so stopping the run on
     //it would wedge the sync on one unprocessable call. Only a transient status defers; this one is passed over

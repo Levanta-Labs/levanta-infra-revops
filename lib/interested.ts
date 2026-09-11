@@ -376,7 +376,7 @@ const ALWAYS_OVERWRITE: ReadonlySet<string> = new Set(["lead_source"]);
 /**
  * [LOGIC] The scalars an attribute currently holds, or null if ANY entry could not be read. All-or-nothing on
  * purpose: a partial read is what would silently delete the entries it failed to see - see mergeMultiselect.
- * USES: arrayValue, isJsonObject (lib/json.js). Pure.
+ * USES: arrayValue, isJsonObject (lib/json.ts). Pure.
  */
 function existingScalars(record: AttioRecord, slug: string, read: ScalarReader): string[] | null {
   const scalars: string[] = [];
@@ -399,7 +399,7 @@ function existingScalars(record: AttioRecord, slug: string, read: ScalarReader):
 //FLOW: 1. no reader for this slug -> decline. 2. read the existing entries; unreadable -> decline. 3. keep only
 //candidates not already present, compared case-insensitively. 4. nothing new -> decline. 5. existing + new.
 //[DEBUG] The decline at step 2 warns, because an attribute quietly not gaining a value is undiagnosable.
-//USES: existingScalars, MULTISELECT_READERS (this module); arrayValue (lib/json.js).
+//USES: existingScalars, MULTISELECT_READERS (this module); arrayValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 function mergeMultiselect(
   record: AttioRecord,
@@ -467,7 +467,7 @@ export interface AttributeWriteResult {
 //provider value would not fit an Attio attribute is a far worse outcome than a blank field. What was dropped is
 //logged, because an attribute silently missing with no record of why is undiagnosable.
 //---------------------------------------------------------------------------------------------------------
-//USES: patchRecord, AttioApiError (lib/attio.ts); errorMessage (lib/json.js).
+//USES: patchRecord, AttioApiError (lib/attio.ts); errorMessage (lib/json.ts).
 //[DEBUG] Everything dropped is named individually and then counted, so a missing attribute has a cause on
 //record. patchRecord logs its own FAILED line first; the [attio] line that follows says what was done about it.
 async function writeSalvagingRejections(
@@ -768,7 +768,7 @@ const ATTIO_DNC_CHANNEL: SuppressionChannel = {
 //[DEBUG] Every channel logs its own result and the summary repeats them together, so a half-suppressed lead is
 //readable from one line rather than reconstructed from three.
 //USES: ATTIO_DNC_CHANNEL (this module), THIRD_PARTY_SUPPRESSION_CHANNELS (lib/providers.ts),
-//errorMessage (lib/json.js).
+//errorMessage (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function suppressInterestedLead(targets: SuppressionTargets): Promise<SuppressionResult> {
   const channels = [ATTIO_DNC_CHANNEL, ...THIRD_PARTY_SUPPRESSION_CHANNELS];

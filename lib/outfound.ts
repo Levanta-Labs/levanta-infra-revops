@@ -207,7 +207,7 @@ const MAX_THREAD_PAGES = 200;
 //difference either way, because it is wider than the gap between them can plausibly be.
 //[STABILITY] Both bounds are sent as naive UTC. A timezone designator makes this endpoint answer 500 - see
 //outfoundNaiveUtc, which is a workaround for an upstream bug and not a formatting preference.
-//USES: outfoundFetch (this module); arrayValue, stringValue (json.ts).
+//USES: outfoundFetch (this module); arrayValue, stringValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function fetchOutfoundThreads(
   query: OutfoundThreadQuery,
@@ -246,7 +246,7 @@ export async function fetchOutfoundThreads(
 //Every message in one thread. The second half of every read: the inbox listing carries no bodies.
 //[PERF] One request per thread, which is what makes the touchpoint sync's cost scale with threads rather than
 //with pages. The run budget is what keeps that bounded - see lib/run-budget.ts.
-//USES: outfoundFetch, parseOutfoundEmail (this module); arrayValue (json.ts).
+//USES: outfoundFetch, parseOutfoundEmail (this module); arrayValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function fetchOutfoundThreadEmails(
   threadHash: string,
@@ -318,7 +318,7 @@ function parseConversation(value: unknown): OutfoundConversation | null {
 //grouped per client, each client holding its own prospects and recent_conversations.
 //Conversations are flattened ACROSS clients. A lead worked by two clients has two groups, and the note is the
 //whole correspondence with that person rather than one client's slice of it.
-//USES: parseConversation (this module); isJsonObject, objectValue, arrayValue, stringValue (json.ts).
+//USES: parseConversation (this module); isJsonObject, objectValue, arrayValue, stringValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export function parseOutfoundLead(value: unknown): OutfoundLead {
   if (!isJsonObject(value)) throw new Error("Outfound returned an invalid lead");
