@@ -195,8 +195,10 @@ export async function GET(request: Request): Promise<Response> {
     //[DEBUG] Exactly one of these per invocation, whatever happened. A log filtered on "[run] instantly sync:"
     //is then a complete record of the runs, and a gap in it means a run that produced no output at all - a
     //Vercel kill at maxDuration, rather than any failure this handler was alive to see.
+    //It leads with the touchpoints actually written, because that is the figure anyone reading a run wants
+    //first; the breakdown that follows says how the rest of the window was accounted for.
     console.log(
-      `[run] instantly sync: ${emailCount} email(s) in window, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stoppedOnBudget, emailCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
+      `[run] instantly sync: ${results.processed} touchpoint(s) logged, ${emailCount} email(s) in window, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stoppedOnBudget, emailCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
     );
   }
 }

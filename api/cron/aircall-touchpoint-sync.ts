@@ -376,12 +376,14 @@ export async function GET(request: Request): Promise<Response> {
     //[DEBUG] Exactly one of these per invocation, whatever happened - see lib/run-summary.ts. The reach and
     //scope floors are stated only once they exist: a run that threw at the config read or the cursor read
     //never derived a window, and printing one would be inventing it.
+    //It leads with the touchpoints actually written, because that is the figure anyone reading a run wants
+    //first; the breakdown that follows says how the rest of the window was accounted for.
     const window =
       processFloorMs === null || fetchFromMs === null
         ? `${callCount} call(s) fetched, no window derived`
         : `${callCount} call(s) fetched from ${new Date(fetchFromMs).toISOString()} (reach), ${inScopeCount} completed at or after ${new Date(processFloorMs).toISOString()} (scope)`;
     console.log(
-      `[run] aircall sync: ${window}, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${runOutcome(fatal, stopReason, callCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
+      `[run] aircall sync: ${results.processed} touchpoint(s) logged, ${window}, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${interestedCount} interested, ${failures.length} failed and passed over, ${runOutcome(fatal, stopReason, callCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
     );
   }
 }
