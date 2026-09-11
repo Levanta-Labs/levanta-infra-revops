@@ -124,7 +124,7 @@ export function parseAircallCall(value: unknown): AircallCall {
 //covers its start and is out of range by the run that covers its end. See MAX_CALL_DURATION_MS in the cron.
 //Sorting cannot substitute for this: `order` only walks created_at, and a call outside the filter is absent
 //from the result set entirely, not merely out of order. No v1 endpoint filters or sorts on ended_at.
-//USES: aircallAuthHeader, credentialHint (endpoints.ts); responseJson, arrayValue, objectValue (json.ts).
+//USES: aircallAuthHeader, credentialHint (lib/endpoints.ts); responseJson, arrayValue, objectValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
   const calls: AircallCall[] = [];

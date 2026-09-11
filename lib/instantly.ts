@@ -166,7 +166,7 @@ export interface InstantlyEmailQuery {
 //FLOW: 1. build a page from whichever query fields are set. 2. GET. 3. parse items. 4. follow
 //next_starting_after until absent.
 //Filters are on timestamp_created, which is also what the cron keys its cursor on, so window and cursor agree.
-//USES: instantlyAuthHeader, credentialHint (endpoints.ts); responseJson, arrayValue (json.ts).
+//USES: instantlyAuthHeader, credentialHint (lib/endpoints.ts); responseJson, arrayValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function fetchInstantlyEmails(
   query: InstantlyEmailQuery,

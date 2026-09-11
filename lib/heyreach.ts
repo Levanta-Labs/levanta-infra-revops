@@ -113,7 +113,7 @@ export function parseHeyReachConversation(value: unknown): HeyReachConversation 
 //A five-minute run therefore routinely receives messages hours or days old, and the volume grows through the
 //day. Rounding always goes DOWN to the start of the day, so the result over-includes and no message can slip
 //past a window boundary. Deduplication is the per-message cursor check in the sync handler, not this filter.
-//USES: heyreachHeaders, credentialHint (endpoints.ts); responseJson, arrayValue, booleanValue (json.ts).
+//USES: heyreachHeaders, credentialHint (lib/endpoints.ts); responseJson, arrayValue, booleanValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
 export async function fetchHeyReachConversations(
   query: HeyReachConversationQuery,

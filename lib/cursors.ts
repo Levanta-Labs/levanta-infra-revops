@@ -139,8 +139,8 @@ export function advanceCursorTo(cursor: SyncCursor, timestampMs: number): SyncCu
 
 //---------------------------------------------------------------------------------------------------------
 //Reads one sync's persisted mark from Supabase (PostgREST).
-//FLOW: 1. build a filtered single-row GET. 2. send with supabaseHeaders (endpoints.ts). 3. throw on non-2xx,
-//appending credentialHint (endpoints.ts). 4. no row -> initialCursor, a ten-minute lookback. 5. row -> parse
+//FLOW: 1. build a filtered single-row GET. 2. send with supabaseHeaders (lib/endpoints.ts). 3. throw on non-2xx,
+//appending credentialHint (lib/endpoints.ts). 4. no row -> initialCursor, a ten-minute lookback. 5. row -> parse
 //via parseCursorRow / parseCursorTimestamp / parseBoundaryIds.
 //[STABILITY] An unreadable or malformed row throws rather than defaulting, because a silently reset mark would
 //replay or skip an unbounded stretch of history.

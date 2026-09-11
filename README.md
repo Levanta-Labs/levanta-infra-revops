@@ -297,8 +297,9 @@ budget stop:
   with and must stay above the mark.
 - The response carries `truncated: true` and a count of what is left (`callsRemaining` / `emailsRemaining` /
   `messagesRemaining` / `threadsRemaining`), and the run logs a `[run] ... STOPPED` warning. The HTTP status stays 200 - a partial run is
-  a success, not a failure. The Aircall and Outfound syncs additionally report `stopReason`, since both can also
-  stop on a throttle.
+  a success, not a failure. All four syncs also report `stopReason`, because all four can stop for either of two
+  reasons - `"budget"` or `"throttled"` - and the two want different responses: a budget stop is a throughput
+  problem, a throttle is a rate-limit one.
 
 Aircall reached the limit first, on volume; the others have the identical shape and so the identical risk. HeyReach
 is the most exposed on steady state - see the `[PERF]` note on its handler, where cost grows through the UTC day
@@ -312,7 +313,8 @@ budget opens before the expansion and stops that too. A run ending there reports
 `threadsScanned` plus a `threadsRemaining` count, and - critically - still refuses to park the cursor: the threads
 it never opened hold emails it never saw, and parking would claim otherwise and skip them permanently.
 
-**Outfound also stops on a throttle** (`stopReason: "throttled"`), as the Aircall sync does. This matters more here
+**Outfound stops on an Outfound throttle too**, not just an Attio one - the same `stopReason: "throttled"`, raised
+one step earlier, while it is still expanding threads. This matters more here
 than the raw request count suggests, because **the dashboard's headline rate limit is not the one that applies**.
 The Integrations screen labels the client key `100K/hr`; that is the *organization* ceiling. `GET /rate-limit`
 reports what the key itself gets, and the key in use is on the `standard` tier: **9/second, 3,000/hour**. Against a
@@ -328,7 +330,7 @@ the default rather than failing the run.
 
 > **The cadence must exceed the budget.** A run may legitimately take the whole 240s, and nothing guards against two
 > invocations of one sync running at once - they would read the same cursor and double-count every event between
-> them. The current cadences (`*/10` for Aircall, `*/5` for the other two) leave headroom; `*/5` against a 240s
+> them. The current cadences (`*/10` for Aircall, `*/5` for the other three) leave headroom; `*/5` against a 240s
 > budget leaves only one minute of it. Shortening a cadence towards the budget means lowering that sync's budget
 > with it.
 
@@ -351,25 +353,32 @@ Four attempts, `Retry-After` honoured when Attio sends one and 0.5s/1s/2s backof
 permanently throttled account has to surface rather than absorb the whole run budget in sleeps - and if it does
 absorb it, the budget stop above handles that cleanly.
 
-**Beyond the retries, a throttle before the first write no longer loses the call.** The sync's standing policy is to
-count a failed call and pass it over, never retrying, because its earlier writes are already committed and a retry
-would duplicate them. That reasoning only holds once something *has* been written. A touchpoint's first two Attio
-requests - the filtered person lookup and the Master TAM list read - write nothing, so a transient failure there was
-being discarded for no reason: the counter and note were lost and the cursor advanced past the call regardless.
+**Beyond the retries, a transient failure before the first write no longer loses the event.** Every sync's standing
+policy is to count a failed event and pass it over, never retrying, because its earlier writes are already committed
+and a retry would duplicate them. That reasoning only holds once something *has* been written. A touchpoint's first
+two Attio requests - the filtered person lookup and the Master TAM list read - write nothing, so a transient failure
+there was being discarded for no reason: the counter and note were lost and the cursor advanced past the event
+regardless.
 
-A transient failure in that pre-write region now raises `ThrottledBeforeWrite`, and the run stops with the cursor
-still **below** that call. The next run starts on it. Nothing is lost and nothing can double, because nothing was
-written. The response reports `stopReason: "throttled"` and the run is still a success with `failed: 0` - the work is
-deferred, not failed.
+A transient failure in that pre-write region now raises `ThrottledBeforeWrite` (`lib/attio.ts`, via `beforeAnyWrite`),
+and the run stops with the cursor still **below** that event. The next run starts on it. Nothing is lost and nothing
+can double, because nothing was written. The response reports `stopReason: "throttled"` and the run is still a
+success with `failed: 0` - the work is deferred, not failed.
+
+**All four syncs do this.** It started on Aircall, where 429s on query complexity made it the common failure, and was
+extended to the other three after production logs showed the Instantly sync dropping touchpoints on bare Attio 500s -
+the same loss, a different status code. The class and its wrapper live in `lib/attio.ts` rather than in any one
+handler, because four `instanceof` checks against four separately-declared classes would silently stop matching.
 
 Two things stay on the old pass-over path, both deliberately:
 
 - **A deterministic failure** (a 404, a bad attribute slug) anywhere. It will fail identically on every future run,
-  so stopping the run on it would wedge the sync on one unprocessable call.
+  so stopping the run on it would wedge the sync on one unprocessable event.
 - **A transient failure from the first write onward.** `incrementCounter` opens with a read but its `PATCH` is inside
   the same call, so a failure there cannot be told apart from one after it. Retrying would risk double-counting a
-  Person, which is the worse outcome. This is a KNOWN GAP: a 429 landing between the Person counter and the Company
-  note still loses the note and the Company counter, and says so in the log.
+  Person, which is the worse outcome. This is a KNOWN GAP: a 429 or 500 landing between the Person counter and the
+  Company note still loses the note and the Company counter, and says so in the log. Recovering those needs a
+  dead-letter record for manual replay, which does not exist today.
 
 If the lookback is ever retuned, two figures move together: tag tolerance, and how many times an interested call's
 notes are written, which is the lookback divided by the cadence. Having both wide coverage and no duplicates needs a

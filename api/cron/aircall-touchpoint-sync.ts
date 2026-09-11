@@ -6,17 +6,18 @@ import {
   processAircallInterested,
 } from "../../lib/aircall-interested.js";
 import {
+  beforeAnyWrite,
   companyCounterSlug,
   createNote,
   findPersonByPhone,
   incrementCounter,
   isPersonInList,
-  isTransientAttioError,
   LISTS,
   personCompanyId,
   personCounterSlug,
   personDisplayName,
   personLabel,
+  ThrottledBeforeWrite,
 } from "../../lib/attio.js";
 import {
   advanceCursor,
@@ -78,39 +79,8 @@ const INTERESTED_LOOKBACK_MS = 5 * 60 * 1_000;
 //so no counter, log line, or failure records that it existed.
 const MAX_CALL_DURATION_MS = 2 * 60 * 60 * 1_000;
 
-//---------------------------------------------------------------------------------------------------------
-//Raised when a touchpoint was throttled or hit a server error BEFORE it had written anything to Attio.
-//
-//WHY THE DISTINCTION EXISTS. This sync's standing policy is to count a failed call and pass it over, never
-//retrying, because its earlier writes are already committed and a retry would duplicate them. That reasoning
-//holds only once something HAS been written. A 429 on the opening lookup wrote nothing, so passing the call
-//over threw it away for no reason: the counter and note were lost and the cursor moved past it regardless.
-//Attio rate-limits on "query complexity" - the filtered lookup at the top of every touchpoint is exactly what
-//trips it - so this was the common failure, not an edge case.
-//
-//A call raising this is left ALONE: the cursor does not advance past it and the run stops, so the next run
-//retries it from the beginning. Nothing was written, so nothing can double.
-//---------------------------------------------------------------------------------------------------------
-class ThrottledBeforeWrite extends Error {
-  constructor(readonly reason: unknown) {
-    super(errorMessage(reason));
-    this.name = "ThrottledBeforeWrite";
-  }
-}
-
-//---------------------------------------------------------------------------------------------------------
-//Wraps a touchpoint step that has not yet written anything. A TRANSIENT failure there becomes
-//ThrottledBeforeWrite; a deterministic one (a 400 or 404, a bad slug, a malformed record) is re-raised
-//untouched, because retrying it on every future run would block the sync on a call that can never succeed.
-//---------------------------------------------------------------------------------------------------------
-async function beforeAnyWrite<T>(step: () => Promise<T>): Promise<T> {
-  try {
-    return await step();
-  } catch (error) {
-    if (isTransientAttioError(error)) throw new ThrottledBeforeWrite(error);
-    throw error;
-  }
-}
+//ThrottledBeforeWrite and beforeAnyWrite now live in lib/attio.ts, because all four syncs catch the same
+//class - see the commentary there for why the pre-write region is treated differently from everything after it.
 
 type ProcessingOutcome = "processed" | "skipped" | "not_tam";
 

@@ -1,4 +1,5 @@
 import {
+  beforeAnyWrite,
   companyCounterSlug,
   createNote,
   findPersonByEmail,
@@ -9,6 +10,7 @@ import {
   personCounterSlug,
   personDisplayName,
   personLabel,
+  ThrottledBeforeWrite,
 } from "../../lib/attio.js";
 import {
   advanceCursor,
@@ -155,7 +157,10 @@ export async function processOutfoundTouchpoint(
     console.log(`[event] outfound email ${event.email.id}: skipped - no lead email on the thread`);
     return "skipped";
   }
-  const person = await findPersonByEmail(leadEmail);
+  //[STABILITY] The filtered lookup, and the list read after it, are the whole pre-write region - see
+  //beforeAnyWrite (lib/attio.ts). incrementCounter below opens with a read too, but its PATCH is inside the
+  //same call, so a failure there cannot be told apart from a failure after it and stays on the pass-over path.
+  const person = await beforeAnyWrite(() => findPersonByEmail(leadEmail));
   if (!person) {
     console.log(`[event] outfound email ${event.email.id}: skipped - no Attio person has ${leadEmail}`);
     return "skipped";
@@ -163,7 +168,7 @@ export async function processOutfoundTouchpoint(
   const personId = person.id.record_id;
   const personName = personLabel(person);
   //Master TAM is the gate on counting anything: off-list people are read but never written to.
-  if (!(await isPersonInList(personId, LISTS.MASTER_TAM, personName))) {
+  if (!(await beforeAnyWrite(() => isPersonInList(personId, LISTS.MASTER_TAM, personName)))) {
     console.log(
       `[event] outfound email ${event.email.id}: skipped - person ${personName} is not on the Master TAM list`,
     );
@@ -194,9 +199,9 @@ export async function processOutfoundTouchpoint(
 //FLOW: 1. isAuthorizedCron (lib/http.ts). 2. getSyncCursor (lib/cursors.ts). 3. fetchOutfoundThreads
 //(lib/outfound.ts) over cursor..now. 4. outfoundTouchpointEvents expands them to a chronological email stream.
 //5. per email, skip anything at or below the mark, else processOutfoundTouchpoint. 6. advance the mark past
-//each handled email. 6a. stop at the run budget if still going. 7. park at (now - OUTFOUND_CURSOR_GRACE_MS)
-//and persist - the park is SKIPPED on a budget stop, since the emails the loop never reached must stay above
-//the mark. See lib/run-budget.ts.
+//each handled email. 6a. stop at the run budget if still going, or if an email was throttled before writing
+//anything. 7. park at (now - OUTFOUND_CURSOR_GRACE_MS) and persist - the park is SKIPPED on either stop, since
+//the emails the loop never reached must stay above the mark. See lib/run-budget.ts.
 //
 //[PERF] The expansion at step 4 spends one request per thread and happens BEFORE the budget loop opens, so a
 //very wide window can spend real time there before the first email is ever written. The budget is measured from
@@ -206,7 +211,9 @@ export async function processOutfoundTouchpoint(
 //sync's. See lib/cursors.ts.
 //[STABILITY] A failed email is counted and passed over, never retried: its earlier writes are committed, so a
 //retry would duplicate them, and a permanently failing one would block the sync forever. A failed THREAD is
-//different - nothing was written and the mark never passed it, so it is retried next run.
+//different - nothing was written and the mark never passed it, so it is retried next run. So is an email that
+//Attio threw on BEFORE its first write; that stops the run rather than being passed over, on the same
+//reasoning as the thread - see ThrottledBeforeWrite (lib/attio.ts).
 //KNOWN GAP: Outfound exposes no per-message auto-reply flag, so an out-of-office is counted as a touchpoint
 //where the Instantly sync would discard it. Outfound does categorise replies as human or automatic, but only
 //per THREAD, and applying a thread's verdict to every message in it would discard real replies alongside the
@@ -270,13 +277,28 @@ export async function GET(request: Request): Promise<Response> {
         const outcome = await processOutfoundTouchpoint(event);
         results[outcome] += 1;
       } catch (error) {
+        //[STABILITY] Throttled or 500'd by ATTIO before writing anything: the one failure that is safe to
+        //attempt again. The cursor is left BELOW this email and the run stops here, so the next run starts on
+        //it. Deliberately not counted as a failure - nothing was lost, the work is deferred. Distinct from the
+        //OutfoundRateLimitError stop in the expansion above, which is the same idea applied to reading
+        //threads. See ThrottledBeforeWrite (lib/attio.ts).
+        if (error instanceof ThrottledBeforeWrite) {
+          console.warn(
+            `[event] outfound email ${event.email.id}: throttled before writing anything - ${error.message}. The run stops here and the next one starts on this email, so nothing is lost and nothing is double-counted.`,
+          );
+          stopReason = "throttled";
+          //Examined but not handled, so it counts towards what is left rather than what was done.
+          examinedCount -= 1;
+          break;
+        }
         failures.push(`Email ${event.email.id}: ${errorMessage(error)}`);
         console.error(
           `[event] outfound email ${event.email.id}: FAILED and passed over - ${errorMessage(error)}. Whatever it already wrote stays as it is, and it will not be attempted again.`,
         );
       }
       //The cursor advances whether or not the touchpoint succeeded. A failed event is passed over after one
-      //attempt rather than blocking every later event on this and all future runs.
+      //attempt rather than blocking every later event on this and all future runs. The one exception broke out
+      //above, before reaching this line.
       cursor = advanceCursor(cursor, event.cursor);
     }
 
