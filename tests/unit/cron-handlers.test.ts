@@ -854,6 +854,10 @@ describe("cron handlers", () => {
       const summary = log.lines.filter((line) => line.startsWith(`[run] ${name} sync:`));
       //Exactly one, so the line stays countable: one per invocation, never two and never none.
       expect(summary).toHaveLength(1);
+      //The headline figure comes first on every sync, a failed run included. Anchored to the start of the
+      //line rather than merely present in it, because "in front" is the requirement. Zero here on purpose:
+      //this run died at the cursor read, so the count it leads with is the one it truly wrote.
+      expect(summary[0]).toStartWith(`[run] ${name} sync: 0 touchpoint(s) logged, `);
       expect(summary[0]).toContain("ABANDONED on an error");
       expect(summary[0]).toContain("Supabase cursor read failed (504)");
       //Nothing was read, so there is no mark to report and the line says that rather than inventing one.
@@ -942,6 +946,8 @@ describe("cron handlers", () => {
     const summary = log.lines.filter((line) => line.startsWith("[run] instantly sync:"));
     expect(summary).toHaveLength(1);
     //The work it did is reported in full, which is the whole point - this is the run that most needs reading.
+    //The headline count is the touchpoint it actually wrote, not a figure that is only ever zero.
+    expect(summary[0]).toStartWith("[run] instantly sync: 1 touchpoint(s) logged, ");
     expect(summary[0]).toContain("1 email(s) in window");
     expect(summary[0]).toContain("1 processed");
     expect(summary[0]).toContain("cursor NOT saved");
@@ -963,6 +969,7 @@ describe("cron handlers", () => {
     }
     const summary = log.lines.filter((line) => line.startsWith("[run] instantly sync:"));
     expect(summary).toHaveLength(1);
+    expect(summary[0]).toStartWith("[run] instantly sync: 0 touchpoint(s) logged, ");
     expect(summary[0]).toContain("0 email(s) in window");
     expect(summary[0]).toContain("complete");
     expect(summary[0]).toMatch(/cursor now \d{4}-\d{2}-\d{2}T/);

@@ -226,9 +226,11 @@ export async function GET(request: Request): Promise<Response> {
     fatal = errorMessage(error);
     return serverError("HeyReach touchpoint sync error", error);
   } finally {
-    //[DEBUG] Exactly one of these per invocation, whatever happened - see lib/run-summary.ts.
+    //[DEBUG] Exactly one of these per invocation, whatever happened - see lib/run-summary.ts. It leads with
+    //the touchpoints actually written, because that is the figure anyone reading a run wants first; the
+    //breakdown that follows says how the rest of the window was accounted for.
     console.log(
-      `[run] heyreach sync: ${conversationCount} conversation(s) and ${messageCount} message(s) returned, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stoppedOnBudget, messageCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
+      `[run] heyreach sync: ${results.processed} touchpoint(s) logged, ${conversationCount} conversation(s) and ${messageCount} message(s) returned, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stoppedOnBudget, messageCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
     );
   }
 }

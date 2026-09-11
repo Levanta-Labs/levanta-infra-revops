@@ -320,9 +320,11 @@ export async function GET(request: Request): Promise<Response> {
     fatal = errorMessage(error);
     return serverError("Outfound touchpoint sync error", error);
   } finally {
-    //[DEBUG] Exactly one of these per invocation, whatever happened - see lib/run-summary.ts.
+    //[DEBUG] Exactly one of these per invocation, whatever happened - see lib/run-summary.ts. It leads with
+    //the touchpoints actually written, because that is the figure anyone reading a run wants first; the
+    //breakdown that follows says how the rest of the window was accounted for.
     console.log(
-      `[run] outfound sync: ${threadCount} thread(s) listed, ${threadsExpanded} expanded, ${emailCount} email(s) returned, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stopReason, emailCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
+      `[run] outfound sync: ${results.processed} touchpoint(s) logged, ${threadCount} thread(s) listed, ${threadsExpanded} expanded, ${emailCount} email(s) returned, ${beforeCursorCount} from before the cursor and already counted, ${results.processed} processed, ${results.skipped} skipped, ${results.not_tam} not on TAM, ${failures.length} failed and passed over, ${runOutcome(fatal, stopReason, emailCount - examinedCount)}, ${cursorState(cursor, cursorSaved)}`,
     );
   }
 }
