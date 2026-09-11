@@ -32,7 +32,7 @@ describe("interested workflows", () => {
       contact: { first_name: "Ada", last_name: "Lovelace", email: "ada@example.com" },
     });
     const fields = extractAircallFields(call, 1_700_000_121);
-    expect(buildCallHistorySummary(fields)).toContain("Duration: 2 min");
+    expect(buildCallHistorySummary(fields)).toContain("Duration: 2m");
     expect(buildCallHistorySummary(fields)).toContain("Tags: Booked");
   });
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { fetchAircallCalls, parseAircallCall } from "../../lib/aircall.js";
+import { fetchAircallCalls, formatCallDuration, parseAircallCall } from "../../lib/aircall.js";
 import { toE164 } from "../../lib/phone.js";
 import { callSubject, logInterestedDecision } from "../../lib/aircall-interested.js";
 import {
@@ -103,6 +103,19 @@ describe("Aircall client", () => {
     //Too short to dial and too long to be a number: a fragment, not something to write into the CRM.
     expect(toE164("555-0123")).toBeNull();
     expect(toE164("+1234567890123456")).toBeNull();
+  });
+
+  test("reports a call's length in seconds, so a short call is not rendered as no call", () => {
+    //The whole point of the format: Aircall's duration counts ringing as well as talking and a dialled call
+    //runs a median ~18s, so whole minutes rounded almost every real call to "0 min".
+    expect(formatCallDuration(18)).toBe("18s");
+    expect(formatCallDuration(29)).toBe("29s");
+    expect(formatCallDuration(66)).toBe("1m 6s");
+    expect(formatCallDuration(120)).toBe("2m");
+    expect(formatCallDuration(310)).toBe("5m 10s");
+    //No length to report is said outright rather than printed as a zero-length call.
+    expect(formatCallDuration(0)).toBe("unknown");
+    expect(formatCallDuration(-1)).toBe("unknown");
   });
 
   test("names the call's other party for a log line, falling back to the number", () => {

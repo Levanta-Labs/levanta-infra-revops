@@ -1,5 +1,5 @@
 import { findPersonByEmail, findPersonByPhone } from "./attio.js";
-import type { AircallCall } from "./aircall.js";
+import { formatCallDuration, type AircallCall } from "./aircall.js";
 import { toE164 } from "./phone.js";
 import { requiredCsvEnv } from "./env.js";
 import { interestedLead, recordInterestedLead, type InterestedLead } from "./interested.js";
@@ -69,11 +69,10 @@ export function aircallLead(fields: AircallInterestedFields): InterestedLead {
 }
 
 export function buildCallHistorySummary(fields: AircallInterestedFields): string {
-  const durationMinutes = Math.round(fields.duration / 60);
   return [
     `**Aircall interaction — ${new Date(fields.occurredAt * 1_000).toISOString()}**`,
     `- Direction: ${fields.direction ?? "unknown"}`,
-    `- Duration: ${durationMinutes} min`,
+    `- Duration: ${formatCallDuration(fields.duration)}`,
     fields.tags.length > 0 ? `- Tags: ${fields.tags.join(", ")}` : null,
   ]
     .filter((line): line is string => line !== null)

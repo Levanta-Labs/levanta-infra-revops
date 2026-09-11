@@ -1,4 +1,4 @@
-import { fetchAircallCalls, type AircallCall } from "../../lib/aircall.js";
+import { fetchAircallCalls, formatCallDuration, type AircallCall } from "../../lib/aircall.js";
 import { toE164 } from "../../lib/phone.js";
 import {
   interestedTagSet,
@@ -177,8 +177,7 @@ export async function processAircallTouchpoint(call: AircallCall): Promise<Proce
   }
 
   const timestamp = new Date((call.endedAt ?? call.startedAt) * 1_000).toISOString();
-  const durationMinutes = Math.round(call.duration / 60);
-  const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${durationMinutes} min`;
+  const content = `**${timestamp}**\nDirection: ${call.direction ?? "unknown"}\nDuration: ${formatCallDuration(call.duration)}`;
   const title = `Aircall Touchpoint — ${timestamp}`;
   await incrementCounter("people", personId, personCounterSlug("aircall"), personName);
 
