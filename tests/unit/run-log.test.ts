@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { findPersonByEmail } from "../../lib/attio.js";
 import { interestedLead, recordInterestedLead } from "../../lib/interested.js";
 import { runLogArtifacts, runLogRecord, withRunLog } from "../../lib/run-log.js";
-import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
+import { installFetchMock, jsonResponse, notesResponse, type FetchCall } from "./test-utils.js";
 
 //=============================================================================================================
 //The run transcript (lib/run-log.ts). Additive diagnostics, so what is asserted here is that it reports the
@@ -75,7 +75,7 @@ function mockRun(options: { person?: Record<string, unknown> | null; linkedCompa
       });
     }
     if (url.includes("objects/deals/records")) return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
-    if (url.includes("/notes")) return jsonResponse({ data: {} });
+    if (url.includes("/notes")) return notesResponse(init);
     if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
     if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
     if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
@@ -113,7 +113,7 @@ interface Transcript {
 function transcripts(calls: readonly FetchCall[]): readonly Transcript[] {
   const found: Transcript[] = [];
   for (const call of calls) {
-    if (!call.input.includes("/notes")) continue;
+    if (!call.input.includes("/notes") || call.init?.method !== "POST") continue;
     const body = JSON.parse(String(call.init?.body)) as {
       data: { title: string; content: string; parent_object: string; parent_record_id: string };
     };
@@ -284,6 +284,9 @@ describe("run transcript", () => {
         return jsonResponse({ data: { id: { record_id: "deal-1" }, values: DEAL_BEFORE } });
       }
       if (url.includes("/notes")) {
+        //Counted on the writes alone. The duplicate check in lib/interested.ts lists this person's notes
+        //first, and that GET must not shift which write the ordinal below picks out.
+        if (method !== "POST") return notesResponse(init);
         notes += 1;
         //The history notes pass; the person's transcript is refused and the rest must still be attempted.
         return notes === 3 ? jsonResponse({ error: "nope" }, 500) : jsonResponse({ data: {} });

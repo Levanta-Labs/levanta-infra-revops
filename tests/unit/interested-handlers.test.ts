@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { POST as instantlyInterested } from "../../api/instantly-interested.js";
 import { POST as outfoundInterested } from "../../api/outfound-interested.js";
-import { historyNoteCalls, installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
+import { historyNoteCalls, installFetchMock, jsonResponse, notesResponse, type FetchCall } from "./test-utils.js";
 
 const envNames = [
   "ATTIO_API_KEY",
@@ -67,7 +67,7 @@ function mockAttio(populated: Record<string, unknown>) {
     if (url.includes("objects/deals/records")) {
       return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
     }
-    if (url.includes("/notes")) return jsonResponse({ data: {} });
+    if (url.includes("/notes")) return notesResponse(init);
     if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
     if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
     if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
@@ -335,7 +335,7 @@ describe("outfound interested webhook", () => {
       if (url.includes("objects/deals/records")) {
         return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
       }
-      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return notesResponse(init);
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
       if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
       if (url.includes("api.heyreach.io")) return jsonResponse({ items: [], hasNextPage: false });

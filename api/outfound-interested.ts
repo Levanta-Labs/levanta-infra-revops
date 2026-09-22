@@ -173,7 +173,10 @@ async function enrichFromOutfound(email: string): Promise<OutfoundLead | null> {
 //
 //[SECURITY] Step 1 precedes the body read, so an unauthenticated caller never reaches the parser.
 //[STABILITY] Step 4 is a series of Attio calls with no transaction. A throw partway leaves earlier writes
-//committed and returns 500; an Outfound retry would then repeat them, adding duplicate notes.
+//committed and returns 500. An Outfound retry no longer duplicates the notes as a matter of course - the
+//repeat check in recordInterestedLead declines an event whose note is already on the Person from inside
+//INTERESTED_DUPLICATE_WINDOW_MS - but a retry landing after that window, or one arriving while the note
+//listing cannot be read, is still recorded a second time. The check narrows this; it does not remove it.
 //[DEBUG] `historyCount` is assigned inside the history thunk because only that closure sees the thread. The
 //thunk is awaited inside recordInterestedLead before this function reads it back, so the count is settled.
 //USES: hasWebhookSecret, json, requestJson, serverError (lib/http.ts); findPersonByEmail, findPersonByLinkedIn
@@ -219,10 +222,13 @@ export async function POST(request: Request): Promise<Response> {
     });
 
     console.log(
-      `[route] outfound-interested: ${historyCount} conversation(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
+      outcome.duplicate
+        ? `[route] outfound-interested: declined as a repeat, ${historyCount} conversation(s) fetched but not written`
+        : `[route] outfound-interested: ${historyCount} conversation(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
     );
     return json({
       success: true,
+      duplicate: outcome.duplicate,
       personId: outcome.personId,
       dealId: outcome.dealId,
       companyId: outcome.companyId,

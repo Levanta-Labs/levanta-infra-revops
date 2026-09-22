@@ -3,7 +3,7 @@ import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.js";
 import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.js";
 import { GET as instantlySync } from "../../api/cron/instantly-touchpoint-sync.js";
 import { GET as outfoundSync } from "../../api/cron/outfound-touchpoint-sync.js";
-import { historyNoteCalls, installFetchMock, jsonResponse } from "./test-utils.js";
+import { historyNoteCalls, installFetchMock, jsonResponse, noteWrites, notesResponse } from "./test-utils.js";
 
 const envNames = [
   "SUPABASE_URL",
@@ -114,7 +114,7 @@ describe("cron handlers", () => {
       if (url.includes("objects/companies/records/company-1")) {
         return init?.method === "PATCH" ? jsonResponse({}) : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [] } } });
       }
-      if (url.includes("/notes")) return jsonResponse({});
+      if (url.includes("/notes")) return notesResponse(init);
       if (url.includes("api.aircall.io")) {
         return jsonResponse({
           calls: [
@@ -138,7 +138,7 @@ describe("cron handlers", () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ success: true, callsFound: 1, processed: 1 });
 
-      const noteCalls = mock.calls.filter((call) => call.input.includes("/notes"));
+      const noteCalls = noteWrites(mock.calls);
       expect(noteCalls).toHaveLength(1);
       expect(String(noteCalls[0]?.init?.body)).toContain('"parent_object":"companies"');
 
@@ -171,7 +171,7 @@ describe("cron handlers", () => {
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
       //Suppression now runs across every outbound platform, not just the Attio DNC list.
       if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
-      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return notesResponse(init);
       if (url.includes("api.aircall.io")) {
         return jsonResponse({
           calls: [
@@ -228,7 +228,7 @@ describe("cron handlers", () => {
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
       //Suppression now runs across every outbound platform, not just the Attio DNC list.
       if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
-      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return notesResponse(init);
       if (url.includes("api.aircall.io")) {
         //The requested window must reach back past the cursor, or this call would not be returned at all.
         const from = Number(new URL(url).searchParams.get("from")) * 1000;
@@ -296,7 +296,7 @@ describe("cron handlers", () => {
       if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
       //Suppression now runs across every outbound platform, not just the Attio DNC list.
       if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
-      if (url.includes("/notes")) return jsonResponse({ data: {} });
+      if (url.includes("/notes")) return notesResponse(init);
       if (url.includes("api.aircall.io")) {
         requestedFromMs = Number(new URL(url).searchParams.get("from")) * 1000;
         //Only returned because the window reaches back far enough to cover the call's start.
@@ -929,7 +929,7 @@ describe("cron handlers", () => {
           ? jsonResponse({})
           : jsonResponse({ data: { id: { record_id: "person-1" }, values: { number_of_emails: [] } } });
       }
-      if (url.includes("/notes")) return jsonResponse({});
+      if (url.includes("/notes")) return notesResponse(init);
       throw new Error(`Unexpected fetch: ${url}`);
     };
 
@@ -958,7 +958,7 @@ describe("cron handlers", () => {
       //The claim itself: one note per email across both runs. A lost email is a missing subject here, and a
       //replayed one is a repeated subject - the two failures the cursor exists to prevent.
       const titles = mock.calls
-        .filter((call) => call.input.includes("/notes"))
+        .filter((call) => call.input.includes("/notes") && call.init?.method === "POST")
         .map((call) => (JSON.parse(String(call.init?.body)) as { data: { title: string } }).data.title);
       expect(titles).toHaveLength(emails.length);
       expect(new Set(titles).size).toBe(emails.length);
@@ -1095,7 +1095,7 @@ describe("cron handlers", () => {
           ? jsonResponse({})
           : jsonResponse({ data: { id: { record_id: "person-1" }, values: { number_of_emails: [] } } });
       }
-      if (url.includes("/notes")) return jsonResponse({});
+      if (url.includes("/notes")) return notesResponse(init);
       throw new Error(`Unexpected fetch: ${url}`);
     });
     try {

@@ -51,6 +51,7 @@ message history into a note. Everything after that is one code path:
 
 | Step | What it does |
 | --- | --- |
+| 0. Repeat check | An event repeating one already recorded for this Person is declined before anything is written - see [Repeated events are declined, not re-recorded](#repeated-events-are-declined-not-re-recorded) |
 | 1. Person | The provider's own lookup order, creating a Person from the lead when there is no match |
 | 2. Company | The Company already linked to the Person if there is one, else found by domain then by exact name, else created - but only when a name or domain exists to create it from |
 | 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company>` - the deal carries no marker of how it was opened, because `lead_source` already does |
@@ -58,6 +59,44 @@ message history into a note. Everything after that is one code path:
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
 | 7. Transcript | The whole run written back to the Person, the Company and the Deal as a note - see below |
+
+### Repeated events are declined, not re-recorded
+
+Providers deliver the same interest more than once, and Attio gives us nothing to make that harmless: there is
+no idempotency key and no upsert for notes, so `createNote` appends. Every repeat therefore left a second
+identical note on the Person and on the Deal, plus a second run transcript on all three records. Nothing else
+in the workflow accumulates - the Person, Company and Deal are all find-or-create, and `updateAttioAttributes`
+only fills blanks - so the note is the whole of the damage, and the only place worth catching it.
+
+**HeyReach is where this shows up.** Its webhook is registered per event type, against *All campaigns*, so one
+registration fans out: a lead enrolled in several campaigns produces a delivery apiece, and a lead auto-tagged
+positive again on a later inbound message produces another. Each is a true event by HeyReach's reckoning and
+indistinguishable from the last by ours. Instantly does not do this, for two reasons that are both worth
+knowing: `lead_interested` is a single status transition per lead rather than a per-message event, and
+`/api/instantly-interested` additionally drops anything that is not that event type, because Instantly posts
+opens and replies to the same URL.
+
+Before writing, `recordInterestedLead` lists the Person's notes and declines the event if one already carries
+the title this run would write - the provider's `leadSourceLabel` - from inside `INTERESTED_DUPLICATE_WINDOW_MS`
+(fifteen minutes by default). A declined repeat writes *nothing*: no note, no transcript, no attribute patch,
+no suppression. It returns the existing record ids with `duplicate: true` in the response body and one
+`[dedupe]` line in the log.
+
+The window is what makes this safe. Title alone would silence a lead who re-engages weeks later, which is a
+real second event that deserves its own note; the window catches a burst and lets a return through. Setting
+`INTERESTED_DUPLICATE_WINDOW_MS` to `0` turns the check off entirely and costs no request.
+
+**It fails open, deliberately.** A listing that errors, or one too long to read to the end (Attio caps `limit`
+at 50 and documents no sort order, so the walk reads four pages and stops), answers "not a repeat" and the
+event is recorded. The two mistakes do not cost the same: a wrong "yes" silently discards a real interested
+lead, which is the event this codebase exists to capture, while a wrong "no" writes a duplicate note - the
+status quo, and visible. Both outcomes log.
+
+**It narrows the race, it does not close it.** The check is a read and the write is a separate request with no
+transaction between them, so two deliveries landing in different Vercel instances within the same few hundred
+milliseconds can both read "no note" and both write. Production shows deliveries seconds apart, which this
+catches. The same gap already allowed two simultaneous events to create two Person records; that predates this
+check and is not addressed by it.
 
 ### Every interested run leaves a transcript on the records it touched
 
@@ -238,7 +277,7 @@ alpha-2 code - which reads correctly as a Person location but is not a postal ad
 | --- | --- | --- |
 | `/api/instantly-interested` | Instantly | A `lead_interested` webhook using current top-level v2 fields; the route reads the lead record back for enrichment |
 | `/api/outfound-interested` | Outfound | A Webhook Relay prospect payload carrying `lead_email`. **No event type is filtered on** - which lead categories fire the relay is configured on Outfound's side, so everything authenticated is recorded |
-| `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email` |
+| `/api/heyreach-interested` | HeyReach | A HeyReach webhook carrying a lead object, nested or top-level, containing `profileUrl`/`linkedInUrl` or `email`. **No event type is filtered on** - which events fire is configured per webhook in HeyReach and is edited there without a deploy, so the route records everything authenticated and *names* the event in the log instead |
 | `/api/cron/aircall-touchpoint-sync` | Vercel Cron | Authorized GET every ten minutes (`*/10 * * * *`); also runs the interested workflow for any call whose completion falls in the window and already carries an `AIRCALL_INTERESTED_TAGS` tag |
 | `/api/cron/instantly-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
 | `/api/cron/outfound-touchpoint-sync` | Vercel Cron | Authorized GET every five minutes |
@@ -482,6 +521,7 @@ Keep credentials in `.env.local` for local development and configure the same va
 | `AIRCALL_API_ID` / `AIRCALL_API_TOKEN` | Aircall Basic Auth credentials for polling |
 | `AIRCALL_INTERESTED_TAGS` | Comma-separated Aircall tags that mean interested |
 | `AIRCALL_SYNC_BUDGET_MS` / `INSTANTLY_SYNC_BUDGET_MS` / `HEYREACH_SYNC_BUDGET_MS` / `OUTFOUND_SYNC_BUDGET_MS` | Optional, one per sync. Milliseconds that sync's loop may run before it stops and saves its place; each defaults to 240000. See [The run budget](#the-run-budget) |
+| `INTERESTED_DUPLICATE_WINDOW_MS` | Optional. Milliseconds within which a second interested event for the same Person, from the same provider, is declined instead of recorded; defaults to 900000 (fifteen minutes), and `0` turns the check off. See [Repeated events are declined, not re-recorded](#repeated-events-are-declined-not-re-recorded) |
 | `INSTANTLY_API_KEY` | Instantly v2 API key; needs to read emails and leads, and to write blocklist entries |
 | `INSTANTLY_WEBHOOK_SECRET` | Secret configured as the Instantly `x-webhook-secret` custom header |
 | `HEYREACH_API_KEY` | HeyReach API key; needs to read conversations and to stop leads in campaigns |
@@ -567,7 +607,8 @@ Secret values are never logged.
 | `[auth]` | Why a cron or webhook request was accepted or rejected, distinguishing an unconfigured secret from an absent header, a missing `Bearer` prefix, and a value that differs by case, whitespace, or length |
 | `[credential]` | A provider answered `401`/`403`, naming the variables that hold that provider's key |
 | `[slug]` | Attio rejected a counter attribute, naming the slug so the matching `ATTIO_PERSON_*` or `ATTIO_COMPANY_*_COUNTER_SLUG` can be checked |
-| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or which HeyReach lead is being handled. Ends with a line counting the history entries summarised and the platforms that failed to suppress |
+| `[route]` | The decision a webhook made before touching Attio: that an Instantly event was not `lead_interested`, or which HeyReach lead is being handled - the HeyReach line also names the event HeyReach called the delivery and the campaign it came from, which is what tells one cause of a repeated delivery from another, and falls back to a keys-and-types shape dump when the payload names no event at all. Ends with a line counting the history entries summarised and the platforms that failed to suppress, or saying the event was declined as a repeat |
+| `[dedupe]` | The repeat check: that this Person already carried this run's note from inside the window and the event was declined, or that the note listing could not be read or could not be read to the end - in which case the event is recorded anyway, because dropping a real interested lead costs more than a duplicate note |
 | `[interested]` | The Aircall interested workflow, naming the call and who it was with. Always `poll`: the cron is the only caller. Every call the check sees produces a decision line listing every tag it carried, whether or not any matched, and on a miss the configured set it was compared against; a run reporting nothing interested is therefore readable as "these calls, these tags, no match" rather than as silence. A match is followed by the person and deal it finished with, or by the reason it could not: no way to reach a person (the call carried neither an email nor a phone number), or a failure passed over |
 | `[lookup]` | Each person, company, and deal search and its result, naming the attribute searched and the record matched, plus whether that person is on the Master TAM list. A company line also says when the person was already linked to one, or when neither Attio nor the provider names one and the deal will be named for an unknown company. An Instantly lead lookup names which enrichment fields arrived, by field name only. The deal line reports both outcomes - how many deals the person already had and which is being reused, or that they had none and one is being created - because "checked and found none" and "never checked" must not read alike |
 | `[action]` | Each write and its outcome: person or company created, a record updated with the attribute list, a record left untouched because every target attribute was already populated, deal created, deal reused, note added, blocklist entry added, counter moved from one value to the next. A failure is reported as `[action] FAILED` naming the action and record before the error propagates |

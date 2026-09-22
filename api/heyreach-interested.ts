@@ -38,6 +38,13 @@ const LAST_NAME_NAMES = ["lastName", "surname", "familyName"] as const;
 const COMPANY_NAMES = ["companyName", "company", "organization", "organizationName", "currentCompany"] as const;
 const CAMPAIGN_NAMES = ["campaignName", "campaign", "sequenceName"] as const;
 
+//[DEBUG] Not used to decide anything - the route acts on every authenticated delivery carrying a lead, and
+//that is deliberate (see the POST below). These exist so the log can NAME the event, which is what tells a
+//repeat apart from a genuinely separate one. Deliberately excludes a bare `type`, which is too common a key
+//to read off an unknown payload without risking some unrelated field; an event spelled that way falls to the
+//shape dump instead, which is where an unmapped name is supposed to show up.
+const EVENT_NAMES = ["eventType", "event", "eventName", "webhookEvent", "notificationType"] as const;
+
 const LEAD_CONTAINER_NAMES = [
   "lead",
   "leadProfile",
@@ -75,6 +82,7 @@ const FIRST_NAME_KEYS = keySet(FIRST_NAME_NAMES);
 const LAST_NAME_KEYS = keySet(LAST_NAME_NAMES);
 const COMPANY_KEYS = keySet(COMPANY_NAMES);
 const CAMPAIGN_KEYS = keySet(CAMPAIGN_NAMES);
+const EVENT_KEYS = keySet(EVENT_NAMES);
 const LEAD_CONTAINER_KEYS: ReadonlySet<string> = new Set(LEAD_CONTAINER_NAMES.map(normalizeKey));
 
 function namesSendingAccount(key: string): boolean {
@@ -161,6 +169,23 @@ export function parseHeyReachInterestedWebhook(value: unknown): HeyReachInterest
   );
 }
 
+//---------------------------------------------------------------------------------------------------------
+//[DEBUG] What HeyReach called this delivery, read off the TOP LEVEL only.
+//
+//WHY IT IS LOGGED AND NOT ACTED ON. The webhook is configured in HeyReach, one event type per registration,
+//and what is registered is edited there without a deploy - so the route cannot assume a name and stay correct.
+//The log is where that configuration becomes visible: a burst of deliveries for one lead reads as either the
+//same event name repeated (one registration firing per campaign, or a lead auto-tagged again on a later
+//message) or as different names (more than one registration pointed here). Those have different fixes, and
+//nothing in the payload distinguishes them once the name is discarded.
+//Top level only because an event name describes the delivery, not the lead - the nested walk that finds a lead
+//would happily read some unrelated `event` off a message or a campaign object.
+//USES: firstOf (this module). Pure.
+//---------------------------------------------------------------------------------------------------------
+export function heyReachEventName(value: unknown): string | null {
+  return isJsonObject(value) ? firstOf(value, EVENT_KEYS) : null;
+}
+
 /** [LOGIC] Oldest first, so the note reads top to bottom. USES: nothing. Pure. */
 export function formatHeyReachThread(messages: readonly HeyReachMessage[]): string {
   if (messages.length === 0) return "No message history found.";
@@ -217,11 +242,16 @@ export function heyReachLead(
 // 3. fetchHeyReachConversations (lib/heyreach.ts) for the thread, which also yields the correspondent profile
 //    the mapping enriches from. Keyed on the profile URL only; an email-only lead gets neither.
 // 4. recordInterestedLead (lib/interested.ts) - the sequence every provider shares. HeyReach contributes the
-//    person lookup (profile URL first, then address) and the thread note.
+//    person lookup (profile URL first, then address) and the thread note. It declines the event outright if
+//    this Person already carries a HeyReach note from inside the duplicate window - which is what stops one
+//    webhook registered against ALL campaigns leaving a note per campaign the lead is enrolled in.
 //
 //[SECURITY] Step 1 precedes the body read, so an unauthenticated caller never reaches the parser.
-//[STABILITY] Step 4 is a series of calls with no transaction. A throw partway leaves earlier writes committed
-//and returns 500; a relay retry would then repeat them, adding duplicate notes.
+//[STABILITY] Step 4 is a series of calls with no transaction. A throw partway leaves earlier writes
+//committed and returns 500. A relay's retry no longer duplicates the notes as a matter of course - the repeat
+//check in recordInterestedLead declines an event whose note is already on the Person from inside
+//INTERESTED_DUPLICATE_WINDOW_MS - but a retry landing after that window, or one arriving while the note
+//listing cannot be read, is still recorded a second time. The check narrows this; it does not remove it.
 //Ending HeyReach sequencing is no longer done here: it is one channel of suppressInterestedLead, which runs
 //for every interested lead whatever platform reported it. Its known gap - a lead with no profile URL cannot be
 //stopped, because StopLeadInCampaign is driven by leadUrl - now reports itself as a skipped channel.
@@ -233,9 +263,16 @@ export async function POST(request: Request): Promise<Response> {
     return json({ error: "Unauthorized" }, 401);
   }
   try {
-    const fields = parseHeyReachInterestedWebhook(await requestJson(request));
+    const payload = await requestJson(request);
+    const fields = parseHeyReachInterestedWebhook(payload);
+    //[DEBUG] Every field here is either a name HeyReach chose or an identifier already in the CRM - no message
+    //text, no address. describeShape reports keys and types only, and is spent solely when no event key was
+    //found, which is the one case where the payload's own key names are the missing information.
+    const event = heyReachEventName(payload);
     console.log(
-      `[route] heyreach-interested: handling ${fields.profileUrl ?? fields.email ?? "a lead with no identifier"}`,
+      `[route] heyreach-interested: handling ${fields.profileUrl ?? fields.email ?? "a lead with no identifier"}` +
+        ` - event ${event ? JSON.stringify(event) : `unnamed, payload shape was ${describeShape(payload)}`}` +
+        `, campaign ${fields.campaignName ? JSON.stringify(fields.campaignName) : "unnamed"}`,
     );
 
     //Fetched before the workflow rather than inside it, because the profile it carries feeds the mapping and
@@ -257,10 +294,13 @@ export async function POST(request: Request): Promise<Response> {
     });
 
     console.log(
-      `[route] heyreach-interested: ${messages.length} message(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
+      outcome.duplicate
+        ? `[route] heyreach-interested: declined as a repeat, ${messages.length} message(s) fetched but not written`
+        : `[route] heyreach-interested: ${messages.length} message(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
     );
     return json({
       success: true,
+      duplicate: outcome.duplicate,
       personId: outcome.personId,
       dealId: outcome.dealId,
       companyId: outcome.companyId,

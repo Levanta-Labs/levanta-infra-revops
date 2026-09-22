@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseHeyReachInterestedWebhook } from "../../api/heyreach-interested.js";
+import { heyReachEventName, parseHeyReachInterestedWebhook } from "../../api/heyreach-interested.js";
 import { describeShape } from "../../lib/json.js";
 
 const PROFILE = "https://www.linkedin.com/in/ada-lovelace";
@@ -227,5 +227,36 @@ describe("describeShape recursion safety", () => {
     let nested: unknown = { id: "x" };
     for (let i = 0; i < 5000; i += 1) nested = [nested];
     expect(describeShape(nested)).toContain("...");
+  });
+});
+
+//=============================================================================================================
+//The event name is logged, never acted on - see the POST in api/heyreach-interested.ts. These cover it
+//because it is the only thing in a burst of deliveries that tells one cause from another, and a name silently
+//read off the wrong object would point the diagnosis at the wrong fix.
+//=============================================================================================================
+describe("naming a HeyReach delivery for the log", () => {
+  test("reads the event whatever the relay spells it", () => {
+    for (const key of ["eventType", "event_type", "event", "EventName", "webhook_event", "notificationType"]) {
+      expect(heyReachEventName({ [key]: "LEAD_AUTO_TAGGED_POSITIVE", lead: { profileUrl: PROFILE } })).toBe(
+        "LEAD_AUTO_TAGGED_POSITIVE",
+      );
+    }
+  });
+
+  test("accepts the lead prefix a flattened payload folds in", () => {
+    expect(heyReachEventName({ leadEventType: "REPLY_RECEIVED" })).toBe("REPLY_RECEIVED");
+  });
+
+  test("reads the top level only, so a nested event on some other object is not mistaken for this one", () => {
+    //A message or campaign object carrying its own `event` describes itself, not the delivery.
+    expect(heyReachEventName({ lead: { profileUrl: PROFILE, event: "MESSAGE_SENT" } })).toBeNull();
+  });
+
+  test("answers null rather than guessing when the payload names no event", () => {
+    expect(heyReachEventName({ lead: { profileUrl: PROFILE } })).toBeNull();
+    expect(heyReachEventName({ eventType: "" })).toBeNull();
+    expect(heyReachEventName("LEAD_AUTO_TAGGED_POSITIVE")).toBeNull();
+    expect(heyReachEventName(null)).toBeNull();
   });
 });

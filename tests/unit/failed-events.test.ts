@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.js";
-import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
+import { installFetchMock, jsonResponse, noteWrites, notesResponse, type FetchCall } from "./test-utils.js";
 
 const envNames = [
   "SUPABASE_URL",
@@ -110,7 +110,7 @@ function aircallMock(cursorRow?: unknown) {
         ? jsonResponse({})
         : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_calls: [{ value: 5 }] } } });
     }
-    if (url.includes("/notes")) return jsonResponse({});
+    if (url.includes("/notes")) return notesResponse(init);
     throw new Error(`Unexpected fetch: ${url}`);
   });
 }
@@ -186,7 +186,7 @@ describe("a touchpoint that fails mid-flight", () => {
       // The doomed call is behind the cursor, so nothing was written for it a second time.
       const retried = second.calls.filter((call) => call.input.includes("objects/companies/records/company-1"));
       expect(retried).toHaveLength(0);
-      expect(second.calls.filter((call) => call.input.includes("/notes"))).toHaveLength(0);
+      expect(noteWrites(second.calls)).toHaveLength(0);
     } finally {
       second.restore();
     }

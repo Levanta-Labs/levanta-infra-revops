@@ -1,4 +1,18 @@
-export type JsonObject = Record<string, unknown>;
+/*
+script purpose
+
+
+
+
+*/
+
+
+export type JsonObject = Record<string, unknown>; //an object with string keys, unknown value type
+//type any //do whatever you want, disables type constraints
+//ype unknown //type checking is enabled but type is unknown, is one from set of all possible values in ts, can check type using logic for operations
+//type 
+
+//#region type guards
 
 export function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -25,6 +39,8 @@ export function arrayValue(parent: JsonObject, key: string): readonly unknown[] 
   const value = parent[key];
   return Array.isArray(value) ? value : [];
 }
+
+//#endregion
 
 /**
  * The key structure of an unknown payload, with types but no values, so an unrecognised webhook shape can be
