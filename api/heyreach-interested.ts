@@ -1,6 +1,8 @@
 import { findPersonByEmail, findPersonByLinkedIn } from "../lib/attio.js";
 import {
   fetchHeyReachConversations,
+  HeyReachRateLimitError,
+  type HeyReachConversation,
   type HeyReachMessage,
   type HeyReachProfile,
 } from "../lib/heyreach.js";
@@ -10,7 +12,7 @@ import {
   recordInterestedLead,
   type InterestedLead,
 } from "../lib/interested.js";
-import { describeShape, isJsonObject, stringValue, type JsonObject } from "../lib/json.js";
+import { describeShape, errorMessage, isJsonObject, stringValue, type JsonObject } from "../lib/json.js";
 
 export interface HeyReachInterestedFields {
   readonly profileUrl: string | null;
@@ -186,6 +188,43 @@ export function heyReachEventName(value: unknown): string | null {
   return isJsonObject(value) ? firstOf(value, EVENT_KEYS) : null;
 }
 
+//---------------------------------------------------------------------------------------------------------
+//The lead's conversations, or nothing if HeyReach would not hand them over.
+//
+//[STABILITY] A throttled read costs the history, never the lead. HeyReach's allowance is one pool shared
+//across every endpoint, and the touchpoint sync draws on it every five minutes with a window that grows
+//through the UTC day - so an interested webhook can be refused through no fault of its own. Raising here would
+//500 the webhook and lose the lead until HeyReach retried it, to save a note body and some enrichment. The
+//lead is the part worth keeping; the conversation stays readable in HeyReach.
+//
+//This mirrors what api/instantly-interested.ts does with its own thread read, deliberately: the two routes
+//have the same shape and the same failure, and one degrading while the other 500s is the kind of difference
+//nobody discovers until the day it matters.
+//Anything that is not a rate limit still raises - an unreachable API or a malformed page is not a reason to
+//record a lead with half its detail missing and no sign that anything went wrong.
+//USES: fetchHeyReachConversations (lib/heyreach.ts), errorMessage (lib/json.ts).
+//---------------------------------------------------------------------------------------------------------
+export async function readHeyReachConversations(
+  profileUrl: string | null,
+): Promise<{ readonly conversations: readonly HeyReachConversation[]; readonly throttled: boolean }> {
+  if (!profileUrl) return { conversations: [], throttled: false };
+  try {
+    return { conversations: await fetchHeyReachConversations({ profileUrl }), throttled: false };
+  } catch (error) {
+    if (!(error instanceof HeyReachRateLimitError)) throw error;
+    console.warn(
+      `[route] heyreach-interested: the conversation for ${profileUrl} could not be read - ${errorMessage(error)}. The lead is recorded without it.`,
+    );
+    return { conversations: [], throttled: true };
+  }
+}
+
+//[LOGIC] Said plainly rather than reusing formatHeyReachThread's empty-thread text, which would claim there is
+//no history when the truth is that it could not be read - a difference that matters to whoever opens the note
+//looking for the reply.
+const HISTORY_UNAVAILABLE =
+  "The message history could not be read from HeyReach when this lead was recorded, because the API rate limit had been reached. It is not lost - the conversation is still in HeyReach.";
+
 /** [LOGIC] Oldest first, so the note reads top to bottom. USES: nothing. Pure. */
 export function formatHeyReachThread(messages: readonly HeyReachMessage[]): string {
   if (messages.length === 0) return "No message history found.";
@@ -277,9 +316,7 @@ export async function POST(request: Request): Promise<Response> {
 
     //Fetched before the workflow rather than inside it, because the profile it carries feeds the mapping and
     //the mapping is the workflow's input. One request either way.
-    const conversations = fields.profileUrl
-      ? await fetchHeyReachConversations({ profileUrl: fields.profileUrl })
-      : [];
+    const { conversations, throttled } = await readHeyReachConversations(fields.profileUrl);
     const messages = conversations.flatMap((conversation) => conversation.messages);
     //Any conversation for this lead carries the same correspondent; the first is as good as any.
     const profile = conversations[0]?.profile ?? null;
@@ -290,13 +327,13 @@ export async function POST(request: Request): Promise<Response> {
       //URL first: it is the identifier HeyReach always carries and the one Attio stores for LinkedIn.
       findPerson: async () =>
         (await findPersonByLinkedIn(fields.profileUrl)) ?? (await findPersonByEmail(fields.email)),
-      history: async () => formatHeyReachThread(messages),
+      history: async () => (throttled ? HISTORY_UNAVAILABLE : formatHeyReachThread(messages)),
     });
 
     console.log(
       outcome.duplicate
         ? `[route] heyreach-interested: declined as a repeat, ${messages.length} message(s) fetched but not written`
-        : `[route] heyreach-interested: ${messages.length} message(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
+        : `[route] heyreach-interested: ${throttled ? "no message history - HeyReach throttled the read" : `${messages.length} message(s) summarised`}, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
     );
     return json({
       success: true,

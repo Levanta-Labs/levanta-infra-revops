@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GET as aircallSync } from "../../api/cron/aircall-touchpoint-sync.js";
+import { POST as heyReachInterested } from "../../api/heyreach-interested.js";
 import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.js";
 import {
   AircallRateLimitError,
@@ -34,6 +35,7 @@ const envNames = [
   "AIRCALL_API_TOKEN",
   "AIRCALL_INTERESTED_TAGS",
   "HEYREACH_API_KEY",
+  "HEYREACH_WEBHOOK_SECRET",
   "CRON_SECRET",
   "ATTIO_API_KEY",
   "ATTIO_DEFAULT_DEAL_OWNER",
@@ -49,6 +51,7 @@ beforeEach(() => {
   process.env.AIRCALL_API_TOKEN = "aircall-token";
   process.env.AIRCALL_INTERESTED_TAGS = "Booked";
   process.env.HEYREACH_API_KEY = "heyreach-key";
+  process.env.HEYREACH_WEBHOOK_SECRET = "hook-secret";
   process.env.CRON_SECRET = "cron-secret";
   process.env.ATTIO_API_KEY = "attio-key";
   process.env.ATTIO_DEFAULT_DEAL_OWNER = "owner@example.com";
@@ -308,6 +311,80 @@ describe("a throttled sync still saves its cursor", () => {
       expect(summary).not.toContain("Attio throttling");
     } finally {
       console.warn = warn;
+      mock.restore();
+    }
+  });
+});
+
+describe("an interested lead arriving while HeyReach is throttling", () => {
+  test("is recorded without its thread rather than lost", async () => {
+    //The same shape api/instantly-interested.ts already had. One route degrading while its twin 500s is the
+    //kind of difference nobody finds until the day it matters.
+    const mock = installFetchMock((url, init) => {
+      const method = init?.method ?? "GET";
+      if (url.includes("api.heyreach.io")) return jsonResponse(TOO_MANY, 429);
+      if (url.includes("objects/people/records/query")) return jsonResponse({ data: [] });
+      if (url.includes("objects/companies/records/query")) return jsonResponse({ data: [] });
+      if (url.includes("objects/") && method === "PATCH") return jsonResponse({ data: {} });
+      if (url.includes("objects/people/records")) {
+        return jsonResponse({
+          data: { id: { record_id: "person-1" }, values: { associated_deals: [], company: [], name: [] } },
+        });
+      }
+      if (url.includes("objects/deals/records")) {
+        return jsonResponse({ data: { id: { record_id: "deal-1" }, values: {} } });
+      }
+      if (url.includes("/notes")) {
+        return method === "GET" ? jsonResponse({ data: [] }) : jsonResponse({ data: {} });
+      }
+      if (url.includes("/lists/dnc/entries")) return jsonResponse({ data: {} });
+      if (url.includes("block-lists-entries")) return jsonResponse({ data: {} });
+      if (url.includes("api.instantly.ai")) return jsonResponse({ items: [], next_starting_after: null });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await heyReachInterested(
+        new Request("https://example.com/api/heyreach-interested", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-webhook-secret": "hook-secret" },
+          body: JSON.stringify({
+            eventType: "LEAD_AUTO_TAGGED_POSITIVE",
+            lead: { profileUrl: "https://www.linkedin.com/in/ada", firstName: "Ada", lastName: "Lovelace" },
+          }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ success: true, personId: "person-1" });
+
+      //The note says the history could not be READ, which is not the same as there being none - the reader is
+      //looking for the reply and needs to know it exists somewhere.
+      const note = mock.calls.find(
+        (call) => call.input.includes("/notes") && call.init?.method === "POST",
+      );
+      const body = JSON.parse(String(note?.init?.body)) as { data?: { content?: string } };
+      expect(body.data?.content).toContain("could not be read");
+      expect(body.data?.content).not.toContain("No message history found");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("still fails on anything that is not a rate limit", async () => {
+    //An unreachable API is not a reason to record a lead with half its detail and no sign anything went wrong.
+    const mock = installFetchMock((url) => {
+      if (url.includes("api.heyreach.io")) return jsonResponse({ error: "boom" }, 500);
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      const response = await heyReachInterested(
+        new Request("https://example.com/api/heyreach-interested", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-webhook-secret": "hook-secret" },
+          body: JSON.stringify({ lead: { profileUrl: "https://www.linkedin.com/in/ada" } }),
+        }),
+      );
+      expect(response.status).toBe(500);
+    } finally {
       mock.restore();
     }
   });

@@ -445,6 +445,15 @@ and `fetchAircallCalls` still raise rather than returning a partial read, becaus
 and has no cursor to resume from — half a thread rendered as though it were the whole is a misleading note, not
 deferred work.
 
+**Both interested routes then degrade rather than failing.** `/api/instantly-interested` and
+`/api/heyreach-interested` each catch their own provider's rate limit around the thread read, record the lead from
+the webhook alone, and write a note saying the history could not be *read* — which is not the same as there being
+none, and matters to whoever opens the note looking for the reply. Raising instead would 500 the webhook and lose
+the lead until the provider retried it, to save a note body. Anything that is not a rate limit still raises: an
+unreachable API is not a reason to record a lead with half its detail and no sign anything went wrong. The two
+routes are kept deliberately symmetrical, because one degrading while its twin 500s is a difference nobody finds
+until the day it matters.
+
 A single truncated run is normal while a backlog drains. Truncation run after run means events arrive faster than
 they are processed. Each sync takes its own override - `AIRCALL_SYNC_BUDGET_MS`, `INSTANTLY_SYNC_BUDGET_MS`,
 `HEYREACH_SYNC_BUDGET_MS`, `OUTFOUND_SYNC_BUDGET_MS` - for retuning against a live backlog without a redeploy; a malformed value falls back to
