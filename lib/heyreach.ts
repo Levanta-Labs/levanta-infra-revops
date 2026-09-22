@@ -1,4 +1,5 @@
 import { credentialHint, HEYREACH_BASE, heyreachHeaders } from "./endpoints.js";
+import { rateLimitWaitMs } from "./http.js";
 import {
   arrayValue,
   booleanValue,
@@ -103,6 +104,77 @@ export function parseHeyReachConversation(value: unknown): HeyReachConversation 
   };
 }
 
+//=============================================================================================================
+//Rate limiting.
+//
+//HeyReach refuses with 429 once the key's allowance is spent, and the allowance is shared across every
+//endpoint rather than being per-route - so the touchpoint sync's pagination, the interested route's
+//conversation read and the suppression's campaign calls all draw on the same pool.
+//
+//[STABILITY] WHY A RETRY AND NOT A SELF-IMPOSED CAP. HeyReach was probed live and answers 200 with no
+//rate-limit header of any kind, so there is no allowance to read ahead and no honest number to pace against.
+//Instantly gets a page cap because its 20-per-minute ceiling is documented as a hard figure; here the
+//transport can only react to the refusal when it arrives. A refused request was not processed, so repeating it
+//cannot apply anything twice - which is what makes this safe on StopLeadInCampaign as well as on the reads.
+//=============================================================================================================
+
+export class HeyReachRateLimitError extends Error {
+  constructor(detail: string) {
+    super(`HeyReach rate limit reached: ${detail}`);
+    this.name = "HeyReachRateLimitError";
+  }
+}
+
+const RATE_LIMIT_ATTEMPTS = 3;
+//Matches attioFetch's RETRY_BASE_MS, so the one backoff shape in this codebase stays one shape.
+const RATE_LIMIT_BASE_MS = 500;
+//[PERF] A run that spends its budget asleep has done nothing. Past this, stopping and resuming next run beats
+//waiting, because the next run starts with a fresh allowance either way - see rateLimitWaitMs (lib/http.ts).
+const RATE_LIMIT_MAX_WAIT_MS = 5_000;
+
+//---------------------------------------------------------------------------------------------------------
+//Single transport for every HeyReach call. Nothing else in this module calls fetch.
+//
+//WHY IT EXISTS AT ALL. There were three raw fetch sites here - conversations, GetCampaignsForLead and
+//StopLeadInCampaign - each with its own copy of the status check. A 429 was an ordinary Error at all three,
+//which in the touchpoint sync abandoned the run before its cursor was saved; the next run then re-read the
+//same window and failed identically. That is not hypothetical: the Instantly sync sat in exactly that loop
+//for five days. One chokepoint is what lets the retry, and the typed error below it, apply to all three.
+//
+//FLOW: 1. POST to HEYREACH_BASE + path. 2. 429 with attempts left -> wait and repeat. 3. 429 out of attempts
+//-> HeyReachRateLimitError, which a caller can tell from a bad request. 4. other non-2xx -> throw.
+//USES: heyreachHeaders, credentialHint (lib/endpoints.ts); rateLimitWaitMs (lib/http.ts); responseJson
+//(lib/json.ts).
+//---------------------------------------------------------------------------------------------------------
+async function heyreachFetch(path: string, body: unknown): Promise<unknown> {
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await fetch(`${HEYREACH_BASE}${path}`, {
+      method: "POST",
+      headers: heyreachHeaders(),
+      body: JSON.stringify(body),
+    });
+    const parsed = await responseJson(response);
+    if (response.ok) return parsed;
+
+    if (response.status === 429) {
+      if (attempt >= RATE_LIMIT_ATTEMPTS) {
+        throw new HeyReachRateLimitError(
+          `${path} refused after ${RATE_LIMIT_ATTEMPTS} attempt(s). The allowance is shared across every HeyReach endpoint, so the touchpoint sync's pagination, the interested route and the suppression all spend it.`,
+        );
+      }
+      const waitMs = rateLimitWaitMs(response, attempt, RATE_LIMIT_BASE_MS, RATE_LIMIT_MAX_WAIT_MS);
+      console.warn(
+        `[heyreach] 429 on ${path} (attempt ${attempt} of ${RATE_LIMIT_ATTEMPTS}) - waiting ${waitMs}ms and retrying`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      continue;
+    }
+    throw new Error(
+      `HeyReach API error ${response.status}: ${JSON.stringify(parsed)}${credentialHint("heyreach", response.status)}`,
+    );
+  }
+}
+
 //---------------------------------------------------------------------------------------------------------
 //Reads conversations with their full message lists, paginated. Two callers: the touchpoint cron passes a time
 //window, the interested webhook passes one profile URL.
@@ -113,19 +185,38 @@ export function parseHeyReachConversation(value: unknown): HeyReachConversation 
 //A five-minute run therefore routinely receives messages hours or days old, and the volume grows through the
 //day. Rounding always goes DOWN to the start of the day, so the result over-includes and no message can slip
 //past a window boundary. Deduplication is the per-message cursor check in the sync handler, not this filter.
-//USES: heyreachHeaders, credentialHint (lib/endpoints.ts); responseJson, arrayValue, booleanValue (lib/json.ts).
+//USES: heyreachFetch (this module); arrayValue, booleanValue, isJsonObject, stringValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
-export async function fetchHeyReachConversations(
+export interface HeyReachConversationWindow {
+  readonly conversations: readonly HeyReachConversation[];
+  /** Set when pagination stopped short of the end of the window; null means it was read to the end. */
+  readonly stoppedBy: "throttled" | null;
+  readonly pagesRead: number;
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The paginating form, which keeps what it read when HeyReach refuses the rest.
+//
+//[STABILITY] A 429 RETURNS WHAT IT HAS rather than throwing it away, once heyreachFetch has exhausted its
+//retries. The pages already read are real conversations the caller can process, and discarding them is what
+//wedged the Instantly sync for five days: the throw came from the fetch, before the loop, so the run
+//abandoned before saving its cursor and every later run repeated it exactly. The caller is told the window is
+//incomplete so it knows not to park its cursor at the end of it.
+//Any other failure still throws: a 500 or a malformed page says nothing about how much of the window exists,
+//and treating the part already read as the whole of it would step over the rest for good.
+//USES: heyreachFetch, parseHeyReachConversation (this module).
+//---------------------------------------------------------------------------------------------------------
+export async function fetchHeyReachConversationWindow(
   query: HeyReachConversationQuery,
-): Promise<readonly HeyReachConversation[]> {
+): Promise<HeyReachConversationWindow> {
   const conversations: HeyReachConversation[] = [];
   let cursor: string | null = null;
+  let pagesRead = 0;
 
   do {
-    const response = await fetch(`${HEYREACH_BASE}/inbox/GetConversationsV3`, {
-      method: "POST",
-      headers: heyreachHeaders(),
-      body: JSON.stringify({
+    let body: unknown;
+    try {
+      body = await heyreachFetch("/inbox/GetConversationsV3", {
         limit: 100,
         cursor,
         ...(query.fromMs !== undefined ? { from: new Date(query.fromMs).toISOString() } : {}),
@@ -141,12 +232,17 @@ export async function fetchHeyReachConversations(
           latestAutoTagNames: [],
           seen: null,
         },
-      }),
-    });
-    const body = await responseJson(response);
-    if (!response.ok) {
-      throw new Error(`HeyReach API error ${response.status}: ${JSON.stringify(body)}${credentialHint("heyreach", response.status)}`);
+      });
+    } catch (error) {
+      if (error instanceof HeyReachRateLimitError) {
+        console.warn(
+          `[heyreach] throttled after ${pagesRead} page(s) and ${conversations.length} conversation(s) - ${error.message}. What was read is kept and returned; the rest of the window is left for the next run.`,
+        );
+        return { conversations, stoppedBy: "throttled", pagesRead };
+      }
+      throw error;
     }
+    pagesRead += 1;
     if (!isJsonObject(body)) throw new Error("HeyReach conversations response is invalid");
     conversations.push(...arrayValue(body, "items").map(parseHeyReachConversation));
     const hasNextPage = booleanValue(body.hasNextPage) ?? false;
@@ -154,6 +250,24 @@ export async function fetchHeyReachConversations(
     if (hasNextPage && !cursor) throw new Error("HeyReach response omitted nextCursor");
   } while (cursor);
 
+  return { conversations, stoppedBy: null, pagesRead };
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The whole of a query's conversations, or nothing.
+//For the interested route, whose note is one lead's thread: half a thread rendered as though it were the
+//whole is a misleading note, and unlike the cron there is no cursor to resume from - the note is written once.
+//USES: fetchHeyReachConversationWindow (this module).
+//---------------------------------------------------------------------------------------------------------
+export async function fetchHeyReachConversations(
+  query: HeyReachConversationQuery,
+): Promise<readonly HeyReachConversation[]> {
+  const { conversations, stoppedBy } = await fetchHeyReachConversationWindow(query);
+  if (stoppedBy === "throttled") {
+    throw new HeyReachRateLimitError(
+      `only ${conversations.length} conversation(s) could be read, and a partial thread is not written as though it were the whole`,
+    );
+  }
   return conversations;
 }
 
@@ -224,15 +338,13 @@ export async function stopLeadInActiveCampaigns(
   email: string | null,
 ): Promise<CampaignStopResult> {
   if (!profileUrl) return { inCampaigns: 0, removedFrom: 0 };
-  const response = await fetch(`${HEYREACH_BASE}/campaign/GetCampaignsForLead`, {
-    method: "POST",
-    headers: heyreachHeaders(),
-    body: JSON.stringify({ email, linkedinId: null, profileUrl, offset: 0, limit: 100 }),
+  const body = await heyreachFetch("/campaign/GetCampaignsForLead", {
+    email,
+    linkedinId: null,
+    profileUrl,
+    offset: 0,
+    limit: 100,
   });
-  const body = await responseJson(response);
-  if (!response.ok) {
-    throw new Error(`HeyReach campaign lookup failed ${response.status}: ${JSON.stringify(body)}${credentialHint("heyreach", response.status)}`);
-  }
   if (!isJsonObject(body)) throw new Error("HeyReach campaigns response is invalid");
   //Every campaign that lists the lead, before any liveness filter - the total the caller reports against.
   const listed = arrayValue(body, "items").map(parseCampaign);
@@ -248,16 +360,13 @@ export async function stopLeadInActiveCampaigns(
     );
 
   for (const campaign of campaigns) {
-    const stopResponse = await fetch(`${HEYREACH_BASE}/campaign/StopLeadInCampaign`, {
-      method: "POST",
-      headers: heyreachHeaders(),
-      body: JSON.stringify({ campaignId: campaign.campaignId, leadMemberId: null, leadUrl: profileUrl }),
+    //[STABILITY] The one WRITE on this transport. Retrying it on a 429 is safe for the same reason it is safe
+    //on Attio: a refused request was not processed, so repeating it cannot withdraw a lead twice.
+    await heyreachFetch("/campaign/StopLeadInCampaign", {
+      campaignId: campaign.campaignId,
+      leadMemberId: null,
+      leadUrl: profileUrl,
     });
-    if (!stopResponse.ok) {
-      throw new Error(
-        `HeyReach failed to stop lead in campaign ${campaign.campaignId} (${stopResponse.status}): ${await stopResponse.text()}${credentialHint("heyreach", stopResponse.status)}`,
-      );
-    }
   }
   return { inCampaigns: listed.length, removedFrom: campaigns.length };
 }

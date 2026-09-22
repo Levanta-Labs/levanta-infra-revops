@@ -1,4 +1,5 @@
 import { AIRCALL_BASE, aircallAuthHeader, credentialHint } from "./endpoints.js";
+import { rateLimitWaitMs } from "./http.js";
 //Aircall spells a number for display ("+1 949-735-4000"); Attio matches E.164. One shared normaliser, because
 //a lookup keyed on the wrong spelling misses and creates a duplicate Person - see lib/phone.ts.
 import { toE164 } from "./phone.js";
@@ -126,7 +127,111 @@ export function parseAircallCall(value: unknown): AircallCall {
 //from the result set entirely, not merely out of order. No v1 endpoint filters or sorts on ended_at.
 //USES: aircallAuthHeader, credentialHint (lib/endpoints.ts); responseJson, arrayValue, objectValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
-export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
+//=============================================================================================================
+//Rate limiting.
+//
+//Aircall allows 120 requests a minute PER COMPANY, not per key - so every integration the workspace runs draws
+//on the same allowance, and this sync's share of it is not something this codebase can know.
+//
+//[STABILITY] WHY A RETRY AND NOT A SELF-IMPOSED CAP. Aircall was probed live and answers 200 with no
+//rate-limit header at all; its X-AircallApi-Limit/Remaining/Reset trio is documented as arriving only once the
+//limit IS reached. So there is no allowance to read ahead of time and nothing honest to pace against, and the
+//transport can only react to the refusal. Contrast Instantly, which gets a page cap because its
+//20-per-minute ceiling is a documented hard figure.
+//A refused request was not processed, so repeating it cannot apply anything twice.
+//=============================================================================================================
+
+export class AircallRateLimitError extends Error {
+  constructor(detail: string) {
+    super(`Aircall rate limit reached: ${detail}`);
+    this.name = "AircallRateLimitError";
+  }
+}
+
+const RATE_LIMIT_ATTEMPTS = 3;
+//Matches attioFetch's RETRY_BASE_MS, so the one backoff shape in this codebase stays one shape.
+const RATE_LIMIT_BASE_MS = 500;
+//[PERF] A run that spends its budget asleep has done nothing. Past this, stopping and resuming next run beats
+//waiting - the next run starts with a fresh allowance either way. See rateLimitWaitMs (lib/http.ts).
+const RATE_LIMIT_MAX_WAIT_MS = 5_000;
+
+/**
+ * [LOGIC] Aircall's own reset header, in ms from now. Documented only as "timestamp when the counter will be
+ * reset" with no unit, so both readings are accepted: a value that looks like epoch SECONDS is treated as one,
+ * and anything else is tried as a date. A reading that lands in the past or absurdly far ahead is discarded
+ * rather than trusted, and the caller falls back to its backoff.
+ */
+function aircallResetMs(response: Response): number | null {
+  const header = response.headers.get("x-aircallapi-reset");
+  if (!header) return null;
+  const numeric = Number(header);
+  const epochMs = Number.isFinite(numeric)
+    ? (numeric > 1e11 ? numeric : numeric * 1_000)
+    : Date.parse(header);
+  if (!Number.isFinite(epochMs)) return null;
+  const waitMs = epochMs - Date.now();
+  //A whole minute is the widest a per-minute window can legitimately be.
+  return waitMs > 0 && waitMs <= 60_000 ? waitMs : null;
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Single transport for every Aircall call. Nothing else in this module calls fetch.
+//FLOW: 1. GET the absolute url. 2. 429 with attempts left -> wait and repeat. 3. 429 out of attempts ->
+//AircallRateLimitError, which a caller can tell from a bad request. 4. other non-2xx -> throw.
+//[SECURITY] Basic credentials are rebuilt per request from env and never held in module state.
+//[DEBUG] credentialHint names AIRCALL_API_ID / AIRCALL_API_TOKEN on a 401/403.
+//USES: aircallAuthHeader, credentialHint (lib/endpoints.ts); rateLimitWaitMs (lib/http.ts); responseJson
+//(lib/json.ts).
+//---------------------------------------------------------------------------------------------------------
+async function aircallFetch(url: string): Promise<unknown> {
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await fetch(url, { headers: { Authorization: aircallAuthHeader() } });
+    const body = await responseJson(response);
+    if (response.ok) return body;
+
+    if (response.status === 429) {
+      if (attempt >= RATE_LIMIT_ATTEMPTS) {
+        throw new AircallRateLimitError(
+          `refused after ${RATE_LIMIT_ATTEMPTS} attempt(s). The 120-per-minute allowance is per COMPANY, so every integration on this workspace spends it, not only this sync.`,
+        );
+      }
+      const waitMs = rateLimitWaitMs(
+        response,
+        attempt,
+        RATE_LIMIT_BASE_MS,
+        RATE_LIMIT_MAX_WAIT_MS,
+        aircallResetMs(response),
+      );
+      console.warn(
+        `[aircall] 429 (attempt ${attempt} of ${RATE_LIMIT_ATTEMPTS}) - waiting ${waitMs}ms and retrying`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      continue;
+    }
+    throw new Error(
+      `Aircall API error ${response.status}: ${JSON.stringify(body)}${credentialHint("aircall", response.status)}`,
+    );
+  }
+}
+
+export interface AircallCallWindow {
+  readonly calls: readonly AircallCall[];
+  /** Set when pagination stopped short of the end of the window; null means it was read to the end. */
+  readonly stoppedBy: "throttled" | null;
+  readonly pagesRead: number;
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The paginating form, which keeps what it read when Aircall refuses the rest.
+//
+//[STABILITY] A 429 RETURNS WHAT IT HAS rather than throwing it away, once aircallFetch has exhausted its
+//retries. Discarding it is what wedged the Instantly sync for five days: the throw came from the fetch,
+//before the loop, so the run abandoned before saving its cursor and every later run repeated it exactly.
+//Any other failure still throws - a 500 says nothing about how much of the window exists, and treating the
+//part already read as the whole of it would step over the rest for good.
+//USES: aircallFetch, parseAircallCall (this module).
+//---------------------------------------------------------------------------------------------------------
+export async function fetchAircallCallWindow(fromMs: number, toMs: number): Promise<AircallCallWindow> {
   const calls: AircallCall[] = [];
   //Aircall takes whole seconds. Floor both bounds so the window can only widen, never clip an edge call.
   const first = new URL(`${AIRCALL_BASE}/calls`);
@@ -134,16 +239,25 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
   first.searchParams.set("to", String(Math.floor(toMs / 1_000)));
   first.searchParams.set("per_page", "50");
   let nextUrl: string | null = first.toString();
+  let pagesRead = 0;
+  let stoppedBy: "throttled" | null = null;
 
   //[PERF] Page cost scales with the width of the window, so widening fromMs is not free - see the cron constant.
   while (nextUrl) {
-    //[SECURITY] Basic credentials are rebuilt per request from env and never held in module state.
-    const response = await fetch(nextUrl, { headers: { Authorization: aircallAuthHeader() } });
-    const body = await responseJson(response);
-    //[DEBUG] credentialHint names AIRCALL_API_ID / AIRCALL_API_TOKEN on a 401/403.
-    if (!response.ok) {
-      throw new Error(`Aircall API error ${response.status}: ${JSON.stringify(body)}${credentialHint("aircall", response.status)}`);
+    let body: unknown;
+    try {
+      body = await aircallFetch(nextUrl);
+    } catch (error) {
+      if (error instanceof AircallRateLimitError) {
+        console.warn(
+          `[aircall] throttled after ${pagesRead} page(s) and ${calls.length} call(s) - ${error.message}. What was read is kept and returned; the rest of the window is left for the next run.`,
+        );
+        stoppedBy = "throttled";
+        break;
+      }
+      throw error;
     }
+    pagesRead += 1;
     if (!isJsonObject(body)) throw new Error("Aircall calls response is invalid");
     calls.push(...arrayValue(body, "calls").map(parseAircallCall));
     //Aircall hands back an absolute URL for the next page; null ends the walk.
@@ -152,7 +266,20 @@ export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<r
   }
   //A call still ringing or in progress has no completion time, so it cannot be placed on the cursor timeline.
   //It is simply omitted; a later run reads it once Aircall marks it done.
-  return calls.filter((call) => call.status === "done" && call.endedAt !== null);
+  return {
+    calls: calls.filter((call) => call.status === "done" && call.endedAt !== null),
+    stoppedBy,
+    pagesRead,
+  };
+}
+
+/** [LOGIC] The whole window or nothing, for callers with no cursor to resume from. USES: fetchAircallCallWindow. */
+export async function fetchAircallCalls(fromMs: number, toMs: number): Promise<readonly AircallCall[]> {
+  const { calls, stoppedBy } = await fetchAircallCallWindow(fromMs, toMs);
+  if (stoppedBy === "throttled") {
+    throw new AircallRateLimitError(`only ${calls.length} call(s) of this window could be read`);
+  }
+  return calls;
 }
 
 //---------------------------------------------------------------------------------------------------------

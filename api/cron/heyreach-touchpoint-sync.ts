@@ -23,7 +23,7 @@ import {
   type SyncCursor,
 } from "../../lib/cursors.js";
 import {
-  fetchHeyReachConversations,
+  fetchHeyReachConversationWindow,
   heyReachMessageId,
   type HeyReachConversation,
   type HeyReachMessage,
@@ -156,16 +156,26 @@ export async function GET(request: Request): Promise<Response> {
   let beforeCursorCount = 0;
   //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
   //at now - so they are one value rather than two flags that could disagree.
-  let stopReason: "budget" | "throttled" | null = null;
+  //Why this run covered less than the whole window, if it did. Every reason shares one consequence - the
+  //cursor must NOT be parked at now - so they are one value rather than flags that could disagree.
+  //"window-throttled" is the FETCH stopping partway, which means the window itself is short and the records
+  //beyond it were never seen; the others are the loop stopping partway through a window it read in full.
+  let stopReason: "budget" | "throttled" | "window-throttled" | null = null;
   let cursorSaved = false;
   let fatal: string | null = null;
 
   try {
     cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
-    const conversations = await fetchHeyReachConversations({
+    //[STABILITY] A short read is a partial run, not a failed one. A 429 used to abandon the run before
+    //saveSyncCursor, leaving the mark where it was so the next run re-read the same window and failed the same
+    //way - the loop the Instantly sync sat in for five days. Whatever was read is now processed and the cursor
+    //parked after it, so every run makes progress.
+    const window = await fetchHeyReachConversationWindow({
       fromMs: cursor.timestampMs,
       toMs: upperBoundMs,
     });
+    if (window.stoppedBy) stopReason = "window-throttled";
+    const conversations = window.conversations;
     conversationCount = conversations.length;
     const events = await heyReachTouchpointEvents(conversations);
     messageCount = events.length;
@@ -178,7 +188,7 @@ export async function GET(request: Request): Promise<Response> {
       //Checked before the message rather than after, so the budget is what remains for a whole one. Stopping
       //here leaves `cursor` where the last handled message put it; everything past stays above the mark.
       if (budget.expired()) {
-        stopReason = "budget";
+        stopReason ??= "budget";
         break;
       }
       examinedCount += 1;
@@ -199,7 +209,7 @@ export async function GET(request: Request): Promise<Response> {
           console.warn(
             `[event] heyreach message ${event.cursor.id}: throttled before writing anything - ${error.message}. The run stops here and the next one starts on this message, so nothing is lost and nothing is double-counted.`,
           );
-          stopReason = "throttled";
+          stopReason ??= "throttled";
           //Examined but not handled, so it counts towards what is left rather than what was done.
           examinedCount -= 1;
           break;
@@ -223,7 +233,9 @@ export async function GET(request: Request): Promise<Response> {
       console.warn(
         stopReason === "budget"
           ? `[run] heyreach sync: stopped after ${budgetSeconds(budget)}s of a ${messageCount}-message stream with ${messagesRemaining} still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${messagesRemaining > examinedCount ? " More is left than was done - if that repeats, messages are arriving faster than they are processed." : ""}`
-          : `[run] heyreach sync: stopped by Attio throttling with ${messagesRemaining} of ${messageCount} message(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the message that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`,
+          : stopReason === "throttled"
+            ? `[run] heyreach sync: stopped by Attio throttling with ${messagesRemaining} of ${messageCount} message(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the message that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`
+            : `[run] heyreach sync: HeyReach throttled the window read, so this run saw only part of it and there are conversations beyond what it fetched. What was read is processed and the cursor is left at ${new Date(cursor.timestampMs).toISOString()} to resume from; nothing is lost. Persisting past a few runs means the workspace is spending its HeyReach allowance faster than this sync can read a window.`,
       );
     } else {
       //[STABILITY] Park short of now. A message HeyReach has not yet published is picked up next run, not skipped.
