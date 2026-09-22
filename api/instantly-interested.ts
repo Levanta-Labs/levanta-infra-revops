@@ -8,6 +8,7 @@ import {
 import {
   fetchInstantlyEmails,
   fetchInstantlyLead,
+  InstantlyRateLimitError,
   type InstantlyEmail,
   type InstantlyLead,
 } from "../lib/instantly.js";
@@ -155,10 +156,28 @@ export async function POST(request: Request): Promise<Response> {
       subject: "instantly-interested",
       findPerson: () => findPersonByEmail(fields.email),
       history: async () => {
-        //Unbounded by time - the whole thread for this lead, paginated. Bounded in practice by one lead's volume.
-        const emails = await fetchInstantlyEmails({ leadEmail: fields.email });
-        emailCount = emails.length;
-        return formatInstantlyThread(emails, fields.campaignName);
+        //[STABILITY] A throttled thread read costs the history, never the lead. Instantly's allowance is 20
+        //requests a minute across the whole key, and the touchpoint sync spends up to fifteen of them a run
+        //while a backlog drains - so an interested webhook arriving mid-drain can be refused through no fault
+        //of its own. Raising here would 500 the webhook and lose the lead until Instantly retried it, to save
+        //a note body. The lead is the part worth keeping; the thread stays readable in Instantly.
+        try {
+          //Unbounded by time - the whole thread for this lead, paginated. Bounded in practice by one lead's volume.
+          const emails = await fetchInstantlyEmails({ leadEmail: fields.email });
+          emailCount = emails.length;
+          return formatInstantlyThread(emails, fields.campaignName);
+        } catch (error) {
+          if (!(error instanceof InstantlyRateLimitError)) throw error;
+          console.warn(
+            `[route] instantly-interested: the thread for ${fields.email} could not be read - ${errorMessage(error)}. The lead is recorded without it.`,
+          );
+          //Said plainly rather than reusing formatInstantlyThread's empty-thread text, which would claim there
+          //is no history when the truth is that it could not be read - a difference that matters to whoever
+          //opens the note looking for the reply.
+          return `The email history could not be read from Instantly when this lead was recorded, because the API rate limit had been reached. It is not lost - the thread is still in Instantly.${fields.campaignName ? `
+
+Campaign: ${fields.campaignName}` : ""}`;
+        }
       },
     });
 

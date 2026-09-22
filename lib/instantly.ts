@@ -12,10 +12,33 @@ import {
 export type InstantlyEmailType = "received" | "sent" | "scheduled" | "unknown";
 
 //---------------------------------------------------------------------------------------------------------
+//Raised on a 429, so a caller can tell "slow down" apart from "this request was wrong". Mirrors
+//OutfoundRateLimitError (lib/outfound.ts) - see fetchInstantlyEmailWindow for why the distinction matters
+//more here than the shared shape suggests.
+//
+//WHAT THIS COST BEFORE IT EXISTED. Instantly allows 20 requests per minute and fetchInstantlyEmails pages a
+//hundred emails at a time with no pause between pages, so a backlog reaches the ceiling in seconds. A 429 was
+//an ordinary Error, which abandoned the whole run - and the sync saves its cursor AFTER the loop, so the mark
+//never moved. The next run re-read the same window from the same mark, hit the same ceiling at the same page,
+//and discarded the same work. Production sat in that loop for five days: the Instantly cursor stuck at
+//2026-09-17T14:12:55Z while every run for five days logged "ABANDONED ... cursor NOT saved".
+//---------------------------------------------------------------------------------------------------------
+export class InstantlyRateLimitError extends Error {
+  constructor(detail: string) {
+    super(`Instantly rate limit reached: ${detail}`);
+    this.name = "InstantlyRateLimitError";
+  }
+}
+
+//---------------------------------------------------------------------------------------------------------
 //Single transport for every Instantly call. Nothing else in this module calls fetch.
 //FLOW: 1. prefix with INSTANTLY_BASE. 2. attach the bearer under any caller override. 3. parse the body.
-//4. non-2xx -> throw, with credentialHint naming INSTANTLY_API_KEY on a 401/403.
+//4. 429 -> InstantlyRateLimitError. 5. other non-2xx -> throw, with credentialHint naming INSTANTLY_API_KEY
+//on a 401/403.
 //[SECURITY] The key is read from env per request by instantlyAuthHeader and never cached in module state.
+//[STABILITY] A 429 is NOT retried in here, unlike attioFetch. Attio's limit is per second and a short backoff
+//clears it; Instantly's is 20 per MINUTE, so waiting it out would spend most of a run's budget sleeping. The
+//caller stops and resumes next run instead, which costs nothing and drains the same backlog faster.
 //---------------------------------------------------------------------------------------------------------
 async function instantlyFetch(path: string, options: RequestInit = {}): Promise<unknown> {
   const response = await fetch(`${INSTANTLY_BASE}${path}`, {
@@ -27,6 +50,12 @@ async function instantlyFetch(path: string, options: RequestInit = {}): Promise<
     },
   });
   const body = await responseJson(response);
+  if (response.status === 429) {
+    const retryAfter = response.headers.get("retry-after");
+    throw new InstantlyRateLimitError(
+      `${path.split("?")[0]}${retryAfter ? `, retry after ${retryAfter}s` : ""}. The documented allowance is 20 requests per minute across the whole key, which the touchpoint sync's pagination and the interested route's lookups share.`,
+    );
+  }
   if (!response.ok) {
     throw new Error(
       `Instantly API error ${response.status}: ${JSON.stringify(body)}${credentialHint("instantly", response.status)}`,
@@ -160,21 +189,53 @@ export interface InstantlyEmailQuery {
   readonly leadEmail?: string;
 }
 
+/** Why pagination stopped short of the end of the window, if it did. null means it was read to the end. */
+export type InstantlyPageStop = "throttled" | "page-limit";
+
+export interface InstantlyEmailWindow {
+  readonly emails: readonly InstantlyEmail[];
+  readonly stoppedBy: InstantlyPageStop | null;
+  readonly pagesRead: number;
+}
+
 //---------------------------------------------------------------------------------------------------------
-//Reads emails, paginated. Two callers with different shapes of query: the touchpoint cron passes a time
-//window, the interested webhook passes a lead address and no bounds (the whole thread for that lead).
+//Pages the sync stops itself at, short of the 20-per-minute ceiling.
+//
+//WHY A CAP AND NOT JUST THE 429. Bursting until Instantly refuses would make a rejected request part of normal
+//operation on every run with a backlog, which is both rude to the API and indistinguishable in the log from
+//the real problem. Fifteen pages is 1,500 emails, and leaves five requests of headroom for the interested
+//route - which shares this key's allowance and fires on a lead's schedule, not ours.
+//
+//[PERF] The cap is not the binding constraint on throughput and is not meant to be. One touchpoint is several
+//Attio writes, so INSTANTLY_SYNC_BUDGET_MS runs out long before 1,500 emails are processed; the run stops on
+//budget, parks its cursor, and the next run picks up from there. The cap only bounds what is FETCHED, so a
+//deep backlog cannot spend the whole run on pages it will never reach.
+//---------------------------------------------------------------------------------------------------------
+export const INSTANTLY_SYNC_PAGE_LIMIT = 15;
+
+//---------------------------------------------------------------------------------------------------------
+//Reads emails, paginated, up to `maxPages`.
 //FLOW: 1. build a page from whichever query fields are set. 2. GET. 3. parse items. 4. follow
-//next_starting_after until absent.
+//next_starting_after until absent, until the page cap, or until Instantly refuses.
 //Filters are on timestamp_created, which is also what the cron keys its cursor on, so window and cursor agree.
-//USES: instantlyAuthHeader, credentialHint (lib/endpoints.ts); responseJson, arrayValue (lib/json.ts).
+//
+//[STABILITY] A 429 RETURNS WHAT IT HAS rather than throwing it away. The pages already read are real emails
+//the caller can process, and discarding them is what wedged this sync - see InstantlyRateLimitError. The
+//caller is told the window is incomplete so it knows not to park its cursor at the end of it.
+//Any other failure still throws: a malformed page or a 500 says nothing about how much of the window exists,
+//and guessing that the part already read is the whole of it would skip the rest for good.
+//USES: instantlyFetch, parseInstantlyEmail (this module); isJsonObject, arrayValue, stringValue (lib/json.ts).
 //---------------------------------------------------------------------------------------------------------
-export async function fetchInstantlyEmails(
+export async function fetchInstantlyEmailWindow(
   query: InstantlyEmailQuery,
-): Promise<readonly InstantlyEmail[]> {
+  maxPages: number = Number.POSITIVE_INFINITY,
+): Promise<InstantlyEmailWindow> {
   const emails: InstantlyEmail[] = [];
   let startingAfter: string | null = null;
+  let pagesRead = 0;
 
   do {
+    if (pagesRead >= maxPages) return { emails, stoppedBy: "page-limit", pagesRead };
     //Ascending, so the caller's cursor advances monotonically as it walks the result.
     const params = new URLSearchParams({ limit: "100", sort_order: "asc" });
     //Minus one millisecond: the bound is treated as exclusive, and an email sitting exactly on the cursor
@@ -188,12 +249,44 @@ export async function fetchInstantlyEmails(
     if (query.leadEmail) params.set("lead", query.leadEmail);
     if (startingAfter) params.set("starting_after", startingAfter);
 
-    const body = await instantlyFetch(`/emails?${params}`);
+    let body: unknown;
+    try {
+      body = await instantlyFetch(`/emails?${params}`);
+    } catch (error) {
+      if (error instanceof InstantlyRateLimitError) {
+        console.warn(
+          `[instantly] throttled after ${pagesRead} page(s) and ${emails.length} email(s) - ${error.message}. What was read is kept and returned; the rest of the window is left for the next run.`,
+        );
+        return { emails, stoppedBy: "throttled", pagesRead };
+      }
+      throw error;
+    }
+    pagesRead += 1;
     if (!isJsonObject(body)) throw new Error("Instantly emails response is invalid");
     emails.push(...arrayValue(body, "items").map(parseInstantlyEmail));
     startingAfter = stringValue(body.next_starting_after);
   } while (startingAfter);
 
+  return { emails, stoppedBy: null, pagesRead };
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The whole of a query's emails, or nothing.
+//For the interested route, whose note is one lead's thread: half a thread rendered as though it were the
+//whole is a misleading note, and unlike the cron there is no cursor to resume from - the note is written once.
+//So a throttled read raises here rather than returning a partial thread. The route's own handling decides
+//what a missing history is worth; see api/instantly-interested.ts.
+//USES: fetchInstantlyEmailWindow (this module).
+//---------------------------------------------------------------------------------------------------------
+export async function fetchInstantlyEmails(
+  query: InstantlyEmailQuery,
+): Promise<readonly InstantlyEmail[]> {
+  const { emails, stoppedBy } = await fetchInstantlyEmailWindow(query);
+  if (stoppedBy === "throttled") {
+    throw new InstantlyRateLimitError(
+      `only ${emails.length} email(s) of this thread could be read, and a partial thread is not written as though it were the whole`,
+    );
+  }
   return emails;
 }
 
