@@ -336,9 +336,11 @@ budget stop:
   with and must stay above the mark.
 - The response carries `truncated: true` and a count of what is left (`callsRemaining` / `emailsRemaining` /
   `messagesRemaining` / `threadsRemaining`), and the run logs a `[run] ... STOPPED` warning. The HTTP status stays 200 - a partial run is
-  a success, not a failure. All four syncs also report `stopReason`, because all four can stop for either of two
-  reasons - `"budget"` or `"throttled"` - and the two want different responses: a budget stop is a throughput
-  problem, a throttle is a rate-limit one.
+  a success, not a failure. All four syncs also report `stopReason`, because all four can stop for more than one
+  reason - `"budget"` or `"throttled"` - and they want different responses: a budget stop is a throughput problem,
+  a throttle is a rate-limit one. Instantly adds two more, `"window-throttled"` and `"window-truncated"`, which are
+  the *fetch* stopping short rather than the loop - see
+  [Instantly's window cannot always be read in one go](#instantlys-window-cannot-always-be-read-in-one-go).
 
 Aircall reached the limit first, on volume; the others have the identical shape and so the identical risk. HeyReach
 is the most exposed on steady state - see the `[PERF]` note on its handler, where cost grows through the UTC day
@@ -361,6 +363,54 @@ five-minute cadence that is roughly 250 threads per run before Outfound starts r
 easily. A throttled thread wrote nothing and the cursor never passed it, so the run stops and defers rather than
 marching through the remaining backlog collecting one refusal per thread. Repeated `stopReason: "throttled"` means
 the key needs a higher tier, not a longer budget.
+
+### Instantly's window cannot always be read in one go
+
+**Instantly allows 20 requests per minute across the whole key**, and the touchpoint sync pages a hundred emails at
+a time with no pause between pages. Any real backlog reaches that ceiling within seconds.
+
+This wedged production for five days. A 429 was an ordinary thrown `Error`, which abandoned the run — and every sync
+saves its cursor *after* its loop, so the mark never moved. The next run re-read the same window from the same mark,
+hit the same ceiling at the same page, and discarded the same work. The cursor sat at `2026-09-17T14:12:55Z` while
+every run for five days logged `ABANDONED ... cursor NOT saved`. It could not recover on its own: each run needed to
+get further than the last, and none ever did.
+
+Two things changed.
+
+`fetchInstantlyEmailWindow` **returns the pages it read** when Instantly refuses the next one, instead of throwing
+them away, and tells the caller the window is short. The sync processes what arrived and parks its cursor after it,
+so every run makes progress and the backlog drains a slice at a time. Anything that is *not* a 429 still raises: a
+500 says nothing about how much of the window exists, and treating the part already read as the whole of it would
+park the cursor past emails that were never seen.
+
+The sync also **stops itself at `INSTANTLY_SYNC_PAGE_LIMIT` (15 pages, 1,500 emails)** rather than bursting until
+refused. A rejected request as part of normal operation is both rude to the API and indistinguishable in the log
+from the real problem. Fifteen leaves five requests of headroom for the interested webhook, which shares the same
+key and fires on a lead's schedule rather than ours.
+
+The two show up differently, because they want different responses:
+
+| `stopReason` | Meaning | What to do |
+| --- | --- | --- |
+| `"window-truncated"` | The read stopped at the page cap | Nothing. This is a backlog draining as designed; expect it on consecutive runs until the cursor catches up |
+| `"window-throttled"` | Instantly refused a page before the cap | Nothing for a run or two. Persisting means something else is spending the key's allowance and the cap is too high |
+
+**The page cap is not the throughput limit and is not meant to be.** One touchpoint is several Attio writes, so
+`INSTANTLY_SYNC_BUDGET_MS` runs out long before 1,500 emails are processed — the run stops on budget, parks its
+cursor, and the next one resumes. The cap only bounds what is *fetched*, so a deep backlog cannot spend a whole run
+on pages it will never reach.
+
+**The interested route degrades rather than failing.** While a backlog drains the sync is spending up to fifteen of
+the twenty requests, so an interested webhook can be refused through no fault of its own. Raising there would 500
+the webhook and lose the lead until Instantly retried it, to save a note body — so a throttled thread read is
+caught, the lead is recorded, and the note says the history could not be *read*, which is not the same as there
+being none.
+
+**Known gap: HeyReach and Aircall have the same shape and no handling.** Attio retries a 429 with backoff, Outfound
+raises `OutfoundRateLimitError` and stops cleanly, Instantly now does the above — but `heyreachFetch` and the
+Aircall transport still treat a 429 as an ordinary error, which would abandon those runs and discard their cursors
+exactly as Instantly's did. Neither has hit a backlog deep enough to trip it. HeyReach is the more exposed of the
+two, since its fetch is day-granular and re-reads every conversation touched since UTC midnight.
 
 A single truncated run is normal while a backlog drains. Truncation run after run means events arrive faster than
 they are processed. Each sync takes its own override - `AIRCALL_SYNC_BUDGET_MS`, `INSTANTLY_SYNC_BUDGET_MS`,

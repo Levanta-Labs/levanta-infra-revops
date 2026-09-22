@@ -23,7 +23,11 @@ import {
   type SyncCursor,
 } from "../../lib/cursors.js";
 import { isAuthorizedCron, json, serverError } from "../../lib/http.js";
-import { fetchInstantlyEmails, type InstantlyEmail } from "../../lib/instantly.js";
+import {
+  fetchInstantlyEmailWindow,
+  INSTANTLY_SYNC_PAGE_LIMIT,
+  type InstantlyEmail,
+} from "../../lib/instantly.js";
 import { errorMessage } from "../../lib/json.js";
 import { budgetSeconds, startRunBudget } from "../../lib/run-budget.js";
 import { cursorState, runOutcome } from "../../lib/run-summary.js";
@@ -87,13 +91,14 @@ export async function processInstantlyTouchpoint(email: InstantlyEmail): Promise
 
 //---------------------------------------------------------------------------------------------------------
 //Vercel Cron entry point, every five minutes.
-//FLOW: 1. isAuthorizedCron (lib/http.ts). 2. getSyncCursor (lib/cursors.ts). 3. fetchInstantlyEmails
-//(lib/instantly.ts) over cursor..now. 4. keep only real sent/received traffic. 5. sort by creation time.
+//FLOW: 1. isAuthorizedCron (lib/http.ts). 2. getSyncCursor (lib/cursors.ts). 3. fetchInstantlyEmailWindow
+//(lib/instantly.ts) over cursor..now, bounded to INSTANTLY_SYNC_PAGE_LIMIT pages and keeping what it read even
+//if Instantly refused the rest. 4. keep only real sent/received traffic. 5. sort by creation time.
 //6. per email, skip anything at or below the mark, else processInstantlyTouchpoint. 7. advance the mark past
 //each handled email. 7a. stop at the run budget if still going, or if an email was throttled before writing
 //anything, leaving the cursor at the last email actually handled. 8. park at (now - CURSOR_GRACE_MS) and
-//persist - the park is SKIPPED on either stop, since the emails the loop never reached must stay above the
-//mark. See lib/run-budget.ts. 9. report, on every exit - see the finally.
+//persist - the park is SKIPPED on any stop, INCLUDING a short read at step 3, since neither the emails the
+//loop never reached nor the ones the fetch never saw may be left below the mark. See lib/run-budget.ts. 9. report, on every exit - see the finally.
 //[STABILITY] A failed email is counted and passed over, never retried: its earlier writes are committed, so a
 //retry would duplicate them, and a permanently failing one would block the sync forever. THE EXCEPTION is a
 //transient failure before the first write, which is safe to attempt again precisely because nothing is
@@ -119,15 +124,29 @@ export async function GET(request: Request): Promise<Response> {
   //figures account for the whole window: without it a run that fetched forty and processed three reads as
   //though it silently dropped thirty-seven, when they were re-read on purpose and correctly passed over.
   let beforeCursorCount = 0;
-  //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
-  //at now - so they are one value rather than two flags that could disagree.
-  let stopReason: "budget" | "throttled" | null = null;
+  //Why this run covered less than the whole window, if it did. Every reason shares one consequence - the
+  //cursor must NOT be parked at now - so they are one value rather than flags that could disagree.
+  //"budget" and "throttled" are the loop stopping partway; "window-truncated" and "window-throttled" are the
+  //FETCH stopping partway, which means the window itself is short and the emails beyond it were never seen.
+  let stopReason: "budget" | "throttled" | "window-truncated" | "window-throttled" | null = null;
   let cursorSaved = false;
   let fatal: string | null = null;
 
   try {
     cursor = await getSyncCursor(SYNC_KEY, upperBoundMs);
-    const emails = [...(await fetchInstantlyEmails({ fromMs: cursor.timestampMs, toMs: upperBoundMs }))]
+    //[STABILITY] A short read is a partial run, not a failed one. Instantly allows 20 requests a minute and
+    //this pages a hundred emails at a time, so a backlog cannot be read in one go - and it used to THROW on
+    //the 429, which abandoned the run before saveSyncCursor and left the mark where it was. The next run then
+    //re-read the same window and failed identically; production sat in that loop for five days. Whatever was
+    //read is now processed and the cursor parked after it, so every run makes progress.
+    const window = await fetchInstantlyEmailWindow(
+      { fromMs: cursor.timestampMs, toMs: upperBoundMs },
+      INSTANTLY_SYNC_PAGE_LIMIT,
+    );
+    if (window.stoppedBy) {
+      stopReason = window.stoppedBy === "throttled" ? "window-throttled" : "window-truncated";
+    }
+    const emails = [...window.emails]
       //Scheduled mail has not happened yet and an auto-reply is not a human touchpoint; neither is counted.
       .filter(
         (email) =>
@@ -146,7 +165,10 @@ export async function GET(request: Request): Promise<Response> {
       //Checked before the email rather than after, so the budget is what remains for a whole one. Stopping here
       //leaves `cursor` where the last handled email put it; everything past this point stays above the mark.
       if (budget.expired()) {
-        stopReason = "budget";
+        //[LOGIC] A budget stop does not overwrite a short read. Both park the cursor identically, and the
+        //fetch's reason is the one worth reporting: "we never saw the whole window" explains a backlog that
+        //persists, where "we ran out of time" reads as ordinary throughput.
+        stopReason ??= "budget";
         break;
       }
       examinedCount += 1;
@@ -168,7 +190,7 @@ export async function GET(request: Request): Promise<Response> {
           console.warn(
             `[event] instantly email ${email.id}: throttled before writing anything - ${error.message}. The run stops here and the next one starts on this email, so nothing is lost and nothing is double-counted.`,
           );
-          stopReason = "throttled";
+          stopReason ??= "throttled";
           //Examined but not handled, so it counts towards what is left rather than what was done.
           examinedCount -= 1;
           break;
@@ -189,10 +211,17 @@ export async function GET(request: Request): Promise<Response> {
       //[STABILITY] Do NOT park at now. Parking claims everything up to that moment was dealt with, and the
       //emails the loop never reached were not - they would be skipped forever. Leaving the cursor where the
       //loop stopped is what makes the next run resume instead of restart.
+      const resumeAt = new Date(cursor.timestampMs).toISOString();
+      //[DEBUG] Four stops, four different things to do about them, so each says which it was in its own words
+      //rather than sharing a sentence that would be true of all of them and useful for none.
       console.warn(
         stopReason === "budget"
-          ? `[run] instantly sync: stopped after ${budgetSeconds(budget)}s of a ${emailCount}-email window with ${emailsRemaining} still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${emailsRemaining > examinedCount ? " More is left than was done - if that repeats, email is arriving faster than it is processed." : ""}`
-          : `[run] instantly sync: stopped by Attio throttling with ${emailsRemaining} of ${emailCount} email(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the email that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`,
+          ? `[run] instantly sync: stopped after ${budgetSeconds(budget)}s of a ${emailCount}-email window with ${emailsRemaining} still to do, cursor left at ${resumeAt} to resume from.${emailsRemaining > examinedCount ? " More is left than was done - if that repeats, email is arriving faster than it is processed." : ""}`
+          : stopReason === "throttled"
+            ? `[run] instantly sync: stopped by Attio throttling with ${emailsRemaining} of ${emailCount} email(s) still to do, cursor left at ${resumeAt} to resume from. Nothing was lost; the next run starts on the email that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`
+            : stopReason === "window-throttled"
+              ? `[run] instantly sync: Instantly throttled the window read, so this run saw only the first ${emailCount} email(s) of it and there are more beyond them. What was read is processed and the cursor is left at ${resumeAt} to resume from; nothing is lost. Persisting past a few runs means the page cap of ${INSTANTLY_SYNC_PAGE_LIMIT} is too high for what else is spending this key's 20 requests a minute.`
+              : `[run] instantly sync: the window read stopped at the ${INSTANTLY_SYNC_PAGE_LIMIT}-page cap, so this run saw only the first ${emailCount} email(s) of it and there are more beyond them. What was read is processed and the cursor is left at ${resumeAt} to resume from. This is how a backlog drains - expect it on consecutive runs until the cursor catches up.`,
       );
     } else {
       //[STABILITY] Park short of now. An email Instantly has not yet published is picked up next run, not skipped.
