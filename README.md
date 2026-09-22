@@ -338,9 +338,11 @@ budget stop:
   `messagesRemaining` / `threadsRemaining`), and the run logs a `[run] ... STOPPED` warning. The HTTP status stays 200 - a partial run is
   a success, not a failure. All four syncs also report `stopReason`, because all four can stop for more than one
   reason - `"budget"` or `"throttled"` - and they want different responses: a budget stop is a throughput problem,
-  a throttle is a rate-limit one. Instantly adds two more, `"window-throttled"` and `"window-truncated"`, which are
-  the *fetch* stopping short rather than the loop - see
-  [Instantly's window cannot always be read in one go](#instantlys-window-cannot-always-be-read-in-one-go).
+  a throttle is a rate-limit one. Instantly, HeyReach and Aircall add `"window-throttled"` - and Instantly also
+  `"window-truncated"` - which are the *fetch* stopping short rather than the loop, meaning the window itself was
+  incomplete and the records beyond it were never seen. See
+  [Instantly's window cannot always be read in one go](#instantlys-window-cannot-always-be-read-in-one-go) and
+  [Every provider handles its own 429 now](#every-provider-handles-its-own-429-now).
 
 Aircall reached the limit first, on volume; the others have the identical shape and so the identical risk. HeyReach
 is the most exposed on steady state - see the `[PERF]` note on its handler, where cost grows through the UTC day
@@ -406,11 +408,51 @@ the webhook and lose the lead until Instantly retried it, to save a note body �
 caught, the lead is recorded, and the note says the history could not be *read*, which is not the same as there
 being none.
 
-**Known gap: HeyReach and Aircall have the same shape and no handling.** Attio retries a 429 with backoff, Outfound
-raises `OutfoundRateLimitError` and stops cleanly, Instantly now does the above — but `heyreachFetch` and the
-Aircall transport still treat a 429 as an ordinary error, which would abandon those runs and discard their cursors
-exactly as Instantly's did. Neither has hit a backlog deep enough to trip it. HeyReach is the more exposed of the
-two, since its fetch is day-granular and re-reads every conversation touched since UTC midnight.
+### Every provider handles its own 429 now
+
+The four transports had drifted apart and only two were ever hardened, which is how the Instantly wedge went
+unnoticed. They are all covered now, but not identically — the right answer depends on the allowance:
+
+| Provider | Allowance | Handling |
+| --- | --- | --- |
+| Attio | Per second, plus a query-complexity limit | Retries with backoff, honours `Retry-After` |
+| Instantly | **20/minute**, documented | Self-imposed 15-page cap, then partial return |
+| HeyReach | One pool shared across every endpoint | Retries 3x, then partial return |
+| Aircall | **120/minute per company** | Retries 3x honouring `X-AircallApi-Reset`, then partial return |
+| Outfound | Per key, `standard` tier at 9/s and 3,000/hr | `OutfoundRateLimitError` stops the thread expansion |
+
+**Why Instantly gets a cap and the other two get retries.** Instantly's 20/minute is documented as a hard number,
+so the sync can pace itself against it and avoid the refusal entirely. HeyReach and Aircall were both **probed
+live and answered 200 with no rate-limit header of any kind** — no limit, no remaining, no reset — so there is no
+allowance to read ahead of time and nothing honest to pace against. A transport can only react to the refusal when
+it arrives. Aircall documents its `X-AircallApi-Limit`/`Remaining`/`Reset` trio as arriving *once the limit is
+reached*, so `aircallResetMs` reads it when present and falls back to backoff when it is not.
+
+Waiting is also worth less at these ceilings than it looks. A run that spends its budget asleep has done nothing,
+so both cap the wait at five seconds and then stop — the next run starts with a fresh allowance either way.
+
+**In all three cases the invariant is the same and it is the only one that matters:** a run that gets throttled
+still *saves its cursor*. That is what makes the next run different from this one, and its absence is the whole of
+what kept the Instantly sync dead for five days. A throttled window fetch reports `stopReason: "window-throttled"`
+and the run is still a 200.
+
+**HeyReach's retry covers a write.** `StopLeadInCampaign` is the only provider-side write in the codebase, and it
+is retried on a 429 for the same reason Attio retries POSTs: a refused request was not processed, so repeating it
+cannot withdraw a lead twice.
+
+**The all-or-nothing forms are kept for the interested routes.** `fetchInstantlyEmails`, `fetchHeyReachConversations`
+and `fetchAircallCalls` still raise rather than returning a partial read, because their caller writes one note once
+and has no cursor to resume from — half a thread rendered as though it were the whole is a misleading note, not
+deferred work.
+
+**Both interested routes then degrade rather than failing.** `/api/instantly-interested` and
+`/api/heyreach-interested` each catch their own provider's rate limit around the thread read, record the lead from
+the webhook alone, and write a note saying the history could not be *read* — which is not the same as there being
+none, and matters to whoever opens the note looking for the reply. Raising instead would 500 the webhook and lose
+the lead until the provider retried it, to save a note body. Anything that is not a rate limit still raises: an
+unreachable API is not a reason to record a lead with half its detail and no sign anything went wrong. The two
+routes are kept deliberately symmetrical, because one degrading while its twin 500s is a difference nobody finds
+until the day it matters.
 
 A single truncated run is normal while a backlog drains. Truncation run after run means events arrive faster than
 they are processed. Each sync takes its own override - `AIRCALL_SYNC_BUDGET_MS`, `INSTANTLY_SYNC_BUDGET_MS`,

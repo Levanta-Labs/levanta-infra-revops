@@ -1,4 +1,4 @@
-import { fetchAircallCalls, formatCallDuration, type AircallCall } from "../../lib/aircall.js";
+import { fetchAircallCallWindow, formatCallDuration, type AircallCall } from "../../lib/aircall.js";
 import { toE164 } from "../../lib/phone.js";
 import {
   interestedTagSet,
@@ -224,9 +224,11 @@ export async function GET(request: Request): Promise<Response> {
   //the interested gate runs on reach, not on the cursor, so a call counted here may still have been checked
   //for tags. Counted so the summary accounts for the window instead of leaving a silent shortfall.
   let beforeCursorCount = 0;
-  //Why the loop stopped early, if it did. Both reasons share one consequence - the cursor must NOT be parked
-  //at now - so they are one value rather than two flags that could disagree.
-  let stopReason: "budget" | "throttled" | null = null;
+  //Why this run covered less than the whole window, if it did. Every reason shares one consequence - the
+  //cursor must NOT be parked at now - so they are one value rather than flags that could disagree.
+  //"window-throttled" is the FETCH stopping partway, which means the window itself is short and the records
+  //beyond it were never seen; the others are the loop stopping partway through a window it read in full.
+  let stopReason: "budget" | "throttled" | "window-throttled" | null = null;
   let cursorSaved = false;
   let fatal: string | null = null;
 
@@ -244,7 +246,13 @@ export async function GET(request: Request): Promise<Response> {
     //Creation-time floor. See MAX_CALL_DURATION_MS - without this a long call is never seen finished in range.
     fetchFromMs = processFloorMs - MAX_CALL_DURATION_MS;
     //Aircall orders by creation time; re-sort by completion so the cursor advances monotonically.
-    const calls = [...(await fetchAircallCalls(fetchFromMs, upperBoundMs))].sort(
+    //[STABILITY] A short read is a partial run, not a failed one. A 429 used to abandon the run before
+    //saveSyncCursor, leaving the mark where it was so the next run re-read the same window and failed the same
+    //way - the loop the Instantly sync sat in for five days. Whatever was read is now processed and the cursor
+    //parked after it, so every run makes progress.
+    const window = await fetchAircallCallWindow(fetchFromMs, upperBoundMs);
+    if (window.stoppedBy) stopReason = "window-throttled";
+    const calls = [...window.calls].sort(
       (left, right) => aircallCursorEvent(left).timestampMs - aircallCursorEvent(right).timestampMs,
     );
     callCount = calls.length;
@@ -259,7 +267,7 @@ export async function GET(request: Request): Promise<Response> {
       //not what remains after one has already overrun it. Stopping here leaves `cursor` exactly where the last
       //completed call put it; everything past this point is untouched and still above the mark next run.
       if (budget.expired()) {
-        stopReason = "budget";
+        stopReason ??= "budget";
         break;
       }
       examinedCount += 1;
@@ -286,7 +294,7 @@ export async function GET(request: Request): Promise<Response> {
           console.warn(
             `[event] aircall touchpoint call ${call.id}: throttled before writing anything - ${error.message}. The run stops here and the next one starts on this call, so nothing is lost and nothing is double-counted.`,
           );
-          stopReason = "throttled";
+          stopReason ??= "throttled";
           //Examined but not handled, so it counts towards what is left rather than what was done.
           examinedCount -= 1;
           break;
@@ -310,7 +318,9 @@ export async function GET(request: Request): Promise<Response> {
       console.warn(
         stopReason === "budget"
           ? `[run] aircall sync: stopped after ${budgetSeconds(budget)}s of a ${callCount}-call backlog with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from.${callsRemaining > examinedCount ? " More is left than was done - if that repeats, calls are arriving faster than they are processed and the cron cadence in vercel.json wants shortening." : ""}`
-          : `[run] aircall sync: stopped by Attio throttling with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the call that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`,
+          : stopReason === "throttled"
+            ? `[run] aircall sync: stopped by Attio throttling with ${callsRemaining} call(s) still to do, cursor left at ${new Date(cursor.timestampMs).toISOString()} to resume from. Nothing was lost; the next run starts on the call that was throttled. Repeated throttling means this sync is querying Attio faster than the account allows.`
+            : `[run] aircall sync: Aircall throttled the window read, so this run saw only part of it and there are calls beyond what it fetched. What was read is processed and the cursor is left at ${new Date(cursor.timestampMs).toISOString()} to resume from; nothing is lost. Persisting past a few runs means the workspace is spending its Aircall allowance faster than this sync can read a window.`,
       );
     } else {
       //[STABILITY] Park short of now. A call Aircall has not yet published is picked up next run instead of skipped.

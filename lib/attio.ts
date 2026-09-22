@@ -1,6 +1,7 @@
 import { reportConfigEmail, reportConfigValue, requiredEnv } from "./env.js";
 import type { Provider } from "./providers.js";
 import { ATTIO_BASE, attioHeaders, credentialHint } from "./endpoints.js";
+import { retryAfterMs } from "./http.js";
 import {
   arrayValue,
   errorMessage,
@@ -155,16 +156,6 @@ export async function beforeAnyWrite<T>(step: () => Promise<T>): Promise<T> {
     if (isTransientAttioError(error)) throw new ThrottledBeforeWrite(error);
     throw error;
   }
-}
-
-/** Attio's Retry-After, in ms, when it sends one. Seconds or an HTTP date; anything else is ignored. */
-function retryAfterMs(response: Response): number | null {
-  const header = response.headers.get("retry-after");
-  if (!header) return null;
-  const seconds = Number(header);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
-  const date = Date.parse(header);
-  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
 }
 
 //---------------------------------------------------------------------------------------------------------
