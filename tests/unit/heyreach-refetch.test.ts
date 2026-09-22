@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GET as heyReachSync } from "../../api/cron/heyreach-touchpoint-sync.js";
-import { installFetchMock, jsonResponse, type FetchCall } from "./test-utils.js";
+import { installFetchMock, jsonResponse, noteWrites, notesResponse, type FetchCall } from "./test-utils.js";
 
 //=============================================================================================================
 //HeyReach's from/to filter is day-granular: a five-minute window returns every conversation touched since UTC
@@ -99,7 +99,7 @@ function heyReachMock(cursorRow?: unknown) {
         ? jsonResponse({})
         : jsonResponse({ data: { id: { record_id: "record-1" }, values: { number_of_dms_6: [{ value: 9 }] } } });
     }
-    if (url.includes("/notes")) return jsonResponse({});
+    if (url.includes("/notes")) return notesResponse(init);
     throw new Error(`Unexpected fetch: ${url}`);
   });
 }
@@ -110,7 +110,7 @@ const cronRequest = (): Request =>
   });
 
 const notes = (calls: readonly FetchCall[]): readonly FetchCall[] =>
-  calls.filter((call) => call.input.includes("/notes"));
+  noteWrites(calls);
 const counterWrites = (calls: readonly FetchCall[]): readonly FetchCall[] =>
   calls.filter((call) => call.input.includes("/records/") && call.init?.method === "PATCH");
 const savedCursor = (calls: readonly FetchCall[]): Record<string, unknown> => {

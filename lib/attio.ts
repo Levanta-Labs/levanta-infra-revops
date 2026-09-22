@@ -496,6 +496,76 @@ export async function addPersonToList(
   );
 }
 
+//#region notes
+/** One note as the duplicate check needs it: what it is called and when it landed. Content is never read. */
+export interface AttioNote {
+  readonly id: string;
+  readonly title: string;
+  readonly createdAtMs: number;
+}
+
+export interface AttioNoteListing {
+  readonly notes: readonly AttioNote[];
+  /**
+   * False when MAX_NOTE_PAGES was spent with more still unread. The caller then knows only that it did not
+   * SEE a given note, not that none exists, which is the difference between declining to write and failing
+   * open - see recentlyNoted (lib/interested.ts).
+   */
+  readonly complete: boolean;
+}
+
+//Attio caps `limit` at 50, and the listing documents no sort order - so absence can only be concluded by
+//reading every page, and a record with a long note history has to be bounded somewhere. Four pages covers
+//200 notes, which is far past what an interested lead accumulates; past that the caller fails open.
+const NOTE_PAGE_LIMIT = 50;
+const MAX_NOTE_PAGES = 4;
+
+function parseAttioNote(value: unknown): AttioNote | null {
+  if (!isJsonObject(value)) return null;
+  const id = objectValue(value, "id");
+  const noteId = id ? stringValue(id.note_id) : null;
+  const createdAt = stringValue(value.created_at);
+  if (!noteId || !createdAt) return null;
+  const createdAtMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdAtMs)) return null;
+  //An untitled note is legal in Attio and simply matches no title the workflows write.
+  return { id: noteId, title: stringValue(value.title) ?? "", createdAtMs };
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Every note on one record, up to the page bound.
+//FLOW: 1. page through /notes filtered to this parent. 2. stop on a short page, on the bound, or on a page
+//that parses to nothing. 3. report whether the listing was exhausted.
+//[STABILITY] GET only, so attioFetch retries a 429 or a 5xx for free - see RETRY_ON_GET_ONLY.
+//[PERF] One request for any record holding fewer than 50 notes, which is the ordinary case.
+//USES: attioFetch, responseData, parseAttioNote (this module).
+//---------------------------------------------------------------------------------------------------------
+export async function listNotes(
+  parentObject: AttioObject,
+  parentRecordId: string,
+): Promise<AttioNoteListing> {
+  const notes: AttioNote[] = [];
+  for (let page = 0; page < MAX_NOTE_PAGES; page += 1) {
+    const query = new URLSearchParams({
+      parent_object: parentObject,
+      parent_record_id: parentRecordId,
+      limit: String(NOTE_PAGE_LIMIT),
+      offset: String(page * NOTE_PAGE_LIMIT),
+    });
+    const response = await attioFetch(`/notes?${query.toString()}`);
+    const items = responseData(response);
+    if (!Array.isArray(items)) throw new Error("Attio notes response is missing a data array");
+    for (const item of items) {
+      const note = parseAttioNote(item);
+      if (note) notes.push(note);
+    }
+    //A short page is the last page. Attio returns exactly `limit` while more remain.
+    if (items.length < NOTE_PAGE_LIMIT) return { notes, complete: true };
+  }
+  return { notes, complete: false };
+}
+//#endregion
+
 /** Appends a note. Attio has no upsert for notes, so calling twice produces two notes. */
 export async function createNote(
   parentObject: AttioObject,

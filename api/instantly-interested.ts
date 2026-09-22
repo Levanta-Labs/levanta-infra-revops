@@ -123,7 +123,10 @@ async function enrichFromInstantly(email: string): Promise<InstantlyLead | null>
 //
 //[SECURITY] Step 1 precedes the body read, so an unauthenticated caller never reaches the parser.
 //[STABILITY] Step 5 is a series of Attio calls with no transaction. A throw partway leaves earlier writes
-//committed and returns 500; Instantly's retry would then repeat them, adding duplicate notes.
+//committed and returns 500. Instantly's retry no longer duplicates the notes as a matter of course - the repeat
+//check in recordInterestedLead declines an event whose note is already on the Person from inside
+//INTERESTED_DUPLICATE_WINDOW_MS - but a retry landing after that window, or one arriving while the note
+//listing cannot be read, is still recorded a second time. The check narrows this; it does not remove it.
 //[DEBUG] `emailCount` is assigned inside the history thunk because only that closure sees the thread. The
 //thunk is awaited inside recordInterestedLead before this function reads it back, so the count is settled.
 //USES: hasWebhookSecret, json, requestJson, serverError (lib/http.ts); findPersonByEmail (lib/attio.ts);
@@ -160,10 +163,13 @@ export async function POST(request: Request): Promise<Response> {
     });
 
     console.log(
-      `[route] instantly-interested: ${emailCount} email(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
+      outcome.duplicate
+        ? `[route] instantly-interested: declined as a repeat, ${emailCount} email(s) fetched but not written`
+        : `[route] instantly-interested: ${emailCount} email(s) summarised, ${outcome.suppression.failures.length} platform(s) failed to suppress`,
     );
     return json({
       success: true,
+      duplicate: outcome.duplicate,
       personId: outcome.personId,
       dealId: outcome.dealId,
       companyId: outcome.companyId,

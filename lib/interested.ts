@@ -10,6 +10,7 @@ import {
   findCompanyByDomain,
   findCompanyByName,
   LISTS,
+  listNotes,
   patchRecord,
   personCompanyId,
   personLabel,
@@ -19,6 +20,7 @@ import {
   type AttioRecord,
   type AttioValues,
 } from "./attio.js";
+import { reportConfigValue, tunableEnv } from "./env.js";
 import { arrayValue, errorMessage, isJsonObject, stringValue } from "./json.js";
 import {
   automatedSourceLabel,
@@ -800,6 +802,121 @@ export async function suppressInterestedLead(targets: SuppressionTargets): Promi
 }
 //#endregion
 
+//#region declining a repeat
+//=============================================================================================================
+//WHY THIS EXISTS. Attio offers no idempotency key and no upsert for notes - createNote (lib/attio.ts) appends,
+//so the same event arriving twice leaves two identical notes on the Person and two on the Deal, plus a
+//transcript apiece. Every other step of the workflow converges on its own: the person, company and deal are
+//all find-or-create, and updateAttioAttributes fills blanks. The note is the one step that accumulates.
+//
+//Providers repeat events for reasons that are theirs, not ours. HeyReach's webhook is registered against ALL
+//campaigns, and a lead enrolled in several, or auto-tagged again on a second inbound message, produces one
+//delivery apiece - each a true event by HeyReach's reckoning and indistinguishable from the last by ours. A
+//relay retry after a partial failure does the same. Filtering on the event name addresses the first cause
+//only; this addresses all of them, for every provider, at the one point where repetition actually costs.
+//
+//WHAT COUNTS AS A REPEAT: a note already on the Person, carrying the title this run would write - the
+//provider's own lead-source label - and created inside the window. Title alone would be wrong: a lead who
+//re-engages weeks later is a real second event that deserves its own note. The window is what separates a
+//burst from a return.
+//
+//[STABILITY] THIS NARROWS THE WINDOW, IT DOES NOT CLOSE IT. The check is a read and the write that follows is
+//a separate request, with no transaction between them. Two deliveries landing in different Vercel instances
+//within the same few hundred milliseconds can both read "no note" and both write. What is observed in
+//production is deliveries seconds apart, which this catches; simultaneous ones would need a lock Attio cannot
+//give us. The same gap already lets two simultaneous events create two Person records, which predates this
+//check and is not addressed by it.
+//=============================================================================================================
+
+//Long enough to cover a provider's retry and a fan-out across campaigns, short enough that a lead who replies
+//again days later still earns a fresh note. Overridable per deployment without a redeploy.
+export const DEFAULT_DUPLICATE_WINDOW_MS = 15 * 60 * 1_000;
+
+//---------------------------------------------------------------------------------------------------------
+//[STABILITY] A malformed value falls back rather than throwing, matching budgetMs (lib/run-budget.ts): losing
+//the override is a tuning problem, losing the event is a data problem. Zero is honoured as "off", because
+//disabling the check is a legitimate thing to want and a negative number is not.
+//---------------------------------------------------------------------------------------------------------
+function duplicateWindowMs(): number {
+  const raw = tunableEnv(
+    "INTERESTED_DUPLICATE_WINDOW_MS",
+    `using the ${DEFAULT_DUPLICATE_WINDOW_MS / 60_000}-minute default`,
+  );
+  if (!raw) return DEFAULT_DUPLICATE_WINDOW_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(
+      `[config] INTERESTED_DUPLICATE_WINDOW_MS is not a non-negative number (${JSON.stringify(raw)}) - using the ${DEFAULT_DUPLICATE_WINDOW_MS / 60_000}-minute default`,
+    );
+    return DEFAULT_DUPLICATE_WINDOW_MS;
+  }
+  reportConfigValue("INTERESTED_DUPLICATE_WINDOW_MS", raw);
+  return parsed;
+}
+
+//---------------------------------------------------------------------------------------------------------
+//Whether this person already carries `title` from inside the window.
+//FLOW: 1. window of zero -> the check is off, nothing is read. 2. list the person's notes. 3. match on title
+//and age. 4. a listing that could not be exhausted, or a read that failed, answers false.
+//
+//[STABILITY] FAILS OPEN, DELIBERATELY. A read error is swallowed and a truncated listing answers false,
+//because the cost of the two outcomes is not symmetric: a wrong "yes" silently discards a real interested
+//lead, which is the event this whole codebase exists to capture, while a wrong "no" writes a duplicate note -
+//the status quo, and visible. Neither is silent in the log.
+//USES: listNotes (lib/attio.ts), errorMessage (lib/json.ts).
+//---------------------------------------------------------------------------------------------------------
+async function recentlyNoted(person: AttioPerson, title: string, nowMs: number): Promise<boolean> {
+  const windowMs = duplicateWindowMs();
+  if (windowMs === 0) return false;
+
+  const personId = person.id.record_id;
+  try {
+    const { notes, complete } = await listNotes("people", personId);
+    const floorMs = nowMs - windowMs;
+    const match = notes.find((note) => note.title === title && note.createdAtMs >= floorMs);
+    if (match) {
+      console.log(
+        `[dedupe] people ${personId}: ${JSON.stringify(title)} was already posted at ${new Date(match.createdAtMs).toISOString()}, inside the ${windowMs / 60_000}-minute window`,
+      );
+      return true;
+    }
+    if (!complete) {
+      console.warn(
+        `[dedupe] people ${personId}: the note listing could not be read to the end, so no repeat could be ruled out - proceeding, which risks a duplicate note rather than dropping the lead`,
+      );
+    }
+    return false;
+  } catch (error) {
+    console.warn(
+      `[dedupe] people ${personId}: the note listing could not be read, so no repeat could be ruled out - proceeding, which risks a duplicate note rather than dropping the lead. ${errorMessage(error)}`,
+    );
+    return false;
+  }
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The outcome a declined repeat returns: the records the first run left behind, and nothing written.
+//Returns null when the person carries no deal, which is not a state a completed run can leave - the deal is
+//created BEFORE the notes - so the note this matched cannot have come from one. Answering null there sends
+//the event down the normal path rather than inventing a deal id for it.
+//[LOGIC] Suppression is reported empty rather than re-run. A repeat is not new information, and the channels
+//the first run failed on failed structurally, not transiently - see the KNOWN GAP in stopLeadInActiveCampaigns
+//(lib/heyreach.ts). Wanting repeats to retry suppression is a reason to widen this, not the note write.
+//---------------------------------------------------------------------------------------------------------
+function duplicateOutcome(person: AttioPerson, personName: string): InterestedOutcome | null {
+  const dealId = person.values.associated_deals[0]?.target_record_id ?? null;
+  if (!dealId) return null;
+  return {
+    personId: person.id.record_id,
+    personName,
+    dealId,
+    companyId: person.values.company[0]?.target_record_id ?? null,
+    suppression: { outcomes: [], failures: [] },
+    duplicate: true,
+  };
+}
+//#endregion
+
 //#region the shared workflow
 export interface InterestedWorkflow {
   readonly lead: InterestedLead;
@@ -824,6 +941,12 @@ export interface InterestedOutcome {
   readonly dealId: string;
   readonly companyId: string | null;
   readonly suppression: SuppressionResult;
+  /**
+   * True when this event repeated one already recorded and the workflow declined to write anything. The ids
+   * are the existing records' - see recentlyNoted. Routes report it so a suppressed repeat reads as a
+   * decision in the response, not as a silent success.
+   */
+  readonly duplicate: boolean;
 }
 
 //---------------------------------------------------------------------------------------------------------
@@ -831,6 +954,8 @@ export interface InterestedOutcome {
 //they share - so a fourth platform needs an extractor, a lookup, and a note renderer, and inherits the rest.
 //
 //FLOW:
+// 0. recentlyNoted - a person already carrying this run's note from inside the duplicate window means the
+//    event repeats one already recorded, and nothing at all is written. See "declining a repeat" above.
 // 1. Resolve the person by the provider's own lookup order, creating one from the lead when there is no match.
 // 2. resolveInterestedCompany - the company already linked to the person if there is one, else found by domain
 //    or name, else created. This runs BEFORE the deal because the deal is named after it.
@@ -847,13 +972,15 @@ export interface InterestedOutcome {
 //would otherwise have cost is already committed.
 //
 //[STABILITY] Every step is a separate API call with no transaction. A throw partway leaves the earlier writes
-//committed. Callers treat that as a failed event and do not retry, because a retry would duplicate the notes.
+//committed. Callers treat that as a failed event and do not retry; step 0 now catches the retries that arrive
+//anyway, but only those inside the window, so not retrying remains the policy rather than a nicety.
 //Step 6 is the exception: it collects its own failures instead of raising, so one unreachable platform cannot
 //fail an event that Attio already recorded.
 //
 //USES: createPerson, personLabel, ensureInterestedDeal, defaultDealOwner, createNote (lib/attio.ts);
-//leadSourceLabel (lib/providers.ts); resolveInterestedCompany, interestedDealName, personValuesFor,
-//dealValuesFor, updateAttioAttributes, suppressInterestedLead (this module).
+//leadSourceLabel (lib/providers.ts); recentlyNoted, duplicateOutcome, resolveInterestedCompany,
+//interestedDealName, personValuesFor, dealValuesFor, updateAttioAttributes, suppressInterestedLead (this
+//module).
 //The caller supplies findPerson and history; nothing else about a provider is visible from here.
 //[DEBUG] Ends with one line naming the person, deal, and company, so an event reads as a single result.
 //[RUN LOG] Every block below marked `//debug note in attio=` belongs to the transcript written back to the
@@ -868,11 +995,31 @@ export async function recordInterestedLead(workflow: InterestedWorkflow): Promis
 
 async function runInterestedLead(workflow: InterestedWorkflow): Promise<InterestedOutcome> {
   const { lead, subject } = workflow;
+  const title = leadSourceLabel(lead.provider);
 
   let person = await workflow.findPerson();
   //debug note in attio=
   const personWasAlreadyThere = person !== null; //did Attio know this person before we started?
   //===============
+  //Checked here rather than at the note writes, so a repeat costs one GET instead of a company resolution, a
+  //deal, four writes and a suppression pass - and leaves no run transcript either, because nothing has been
+  //registered with runLogRecord yet. A person who does not exist cannot carry a previous note, so a
+  //first-time lead never pays for the check at all.
+  if (person) {
+    const existingName = personLabel(person);
+    if (await recentlyNoted(person, title, Date.now())) {
+      const outcome = duplicateOutcome(person, existingName);
+      if (outcome) {
+        console.log(
+          `[interested] ${subject}: declined - this repeats an event already recorded for ${existingName}, so nothing was written`,
+        );
+        return outcome;
+      }
+      console.warn(
+        `[interested] ${subject}: ${existingName} carries a recent ${JSON.stringify(title)} note but no deal, which no completed run leaves behind - recording the event normally`,
+      );
+    }
+  }
   if (!person) person = await createPerson(personValuesFor(lead));
   const personId = person.id.record_id;
   const personName = personLabel(person);
@@ -893,7 +1040,6 @@ async function runInterestedLead(workflow: InterestedWorkflow): Promise<Interest
   //===============
 
   const history = await workflow.history();
-  const title = leadSourceLabel(lead.provider);
   await createNote("people", personId, title, history, personName);
   await createNote("deals", dealId, title, history);
 
@@ -910,6 +1056,6 @@ async function runInterestedLead(workflow: InterestedWorkflow): Promise<Interest
   console.log(
     `[interested] ${subject}: completed - person ${personName}, deal ${dealId}, company ${company?.name ?? "none"}`,
   );
-  return { personId, personName, dealId, companyId: company?.id ?? null, suppression };
+  return { personId, personName, dealId, companyId: company?.id ?? null, suppression, duplicate: false };
 }
 //#endregion
