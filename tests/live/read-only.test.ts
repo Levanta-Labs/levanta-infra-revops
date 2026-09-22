@@ -141,6 +141,29 @@ liveTest("the Master TAM and DNC lists exist", async () => {
   }
 });
 
+liveTest("the token can list notes, which the duplicate check reads before every write", async () => {
+  //recentlyNoted (lib/interested.ts) lists a Person's notes to decide whether an event repeats one already
+  //recorded. It FAILS OPEN - a refused listing is logged and the event is recorded anyway - so a token
+  //without note:read does not break the workflow, it silently stops deduplicating and the duplicate notes
+  //this check exists to prevent come back. Nothing else in the codebase reads /notes, so nothing else would
+  //notice. That is precisely the kind of failure a smoke test is for.
+  const response = await fetch(`${ATTIO_BASE}/notes?limit=1`, { headers: attioHeaders() });
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(
+      `The Attio token cannot list notes (HTTP ${response.status}). Grant it note:read. Until then the repeat check in lib/interested.ts fails open on every interested lead - look for "[dedupe] ... could not be read" in the logs - and duplicate notes are written as they were before it existed.`,
+    );
+  }
+  await expectOk("Attio /notes", response);
+
+  //The shape listNotes parses, not merely a 200: a listing that answered with an object rather than an array
+  //would make every check fail open just as surely as a 403, and just as quietly.
+  const body = await responseJson(response);
+  if (!isJsonObject(body) || !Array.isArray(body.data)) {
+    throw new Error("Attio /notes did not return a data array, which is the shape listNotes (lib/attio.ts) parses");
+  }
+  expect(Array.isArray(body.data)).toBe(true);
+});
+
 liveTest("the configured deal owner is a workspace member", async () => {
   const owner = optionalEnv("ATTIO_DEFAULT_DEAL_OWNER");
   if (!owner) throw new Error("ATTIO_DEFAULT_DEAL_OWNER is not configured");
