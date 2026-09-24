@@ -42,64 +42,166 @@ const SOURCES = {
 } as const;
 
 //=============================================================================================================
-//Deal attribution: which discrete source each provider represents.
+//Attribution: which discrete source each provider represents, on the Person and on the Deal.
+//
+//THE TWO OBJECTS HAVE DIFFERENT OPTION IDS FOR THE SAME WORDS. "Cold Email" on a Person is
+//4dca8bb3-... and on a Deal it is 6cae752e-...; they are separate select attributes that merely happen to be
+//spelled alike. Writing a Deal's ID to a Person is not an error Attio reports as a mismatch - it rejects the
+//option as unknown, updateAttioAttributes logs it and carries on, and the record ends up with no attribution
+//while the run still reports success.
+//
+//So the mapping is split in two. A provider maps to a CATEGORY, which is a word; each object then has its own
+//table turning that word into that object's ID. The provider table cannot name an ID at all, which is what
+//makes a cross-object mix-up impossible to write rather than merely discouraged.
 //
 //WHY OPTION IDS AND NOT TITLES. Attio accepts either for a select - `[{ option: "Cold Email" }]` works just as
 //well as `[{ option: "6cae752e-..." }]`. The ID is used because it survives a rename: someone relabelling
-//"Cold Email" to "Cold Outbound Email" in the Attio UI keeps the same option_id, where a title write would
-//start failing silently from that moment on with nothing in the code to say why.
-//The trade is that these are unreadable, so each carries its title in a comment, and a live smoke test asserts
-//every one of them still exists on the attribute - see tests/live/read-only.test.ts.
+//"Cold Email" in the Attio UI keeps the same option_id, where a title write would start failing silently from
+//that moment on with nothing in the code to say why.
+//The trade is that these are unreadable, so each carries its title in a comment and a live smoke test asserts
+//every one of them still exists on its own object's attribute - see tests/live/read-only.test.ts.
 //
-//SUB-SOURCE IS ABOUT WHOSE PLATFORM SENT IT, not which tool. Instantly and HeyReach are Levanta's own; Outfound
-//is the SAS platform. Aircall is Levanta's dialler. A provider whose sub-source is null simply does not write
-//the attribute.
+//SUB-SOURCE IS ABOUT WHOSE PLATFORM SENT IT, not which tool. Instantly, HeyReach and Aircall are Levanta's own;
+//Outfound is the SAS platform.
 //=============================================================================================================
 
-/** The `deal_source_discrete` options, by title. Only the four these workflows can produce are named. */
-const DEAL_SOURCE_OPTIONS = {
-  COLD_EMAIL: "6cae752e-6395-478a-83aa-eb934479d7dd",
-  COLD_CALL: "0696a0fc-425c-4ba5-9afb-2897b61ca3aa",
-  LI_OUTBOUND: "9686ed43-60ba-454d-b5d4-70c0840f227f",
-} as const;
-
-/** The `outbound_sub_source_discrete` options, by title. */
-const OUTBOUND_SUB_SOURCE_OPTIONS = {
-  LEVANTA: "4763981c-5793-48dc-b878-c02e0231df13",
-  SAS: "2cbbadd4-dca8-47cd-a6fb-6af4ae0eddee",
-} as const;
-
-export interface DealAttribution {
-  /** Option ID for `deal_source_discrete`. */
-  readonly source: string;
-  /** Option ID for `outbound_sub_source_discrete`, or null to leave the attribute alone. */
-  readonly subSource: string | null;
-}
+/** The source words these workflows can produce. The full option lists are longer; these are ours. */
+type SourceCategory = "COLD_EMAIL" | "COLD_CALL" | "LI_OUTBOUND";
+type SubSourceParty = "LEVANTA" | "SAS";
 
 //[LOGIC] One entry per provider, checked against Provider so adding a fifth will not compile until it is
 //attributed. That is deliberate: a new provider silently writing no source is the failure this prevents.
-const DEAL_ATTRIBUTION: Readonly<Record<Provider, DealAttribution>> = {
+//Names words, never IDs - see the note above.
+const PROVIDER_ATTRIBUTION: Readonly<Record<Provider, { readonly category: SourceCategory; readonly party: SubSourceParty }>> = {
   //George's dialler. Levanta's own.
-  aircall: { source: DEAL_SOURCE_OPTIONS.COLD_CALL, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.LEVANTA },
+  aircall: { category: "COLD_CALL", party: "LEVANTA" },
   //Levanta's own cold email.
-  instantly: { source: DEAL_SOURCE_OPTIONS.COLD_EMAIL, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.LEVANTA },
+  instantly: { category: "COLD_EMAIL", party: "LEVANTA" },
   //LinkedIn outbound, Levanta's own.
-  heyreach: { source: DEAL_SOURCE_OPTIONS.LI_OUTBOUND, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.LEVANTA },
+  heyreach: { category: "LI_OUTBOUND", party: "LEVANTA" },
   //Cold email arriving through the SAS platform rather than ours.
-  outfound: { source: DEAL_SOURCE_OPTIONS.COLD_EMAIL, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.SAS },
+  outfound: { category: "COLD_EMAIL", party: "SAS" },
 };
 
-/** [LOGIC] How a deal from this provider is attributed. USES: DEAL_ATTRIBUTION (this module). Pure. */
-export function dealAttribution(provider: Provider): DealAttribution {
-  return DEAL_ATTRIBUTION[provider];
+//[LOGIC] What each word is called in Attio. Display only - nothing is written from these, so a rename in the
+//Attio UI makes a transcript read slightly stale rather than breaking a write. That is the whole point of
+//writing IDs; see the note above. Kept beside the IDs so the tables read as words rather than as UUIDs.
+const SOURCE_TITLES: Readonly<Record<SourceCategory, string>> = {
+  COLD_EMAIL: "Cold Email",
+  COLD_CALL: "Cold Call",
+  LI_OUTBOUND: "LI Outbound",
+};
+
+const PARTY_TITLES: Readonly<Record<SubSourceParty, string>> = {
+  LEVANTA: "Levanta",
+  SAS: "SAS",
+};
+
+interface AttributionSchema {
+  readonly sourceSlug: string;
+  readonly subSourceSlug: string;
+  readonly source: Readonly<Record<SourceCategory, string>>;
+  readonly subSource: Readonly<Record<SubSourceParty, string>>;
 }
 
-/** [LOGIC] Every option ID this codebase writes, for the live schema check. Pure. */
-export function attributionOptionIds(): Readonly<Record<string, readonly string[]>> {
+/** The `deals` object's attribution attributes and their option IDs. */
+const DEAL_SCHEMA: AttributionSchema = {
+  sourceSlug: "deal_source_discrete",
+  subSourceSlug: "outbound_sub_source_discrete",
+  source: {
+    COLD_EMAIL: "6cae752e-6395-478a-83aa-eb934479d7dd",
+    COLD_CALL: "0696a0fc-425c-4ba5-9afb-2897b61ca3aa",
+    LI_OUTBOUND: "9686ed43-60ba-454d-b5d4-70c0840f227f",
+  },
+  subSource: {
+    LEVANTA: "4763981c-5793-48dc-b878-c02e0231df13",
+    SAS: "2cbbadd4-dca8-47cd-a6fb-6af4ae0eddee",
+  },
+};
+
+/** The `people` object's, which spell the same words with entirely different IDs. */
+const PERSON_SCHEMA: AttributionSchema = {
+  sourceSlug: "lead_source_discrete",
+  subSourceSlug: "lead_outbound_sub_source_discrete",
+  source: {
+    COLD_EMAIL: "4dca8bb3-413a-4d13-984b-e391b6f71852",
+    COLD_CALL: "56188ba9-821a-4878-99a2-333d338247a8",
+    LI_OUTBOUND: "f853ad2b-0681-4f0a-8c66-73358406dab1",
+  },
+  subSource: {
+    LEVANTA: "667ebae3-b820-4fc3-a12e-ebbfa4ce3cfb",
+    SAS: "cba7bd62-52ea-41d3-a494-4fce947b8780",
+  },
+};
+
+/** Which object's attribution attributes to write. Only these two carry any. */
+export type AttributedObject = "people" | "deals";
+
+const SCHEMAS: Readonly<Record<AttributedObject, AttributionSchema>> = {
+  people: PERSON_SCHEMA,
+  deals: DEAL_SCHEMA,
+};
+
+//---------------------------------------------------------------------------------------------------------
+//The attribution attributes for one provider on one object, ready to merge into that object's values.
+//Returns the slugs and values together so a caller cannot pair one object's slug with another's ID: the only
+//way to get an ID out of here is to ask for the object it belongs to.
+//USES: PROVIDER_ATTRIBUTION, SCHEMAS (this module). Pure.
+//---------------------------------------------------------------------------------------------------------
+export function attributionValues(
+  object: AttributedObject,
+  provider: Provider,
+): Readonly<Record<string, readonly { readonly option: string }[]>> {
+  const { category, party } = PROVIDER_ATTRIBUTION[provider];
+  const schema = SCHEMAS[object];
   return {
-    deal_source_discrete: Object.values(DEAL_SOURCE_OPTIONS),
-    outbound_sub_source_discrete: Object.values(OUTBOUND_SUB_SOURCE_OPTIONS),
+    [schema.sourceSlug]: [{ option: schema.source[category] }],
+    [schema.subSourceSlug]: [{ option: schema.subSource[party] }],
   };
+}
+
+/** [LOGIC] Every attribution slug, so ALWAYS_OVERWRITE can name them without repeating the strings. Pure. */
+export function attributionSlugs(): readonly string[] {
+  return Object.values(SCHEMAS).flatMap((schema) => [schema.sourceSlug, schema.subSourceSlug]);
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The word an option ID stands for, or null if it is not one this codebase writes.
+//
+//WHY THE RUN LOG NEEDS THIS. Attio RETURNS a select as `{ option: { id, title } }` but ACCEPTS it as
+//`{ option: "<id>" }`, and the transcript renders both: the "before" picture comes from a read and the "after"
+//from what was written. Without a way back from the ID, a transcript line read
+//`lead source discrete: Cold Email -> {"option":"4dca8bb3-..."}` - the same fact twice, once as a word and
+//once as a blob. See optionTitle (lib/run-log.ts).
+//USES: SCHEMAS, SOURCE_TITLES, PARTY_TITLES (this module). Pure.
+//---------------------------------------------------------------------------------------------------------
+export function attributionOptionTitle(optionId: string): string | null {
+  for (const schema of Object.values(SCHEMAS)) {
+    for (const [category, id] of Object.entries(schema.source)) {
+      if (id === optionId) return SOURCE_TITLES[category as SourceCategory];
+    }
+    for (const [party, id] of Object.entries(schema.subSource)) {
+      if (id === optionId) return PARTY_TITLES[party as SubSourceParty];
+    }
+  }
+  return null;
+}
+
+export interface AttributionOptionCheck {
+  readonly object: AttributedObject;
+  readonly slug: string;
+  readonly optionIds: readonly string[];
+}
+
+/** [LOGIC] Every option ID this codebase writes, with the object and attribute it belongs to. Pure. */
+export function attributionOptionIds(): readonly AttributionOptionCheck[] {
+  return (Object.keys(SCHEMAS) as AttributedObject[]).flatMap((object) => {
+    const schema = SCHEMAS[object];
+    return [
+      { object, slug: schema.sourceSlug, optionIds: Object.values(schema.source) },
+      { object, slug: schema.subSourceSlug, optionIds: Object.values(schema.subSource) },
+    ];
+  });
 }
 
 /** Derived from SOURCES, so appending an entry there is what adds a provider - there is no second list. */

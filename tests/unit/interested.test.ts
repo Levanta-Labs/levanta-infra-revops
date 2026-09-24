@@ -180,17 +180,22 @@ describe("what a create sends to Attio", () => {
   //mappers must omit the keys the provider knows nothing about.
   test("omits every attribute the provider had no value for", () => {
     const thin = interestedLead("aircall", { phones: ["+15555550123"], occurredAtMs: 1756400000000 });
+    //Attribution is not provider-optional on either object - every provider maps to a source - so the pair is
+    //present even on the thinnest lead. These are the PERSON's option IDs, not the deal's.
     expect(personValuesFor(thin)).toEqual({
       phone_numbers: ["+15555550123"],
       date_added: "2025-08-28",
       lead_source: "Aircall Cold Outreach - Automated",
+      lead_source_discrete: [{ option: "56188ba9-821a-4878-99a2-333d338247a8" }],
+      lead_outbound_sub_source_discrete: [{ option: "667ebae3-b820-4fc3-a12e-ebbfa4ce3cfb" }],
     });
     expect(companyValuesFor(interestedLead("aircall", { companyName: "Acme" }))).toEqual({ name: "Acme" });
     //The attribution pair is NOT provider-optional - every provider maps to a discrete source, so these are
     //present even on the thinnest lead. Only outbound_sub_source_discrete can be absent, for a provider with
     //no sub-source; all four currently have one.
+    //No lead_source on the deal: Attio removed that attribute from the deals object when the discrete pair
+    //replaced it. The Person still carries it.
     expect(dealValuesFor(interestedLead("aircall", {}))).toEqual({
-      lead_source: "Aircall Cold Outreach - Automated",
       deal_source_discrete: [{ option: "0696a0fc-425c-4ba5-9afb-2897b61ca3aa" }],
       outbound_sub_source_discrete: [{ option: "4763981c-5793-48dc-b878-c02e0231df13" }],
     });
@@ -393,7 +398,9 @@ describe("updating Attio attributes", () => {
     });
 
     expect(dealValuesFor(full)).toMatchObject({
-      lead_source: "Instantly Cold Outreach - Automated",
+      //No lead_source: Attio removed that attribute from the deals object. The Person still carries it.
+      deal_source_discrete: [{ option: "6cae752e-6395-478a-83aa-eb934479d7dd" }],
+      outbound_sub_source_discrete: [{ option: "4763981c-5793-48dc-b878-c02e0231df13" }],
       campaign_name: "Q3 Founders",
       email: "ada@example.com",
       phone_number_7: "+15555550123",

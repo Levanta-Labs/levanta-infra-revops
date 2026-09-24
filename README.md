@@ -54,7 +54,7 @@ message history into a note. Everything after that is one code path:
 | 0. Repeat check | An event repeating one already recorded for this Person is declined before anything is written - see [Repeated events are declined, not re-recorded](#repeated-events-are-declined-not-re-recorded) |
 | 1. Person | The provider's own lookup order, creating a Person from the lead when there is no match |
 | 2. Company | The Company already linked to the Person if there is one, else found by domain then by exact name, else created - but only when a name or domain exists to create it from |
-| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company>` - the deal carries no marker of how it was opened, because `lead_source` already does |
+| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company>` - the deal carries no marker of how it was opened, because `deal_source_discrete` already does |
 | 4. Notes | The provider's rendered history, on the Person and on the Deal |
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
@@ -179,36 +179,58 @@ worse outcome than a blank field. What was dropped is logged under `[attio]` - a
 no record of why is undiagnosable. The one part that still raises is the *read*: without knowing what a record
 already holds there is no way to write to it without risking an overwrite.
 
-### How a deal is attributed
+### How a lead and its deal are attributed
 
-Two discrete select fields on the **Deal** carry attribution. Both are written by **option ID, not title**, so
-renaming an option in the Attio UI cannot silently break the write - a title write would start failing from that
-moment with nothing in the code to say why.
+Four discrete select fields carry attribution — two on the **Person**, two on the **Deal**. All are written by
+**option ID, not title**, so renaming an option in the Attio UI cannot silently break the write; a title write
+would start failing from that moment with nothing in the code to say why.
 
-| Provider | `deal_source_discrete` | `outbound_sub_source_discrete` |
+| Provider | Source | Sub-source |
 | --- | --- | --- |
 | Instantly | Cold Email | Levanta |
-| Outfound | Cold Email | **SAS** - the one provider whose mail is not sent from Levanta's own tooling |
+| Outfound | Cold Email | **SAS** — the one provider whose mail is not sent from Levanta's own tooling |
 | HeyReach | LI Outbound | Levanta |
 | Aircall | Cold Call | Levanta |
 
-The map lives in `dealAttribution` (`lib/providers.ts`), typed against `Provider`, so a fifth provider will not
-compile until it is attributed - a new channel silently writing no source is the failure that guards against.
+| Object | Source slug | Sub-source slug |
+| --- | --- | --- |
+| `people` | `lead_source_discrete` | `lead_outbound_sub_source_discrete` |
+| `deals` | `deal_source_discrete` | `outbound_sub_source_discrete` |
 
-**Latest touch wins.** Both slugs are in `ALWAYS_OVERWRITE`. A deal is *reused* when the person already has one
-(see `ensureInterestedDeal`), so a lead first seen on Instantly and later replying on HeyReach keeps a single
-deal; without the overwrite it would still read Cold Email months later. The Person is unaffected and keeps
-`lead_source` alone.
+**The two objects spell the same words with entirely different option IDs.** "Cold Email" on a Person is
+`4dca8bb3-…`; on a Deal it is `6cae752e-…`. They are separate attributes that merely read alike. Writing one
+object's ID to the other is not reported as a mismatch — Attio rejects the option as unknown,
+`updateAttioAttributes` logs it and carries on, and the record ends up unattributed while the run reports
+success.
 
-**The IDs are checked in two places, because neither is enough on its own.** `tests/unit/providers.test.ts` pins
-which ID each provider sends - that catches a wrong one. `tests/live/read-only.test.ts` checks every ID against
-Attio's live schema - that catches one deleted and recreated in Attio, which mints a new ID while the old one
-keeps parsing as a perfectly valid UUID. A stale ID costs every interested deal its attribution *silently*, since
-`updateAttioAttributes` salvages what it can and logs the rest rather than failing the event.
+So the mapping is split in two. A provider maps to a **category**, which is a word; each object then has its own
+table turning that word into that object's ID. `PROVIDER_ATTRIBUTION` cannot name an ID at all, and
+`attributionValues(object, provider)` returns slugs and values together — the only way to get an ID out is to
+ask for the object it belongs to. A cross-object mix-up is not discouraged, it is unwriteable.
+
+The map is typed against `Provider`, so a fifth provider will not compile until it is attributed — a new channel
+silently writing no source is the failure that guards against.
+
+**Latest touch wins.** All four slugs are in `ALWAYS_OVERWRITE`. A deal is *reused* when the person already has
+one (see `ensureInterestedDeal`), so a lead first seen on Instantly and later replying on HeyReach keeps a single
+deal; without the overwrite it would still read Cold Email months later.
+
+**The IDs are checked in two places, because neither is enough alone.** `tests/unit/providers.test.ts` pins which
+ID each provider sends on each object, and asserts the two objects share none — that catches a wrong or swapped
+one. `tests/live/read-only.test.ts` checks every ID against Attio's live schema for its own object — that catches
+one deleted and recreated in Attio, which mints a new ID while the old one keeps parsing as a valid UUID. A stale
+ID costs every interested record its attribution *silently*, since `updateAttioAttributes` salvages what it can
+and logs the rest rather than failing the event.
+
+**`lead_source` is a Person attribute only.** The deals object no longer has one - it was removed from Attio
+when `deal_source_discrete` replaced it. Writing it anyway cost every deal an extra round trip and a warning:
+`writeSalvagingRejections` sends one PATCH with everything, Attio rejects the whole batch over the single
+unknown slug, and each remaining attribute is then retried one at a time. The live schema test is what catches
+this class of drift, and it is the reason that test exists.
 
 **Not written:** the `notes` text attribute. Appending to it would mean reading the current value and
 concatenating, which races against anything else writing the same field; it was dropped deliberately rather than
-risk clobbering. The provider is already named in the deal's note title and in `lead_source`.
+risk clobbering. The provider is already named in the note title and in `lead_source`.
 
 ### Interest on one platform means suppression on all of them
 
@@ -273,10 +295,12 @@ Only fields that exist on both sides are mapped. The providers are not equally r
 | Person `description` | yes | - | yes | - |
 | Person `location` | - | yes | yes | country only |
 | Person `campaign_name`, `date_added`, `lead_source`, `company` | yes | yes | yes | yes |
+| Person `lead_source_discrete`, `lead_outbound_sub_source_discrete` | yes | yes | yes | yes |
 | Company `name` | yes | yes | yes | yes |
 | Company `domains`, `employee_range`, `estimated_arr_usd` | - | yes | - | yes |
 | Company `primary_location` | - | yes | - | - |
-| Deal `lead_source`, `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes | yes |
+| Deal `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes | yes |
+| Deal `deal_source_discrete`, `outbound_sub_source_discrete` | yes | yes | yes | yes |
 | Deal `phone_number_7` | yes | yes | - | - |
 | Deal `linkedin` | - | yes | yes | yes |
 | Deal `website`, `industry`, `employees`, `revenue` | - | yes | - | yes |
@@ -750,6 +774,14 @@ a phone number, or a LinkedIn URL - because a miss is not actionable without it.
 are personal data in a retained log.
 
 ## Verification
+
+**Every test in `tests/live` is a real network round trip**, so the file sets a 20s default with
+`setDefaultTimeout`. Bun's own default is 5s, and two calls sit right on that line - HeyReach's
+`GetConversationsV3` answers in about 4.7s and Attio's note listing in about 5.0s - so they passed alone and
+failed inside a full run. A smoke test that only fails under load is worse than no smoke test: this suite is
+what stands between a renamed attribute or a stale option ID and records that go silently unwritten, and one
+that cries wolf stops being read. The Outfound tests keep their own longer overrides, which are about that API
+being erratically slow rather than about the baseline.
 
 Run the compiler and isolated unit suite:
 

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { companyCounterSlug, LISTS, personCounterSlug } from "../../lib/attio.js";
 import { attributionOptionIds } from "../../lib/providers.js";
 import type { Provider } from "../../lib/providers.js";
@@ -28,6 +28,20 @@ import { OUTFOUND_BASE, outfoundAuthHeader } from "../../lib/endpoints.js";
 import { outfoundNaiveUtc } from "../../lib/outfound.js";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
+
+//---------------------------------------------------------------------------------------------------------
+//[PERF] EVERY test in this file is a real network round trip, and Bun's default allowance is 5s. Two of them
+//sit right on that line - HeyReach's GetConversationsV3 answers in about 4.7s for a single-item page, and
+//Attio's note listing in about 5.0s - so they passed when run alone and failed inside a full run. That is the
+//worst way for a smoke test to behave: a safety net that cries wolf stops being read, and this suite is what
+//stands between a renamed attribute or a stale option ID and records that go silently unwritten.
+//
+//Set once for the file rather than per test. Doing it per test is what produced the flake in the first place:
+//the HeyReach case was fixed on its own and the Attio one, identical in cause, was simply next in line.
+//These are diagnostics on a human's terminal, not a CI gate, so a generous ceiling costs nothing - it only
+//decides how long a genuinely hung request waits before it is called hung.
+//---------------------------------------------------------------------------------------------------------
+setDefaultTimeout(20_000);
 
 const PROVIDERS: readonly Provider[] = ["aircall", "instantly", "heyreach", "outfound"];
 
@@ -168,7 +182,7 @@ liveTest("the token can list notes, which the duplicate check reads before every
   expect(Array.isArray(body.data)).toBe(true);
 });
 
-liveTest("every deal-attribution option ID still exists on its attribute", async () => {
+liveTest("every attribution option ID still exists on its own object's attribute", async () => {
   //dealValuesFor writes deal_source_discrete and outbound_sub_source_discrete by OPTION ID rather than title,
   //so a rename in the Attio UI cannot break them. The cost of that choice is that the IDs are opaque: nothing
   //about "6cae752e-..." says "Cold Email", and an option DELETED or recreated in Attio gets a new ID while the
@@ -178,12 +192,12 @@ liveTest("every deal-attribution option ID still exists on its attribute", async
   //Attio rejects a write naming an unknown option, so a stale ID here means every interested deal loses its
   //attribution - silently, since updateAttioAttributes salvages what it can and logs the rest rather than
   //failing the event.
-  for (const [slug, ids] of Object.entries(attributionOptionIds())) {
-    const live = await attioValues(`/objects/deals/attributes/${slug}/options`, "option_id");
-    for (const id of ids) {
+  for (const { object, slug, optionIds } of attributionOptionIds()) {
+    const live = await attioValues(`/objects/${object}/attributes/${slug}/options`, "option_id");
+    for (const id of optionIds) {
       if (!live.has(id)) {
         throw new Error(
-          `lib/providers.ts writes option ${id} to the Attio deals attribute ${slug}, and no such option exists there any more. Either it was deleted and recreated in Attio - which mints a new ID - or the slug is wrong. Every interested deal is losing its attribution until this matches.`,
+          `lib/providers.ts writes option ${id} to the Attio ${object} attribute ${slug}, and no such option exists there any more. Either it was deleted and recreated in Attio - which mints a new ID - or the ID belongs to the other object: people and deals spell the same source words with entirely different IDs. Every interested ${object === "people" ? "person" : "deal"} is losing its attribution until this matches.`,
         );
       }
       expect(live.has(id)).toBe(true);
@@ -320,6 +334,8 @@ liveTest("the Interested deal stage exists", async () => {
 //---------------------------------------------------------------------------------------------------------
 //[PERF] Outfound's reads are slower than the other providers' - see the DNC note below - so every Outfound
 //smoke test that can be slow is given this rather than the 5s default.
+//Left explicit rather than folded into the default above: these are about Outfound being erratically slow -
+//2.2s, 2.5s and 14.7s on three consecutive calls at page_size=1 - not about the suite's baseline.
 const OUTFOUND_TIMEOUT_MS = 20_000;
 
 //[PERF] The DNC list is slower again, and erratically so - measured at 2.2s, 2.5s and 14.7s on three

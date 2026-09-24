@@ -137,13 +137,16 @@ describe("interested webhook handlers", () => {
     try {
       const response = await instantlyInterested(interestedRequest(leadInterested));
       expect(response.status).toBe(200);
-      //Every candidate attribute is already populated, so the only thing written is the one slug this run is
+      //Every candidate attribute is already populated, so the only things written are the slugs this run is
       //entitled to restate - see ALWAYS_OVERWRITE (lib/interested.ts). The Aircall label Attio held is replaced
-      //by the channel that actually produced this event, and nothing else moves.
+      //by the channel that actually produced this event, along with the discrete pair beside it, and nothing
+      //else moves. The IDs are the PERSON's; the deal's are different for the same words.
       const patches = personPatches(mock.calls);
       expect(patches).toHaveLength(1);
       expect(JSON.parse(String(patches[0]?.init?.body)).data.values).toEqual({
         lead_source: "Instantly Cold Outreach - Automated",
+        lead_source_discrete: [{ option: "4dca8bb3-413a-4d13-984b-e391b6f71852" }],
+        lead_outbound_sub_source_discrete: [{ option: "667ebae3-b820-4fc3-a12e-ebbfa4ce3cfb" }],
       });
     } finally {
       mock.restore();
