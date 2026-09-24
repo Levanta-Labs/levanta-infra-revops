@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { companyCounterSlug, LISTS, personCounterSlug } from "../../lib/attio.js";
 import { attributionOptionIds } from "../../lib/providers.js";
 import type { Provider } from "../../lib/providers.js";
@@ -28,6 +28,20 @@ import { OUTFOUND_BASE, outfoundAuthHeader } from "../../lib/endpoints.js";
 import { outfoundNaiveUtc } from "../../lib/outfound.js";
 
 const liveTest = process.env.RUN_LIVE_TESTS === "1" ? test : test.skip;
+
+//---------------------------------------------------------------------------------------------------------
+//[PERF] EVERY test in this file is a real network round trip, and Bun's default allowance is 5s. Two of them
+//sit right on that line - HeyReach's GetConversationsV3 answers in about 4.7s for a single-item page, and
+//Attio's note listing in about 5.0s - so they passed when run alone and failed inside a full run. That is the
+//worst way for a smoke test to behave: a safety net that cries wolf stops being read, and this suite is what
+//stands between a renamed attribute or a stale option ID and records that go silently unwritten.
+//
+//Set once for the file rather than per test. Doing it per test is what produced the flake in the first place:
+//the HeyReach case was fixed on its own and the Attio one, identical in cause, was simply next in line.
+//These are diagnostics on a human's terminal, not a CI gate, so a generous ceiling costs nothing - it only
+//decides how long a genuinely hung request waits before it is called hung.
+//---------------------------------------------------------------------------------------------------------
+setDefaultTimeout(20_000);
 
 const PROVIDERS: readonly Provider[] = ["aircall", "instantly", "heyreach", "outfound"];
 
@@ -93,11 +107,6 @@ liveTest("reads one Instantly email preview", async () => {
   );
 });
 
-//[PERF] GetConversationsV3 answers in about 4.7s for a single-item page, against Bun's 5s default - so this
-//passed alone and failed in a full run, which is the worst way for a smoke test to behave. A safety net that
-//cries wolf stops being read. Measured, not guessed: the probe that produced that figure is in the commit.
-const HEYREACH_TIMEOUT_MS = 20_000;
-
 liveTest("reads one HeyReach conversation page", async () => {
   await expectOk(
     "HeyReach",
@@ -107,7 +116,7 @@ liveTest("reads one HeyReach conversation page", async () => {
       body: JSON.stringify({ limit: 1, cursor: null, filters: {} }),
     }),
   );
-}, HEYREACH_TIMEOUT_MS);
+});
 
 //=============================================================================================================
 //Schema. Every configured slug is checked against the live Attio schema, so a wrong counter slug or a renamed
@@ -325,6 +334,8 @@ liveTest("the Interested deal stage exists", async () => {
 //---------------------------------------------------------------------------------------------------------
 //[PERF] Outfound's reads are slower than the other providers' - see the DNC note below - so every Outfound
 //smoke test that can be slow is given this rather than the 5s default.
+//Left explicit rather than folded into the default above: these are about Outfound being erratically slow -
+//2.2s, 2.5s and 14.7s on three consecutive calls at page_size=1 - not about the suite's baseline.
 const OUTFOUND_TIMEOUT_MS = 20_000;
 
 //[PERF] The DNC list is slower again, and erratically so - measured at 2.2s, 2.5s and 14.7s on three

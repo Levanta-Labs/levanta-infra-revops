@@ -775,6 +775,14 @@ are personal data in a retained log.
 
 ## Verification
 
+**Every test in `tests/live` is a real network round trip**, so the file sets a 20s default with
+`setDefaultTimeout`. Bun's own default is 5s, and two calls sit right on that line - HeyReach's
+`GetConversationsV3` answers in about 4.7s and Attio's note listing in about 5.0s - so they passed alone and
+failed inside a full run. A smoke test that only fails under load is worse than no smoke test: this suite is
+what stands between a renamed attribute or a stale option ID and records that go silently unwritten, and one
+that cries wolf stops being read. The Outfound tests keep their own longer overrides, which are about that API
+being erratically slow rather than about the baseline.
+
 Run the compiler and isolated unit suite:
 
 ```sh
