@@ -114,7 +114,7 @@ states put that side by side:
 ```
 Previous state                          State after run (as this run left it)
 stage: Negotiation                      stage: Negotiation
-lead source: HeyReach Cold Outreach…    lead source: Instantly Cold Outreach - Automated
+lead source discrete: LI Outbound…      lead source discrete: Cold Email
 moved to interested at: 2026-06-14      moved to interested at: 2026-06-14T09:31:00.000Z
 ```
 
@@ -222,11 +222,20 @@ one deleted and recreated in Attio, which mints a new ID while the old one keeps
 ID costs every interested record its attribution *silently*, since `updateAttioAttributes` salvages what it can
 and logs the rest rather than failing the event.
 
-**`lead_source` is a Person attribute only.** The deals object no longer has one - it was removed from Attio
-when `deal_source_discrete` replaced it. Writing it anyway cost every deal an extra round trip and a warning:
-`writeSalvagingRejections` sends one PATCH with everything, Attio rejects the whole batch over the single
-unknown slug, and each remaining attribute is then retried one at a time. The live schema test is what catches
-this class of drift, and it is the reason that test exists.
+**`lead_source` is deprecated on both objects and is no longer written at all.** The discrete pair replaced it.
+On `deals` the attribute was removed from Attio outright, which the live schema test caught - writing it cost
+every deal an extra round trip and a warning, because `writeSalvagingRejections` sends one PATCH with
+everything, Attio rejected the whole batch over the single unknown slug, and each remaining attribute was then
+retried one at a time. On `people` the attribute still exists but nothing reads it, so writing it was churn on
+a dead field - and churn that *overwrote*, since it used to sit in `ALWAYS_OVERWRITE`.
+
+Values already on existing records are left exactly as found. Nothing writes the slug now, so nothing can clear
+it either; clearing them is a decision for Attio, not for this codebase.
+
+`leadSourceLabel` survives and is unchanged. It is not an attribute value - it titles every note the workflow
+writes, and it is what the repeat check matches on, so changing its spelling would stop a run recognising the
+notes earlier runs left and bring duplicates back. `automatedSourceLabel`, which existed only to produce the
+`lead_source` string, is gone.
 
 **Not written:** the `notes` text attribute. Appending to it would mean reading the current value and
 concatenating, which races against anything else writing the same field; it was dropped deliberately rather than
@@ -294,7 +303,7 @@ Only fields that exist on both sides are mapped. The providers are not equally r
 | Person `job_title` | - | yes | yes | yes |
 | Person `description` | yes | - | yes | - |
 | Person `location` | - | yes | yes | country only |
-| Person `campaign_name`, `date_added`, `lead_source`, `company` | yes | yes | yes | yes |
+| Person `campaign_name`, `date_added`, `company` | yes | yes | yes | yes |
 | Person `lead_source_discrete`, `lead_outbound_sub_source_discrete` | yes | yes | yes | yes |
 | Company `name` | yes | yes | yes | yes |
 | Company `domains`, `employee_range`, `estimated_arr_usd` | - | yes | - | yes |

@@ -144,7 +144,6 @@ describe("interested webhook handlers", () => {
       const patches = personPatches(mock.calls);
       expect(patches).toHaveLength(1);
       expect(JSON.parse(String(patches[0]?.init?.body)).data.values).toEqual({
-        lead_source: "Instantly Cold Outreach - Automated",
         lead_source_discrete: [{ option: "4dca8bb3-413a-4d13-984b-e391b6f71852" }],
         lead_outbound_sub_source_discrete: [{ option: "667ebae3-b820-4fc3-a12e-ebbfa4ce3cfb" }],
       });
@@ -166,7 +165,8 @@ describe("interested webhook handlers", () => {
       const patches = personPatches(mock.calls);
       expect(patches).toHaveLength(1);
       const values = JSON.parse(String(patches[0]?.init?.body)).data.values;
-      expect(values.lead_source).toBe("Instantly Cold Outreach - Automated");
+      //Restated whatever Attio held, being the one class of attribute this run is entitled to overwrite.
+      expect(values.lead_source_discrete).toEqual([{ option: "4dca8bb3-413a-4d13-984b-e391b6f71852" }]);
       expect(values.name).toEqual([
         { first_name: "Ada", last_name: "Lovelace", full_name: "Ada Lovelace" },
       ]);
@@ -273,13 +273,17 @@ describe("outfound interested webhook", () => {
     }
   });
 
-  test("writes the Outfound lead source and dates the lead by Outfound's clock, not ours", async () => {
+  test("attributes the Outfound lead to SAS and dates it by Outfound's clock, not ours", async () => {
     const mock = mockAttio({});
     try {
       await outfoundInterested(outfoundRequest(outfoundCategorised));
       const patch = personPatches(mock.calls)[0];
       const values = (JSON.parse(String(patch?.init?.body)) as { data: { values: Record<string, unknown> } }).data.values;
-      expect(values.lead_source).toBe("Outfound Cold Outreach - Automated");
+      //lead_source is deprecated on both objects; the discrete pair carries attribution now. Outfound is the
+      //SAS platform, which is the one sub-source that is not Levanta.
+      expect(values.lead_source).toBeUndefined();
+      expect(values.lead_source_discrete).toEqual([{ option: "4dca8bb3-413a-4d13-984b-e391b6f71852" }]);
+      expect(values.lead_outbound_sub_source_discrete).toEqual([{ option: "cba7bd62-52ea-41d3-a494-4fce947b8780" }]);
       //The webhook's own timestamp, not Date.now() - the warehouse lags by minutes.
       expect(values.date_added).toBe("2026-08-19");
     } finally {
