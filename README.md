@@ -179,6 +179,37 @@ worse outcome than a blank field. What was dropped is logged under `[attio]` - a
 no record of why is undiagnosable. The one part that still raises is the *read*: without knowing what a record
 already holds there is no way to write to it without risking an overwrite.
 
+### How a deal is attributed
+
+Two discrete select fields on the **Deal** carry attribution. Both are written by **option ID, not title**, so
+renaming an option in the Attio UI cannot silently break the write - a title write would start failing from that
+moment with nothing in the code to say why.
+
+| Provider | `deal_source_discrete` | `outbound_sub_source_discrete` |
+| --- | --- | --- |
+| Instantly | Cold Email | Levanta |
+| Outfound | Cold Email | **SAS** - the one provider whose mail is not sent from Levanta's own tooling |
+| HeyReach | LI Outbound | Levanta |
+| Aircall | Cold Call | Levanta |
+
+The map lives in `dealAttribution` (`lib/providers.ts`), typed against `Provider`, so a fifth provider will not
+compile until it is attributed - a new channel silently writing no source is the failure that guards against.
+
+**Latest touch wins.** Both slugs are in `ALWAYS_OVERWRITE`. A deal is *reused* when the person already has one
+(see `ensureInterestedDeal`), so a lead first seen on Instantly and later replying on HeyReach keeps a single
+deal; without the overwrite it would still read Cold Email months later. The Person is unaffected and keeps
+`lead_source` alone.
+
+**The IDs are checked in two places, because neither is enough on its own.** `tests/unit/providers.test.ts` pins
+which ID each provider sends - that catches a wrong one. `tests/live/read-only.test.ts` checks every ID against
+Attio's live schema - that catches one deleted and recreated in Attio, which mints a new ID while the old one
+keeps parsing as a perfectly valid UUID. A stale ID costs every interested deal its attribution *silently*, since
+`updateAttioAttributes` salvages what it can and logs the rest rather than failing the event.
+
+**Not written:** the `notes` text attribute. Appending to it would mean reading the current value and
+concatenating, which races against anything else writing the same field; it was dropped deliberately rather than
+risk clobbering. The provider is already named in the deal's note title and in `lead_source`.
+
 ### Interest on one platform means suppression on all of them
 
 Interest is a fact about the person, not about the channel that noticed it. A lead who answers the phone must

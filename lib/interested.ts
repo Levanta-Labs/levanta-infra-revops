@@ -24,6 +24,7 @@ import { reportConfigValue, tunableEnv } from "./env.js";
 import { arrayValue, errorMessage, isJsonObject, stringValue } from "./json.js";
 import {
   automatedSourceLabel,
+  dealAttribution,
   leadSourceLabel,
   THIRD_PARTY_SUPPRESSION_CHANNELS,
   type Provider,
@@ -373,7 +374,15 @@ const MULTISELECT_READERS: Readonly<Record<string, ScalarReader>> = {
 //Applies to the Person's `lead_source` and, through dealValuesFor, the Deal's. Both carry the same string,
 //automatedSourceLabel. Companies never receive this slug.
 //---------------------------------------------------------------------------------------------------------
-const ALWAYS_OVERWRITE: ReadonlySet<string> = new Set(["lead_source"]);
+//The discrete attribution fields join lead_source here for the same reason and one more of their own: a deal
+//is REUSED when the person already has one (see ensureInterestedDeal), so a lead first seen on Instantly and
+//later replying on HeyReach keeps one deal. Latest touch wins was the explicit call - the deal's source
+//follows the most recent interested signal rather than freezing at whichever channel happened to be first.
+const ALWAYS_OVERWRITE: ReadonlySet<string> = new Set([
+  "lead_source",
+  "deal_source_discrete",
+  "outbound_sub_source_discrete",
+]);
 
 /**
  * [LOGIC] The scalars an attribute currently holds, or null if ANY entry could not be read. All-or-nothing on
@@ -626,9 +635,15 @@ export function companyValuesFor(lead: InterestedLead): AttioValues {
 
 /** [LOGIC] USES: automatedSourceLabel (lib/providers.ts); toTimestamp, withoutEmpty (this module). Pure. */
 export function dealValuesFor(lead: InterestedLead): AttioValues {
+  const attribution = dealAttribution(lead.provider);
   return withoutEmpty({
     //The same string the Person carries - see automatedSourceLabel (lib/providers.ts).
     lead_source: automatedSourceLabel(lead.provider),
+    //The discrete attribution pair, written by option ID rather than title so a rename in Attio cannot quietly
+    //break them - see dealAttribution (lib/providers.ts). Deal only; the Person keeps lead_source alone.
+    deal_source_discrete: [{ option: attribution.source }],
+    //Absent for a provider with no sub-source, and withoutEmpty then drops the slug entirely.
+    outbound_sub_source_discrete: attribution.subSource ? [{ option: attribution.subSource }] : null,
     campaign_name: lead.campaignName,
     email: lead.emails[0] ?? null,
     phone_number_7: lead.phones[0] ?? null,

@@ -186,8 +186,13 @@ describe("what a create sends to Attio", () => {
       lead_source: "Aircall Cold Outreach - Automated",
     });
     expect(companyValuesFor(interestedLead("aircall", { companyName: "Acme" }))).toEqual({ name: "Acme" });
+    //The attribution pair is NOT provider-optional - every provider maps to a discrete source, so these are
+    //present even on the thinnest lead. Only outbound_sub_source_discrete can be absent, for a provider with
+    //no sub-source; all four currently have one.
     expect(dealValuesFor(interestedLead("aircall", {}))).toEqual({
       lead_source: "Aircall Cold Outreach - Automated",
+      deal_source_discrete: [{ option: "0696a0fc-425c-4ba5-9afb-2897b61ca3aa" }],
+      outbound_sub_source_discrete: [{ option: "4763981c-5793-48dc-b878-c02e0231df13" }],
     });
   });
 });
@@ -232,6 +237,27 @@ describe("updating Attio attributes", () => {
         { description: "Analyst", job_title: "Countess" },
       );
       expect(patchBody(mock.calls)).toEqual({ job_title: "Countess" });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  //A deal is REUSED when the person already has one, so attribution has to be restated or a lead first seen on
+  //Instantly would still read Cold Email months after replying on LinkedIn. Latest touch wins.
+  test("restates deal attribution on a reused deal", async () => {
+    const mock = installFetchMock(() => jsonResponse({ data: {} }));
+    try {
+      await updateAttioAttributes(
+        "deals",
+        record({
+          deal_source_discrete: [{ option: { title: "Cold Email" } }],
+          outbound_sub_source_discrete: [{ option: { title: "SAS" } }],
+        }),
+        dealValuesFor(interestedLead("heyreach", {})),
+      );
+      const written = patchBody(mock.calls);
+      expect(written.deal_source_discrete).toEqual([{ option: "9686ed43-60ba-454d-b5d4-70c0840f227f" }]);
+      expect(written.outbound_sub_source_discrete).toEqual([{ option: "4763981c-5793-48dc-b878-c02e0231df13" }]);
     } finally {
       mock.restore();
     }
