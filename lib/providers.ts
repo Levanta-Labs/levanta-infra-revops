@@ -83,6 +83,20 @@ const PROVIDER_ATTRIBUTION: Readonly<Record<Provider, { readonly category: Sourc
   outfound: { category: "COLD_EMAIL", party: "SAS" },
 };
 
+//[LOGIC] What each word is called in Attio. Display only - nothing is written from these, so a rename in the
+//Attio UI makes a transcript read slightly stale rather than breaking a write. That is the whole point of
+//writing IDs; see the note above. Kept beside the IDs so the tables read as words rather than as UUIDs.
+const SOURCE_TITLES: Readonly<Record<SourceCategory, string>> = {
+  COLD_EMAIL: "Cold Email",
+  COLD_CALL: "Cold Call",
+  LI_OUTBOUND: "LI Outbound",
+};
+
+const PARTY_TITLES: Readonly<Record<SubSourceParty, string>> = {
+  LEVANTA: "Levanta",
+  SAS: "SAS",
+};
+
 interface AttributionSchema {
   readonly sourceSlug: string;
   readonly subSourceSlug: string;
@@ -149,6 +163,28 @@ export function attributionValues(
 /** [LOGIC] Every attribution slug, so ALWAYS_OVERWRITE can name them without repeating the strings. Pure. */
 export function attributionSlugs(): readonly string[] {
   return Object.values(SCHEMAS).flatMap((schema) => [schema.sourceSlug, schema.subSourceSlug]);
+}
+
+//---------------------------------------------------------------------------------------------------------
+//The word an option ID stands for, or null if it is not one this codebase writes.
+//
+//WHY THE RUN LOG NEEDS THIS. Attio RETURNS a select as `{ option: { id, title } }` but ACCEPTS it as
+//`{ option: "<id>" }`, and the transcript renders both: the "before" picture comes from a read and the "after"
+//from what was written. Without a way back from the ID, a transcript line read
+//`lead source discrete: Cold Email -> {"option":"4dca8bb3-..."}` - the same fact twice, once as a word and
+//once as a blob. See optionTitle (lib/run-log.ts).
+//USES: SCHEMAS, SOURCE_TITLES, PARTY_TITLES (this module). Pure.
+//---------------------------------------------------------------------------------------------------------
+export function attributionOptionTitle(optionId: string): string | null {
+  for (const schema of Object.values(SCHEMAS)) {
+    for (const [category, id] of Object.entries(schema.source)) {
+      if (id === optionId) return SOURCE_TITLES[category as SourceCategory];
+    }
+    for (const [party, id] of Object.entries(schema.subSource)) {
+      if (id === optionId) return PARTY_TITLES[party as SubSourceParty];
+    }
+  }
+  return null;
 }
 
 export interface AttributionOptionCheck {

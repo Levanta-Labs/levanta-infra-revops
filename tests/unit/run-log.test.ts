@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { findPersonByEmail } from "../../lib/attio.js";
+import { findPersonByEmail, parseAttioRecord } from "../../lib/attio.js";
 import { interestedLead, recordInterestedLead } from "../../lib/interested.js";
-import { runLogArtifacts, runLogRecord, withRunLog } from "../../lib/run-log.js";
+import { runLogApplied, runLogArtifacts, runLogRecord, withRunLog } from "../../lib/run-log.js";
 import { installFetchMock, jsonResponse, notesResponse, type FetchCall } from "./test-utils.js";
 
 //=============================================================================================================
@@ -140,6 +140,47 @@ const afterState = (content: string) => section(content, "**State after run**", 
 /** A record stub, for the scope tests that have no workflow to run. */
 const STUB = { id: { record_id: "stub-1" }, rawValues: {}, populatedAttributes: new Set<string>() };
 
+//=============================================================================================================
+//Attio RETURNS a select as `{ option: { id, title } }` and ACCEPTS it as `{ option: "<id>" }`. The transcript
+//renders both - "before" comes from a read, "after" from what was written - so a line about an attribution
+//change would otherwise read `Cold Email -> {"option":"4dca8bb3-..."}`: the same fact twice, once as a word
+//and once as a blob.
+//=============================================================================================================
+describe("rendering a select in the transcript", () => {
+  test("names a written option by its word, not the ID that was sent", async () => {
+    const mock = installFetchMock(() => jsonResponse({ data: {} }));
+    try {
+      await withRunLog("heyreach", async () => {
+        runLogRecord(
+          "people",
+          parseAttioRecord({
+            id: { record_id: "person-1" },
+            //The read shape, as Attio hands it back.
+            values: { lead_source_discrete: [{ option: { title: "Cold Email" } }] },
+          }),
+          true,
+          "Ada Lovelace",
+        );
+        //The write shape: HeyReach's LI Outbound on the people object.
+        runLogApplied(
+          "people",
+          "person-1",
+          { lead_source_discrete: [{ option: "f853ad2b-0681-4f0a-8c66-73358406dab1" }] },
+          ["lead_source_discrete"],
+        );
+      });
+      const note = mock.calls.find((call) => call.input.includes("/notes") && call.init?.method === "POST");
+      const body = JSON.parse(String(note?.init?.body)).data.content as string;
+      expect(body).toContain("Cold Email");
+      expect(body).toContain("LI Outbound");
+      //The raw UUID must not reach a note a human reads.
+      expect(body).not.toContain("f853ad2b");
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
 describe("run transcript", () => {
   test("posts one note per record touched, titled for the platform that reported the interest", async () => {
     const mock = mockRun();
@@ -214,17 +255,21 @@ describe("run transcript", () => {
     }
   });
 
-  test("shows a reused deal keeping its stage and date while its lead source is restated", async () => {
+  test("shows a reused deal keeping its stage and date while its attribution is restated", async () => {
     //The asymmetry the transcript exists to surface: an interested event on a deal already in the pipeline
     //moves the source to this run's channel but leaves the stage and the original interested date alone.
+    //The deal's own lead_source is NOT touched - Attio removed that attribute from the deals object, so the
+    //stale value it still holds is left exactly as found while the discrete pair carries the restatement.
     const mock = mockRun();
     try {
       await run();
       const deal = transcripts(mock.calls)[2]?.content ?? "";
-      expect(previousState(deal)).toContain("lead source: HeyReach Cold Outreach - Automated");
-      expect(afterState(deal)).toContain("lead source: Instantly Cold Outreach - Automated");
+      expect(afterState(deal)).toContain("deal source discrete: Cold Email");
+      expect(afterState(deal)).toContain("outbound sub source discrete: Levanta");
       expect(afterState(deal)).toContain("stage: Negotiation");
       expect(afterState(deal)).toContain("moved to interested at: 2026-06-14T09:31:00.000Z");
+      //Written as an option ID, rendered as the word - see optionTitle (lib/run-log.ts).
+      expect(deal).not.toContain("6cae752e");
     } finally {
       mock.restore();
     }

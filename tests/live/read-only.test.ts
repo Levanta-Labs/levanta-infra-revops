@@ -93,6 +93,11 @@ liveTest("reads one Instantly email preview", async () => {
   );
 });
 
+//[PERF] GetConversationsV3 answers in about 4.7s for a single-item page, against Bun's 5s default - so this
+//passed alone and failed in a full run, which is the worst way for a smoke test to behave. A safety net that
+//cries wolf stops being read. Measured, not guessed: the probe that produced that figure is in the commit.
+const HEYREACH_TIMEOUT_MS = 20_000;
+
 liveTest("reads one HeyReach conversation page", async () => {
   await expectOk(
     "HeyReach",
@@ -102,7 +107,7 @@ liveTest("reads one HeyReach conversation page", async () => {
       body: JSON.stringify({ limit: 1, cursor: null, filters: {} }),
     }),
   );
-});
+}, HEYREACH_TIMEOUT_MS);
 
 //=============================================================================================================
 //Schema. Every configured slug is checked against the live Attio schema, so a wrong counter slug or a renamed

@@ -636,8 +636,11 @@ export function companyValuesFor(lead: InterestedLead): AttioValues {
 /** [LOGIC] USES: automatedSourceLabel (lib/providers.ts); toTimestamp, withoutEmpty (this module). Pure. */
 export function dealValuesFor(lead: InterestedLead): AttioValues {
   return withoutEmpty({
-    //The same string the Person carries - see automatedSourceLabel (lib/providers.ts).
-    lead_source: automatedSourceLabel(lead.provider),
+    //NO lead_source HERE. The deals object no longer has that attribute - it was removed from Attio when
+    //deal_source_discrete replaced it, and the Person kept its own. Writing it cost every deal an extra round
+    //trip and a warning: writeSalvagingRejections sends one PATCH with everything, Attio rejects the whole
+    //batch over the one unknown slug, and each remaining attribute is then retried individually. The live
+    //schema test in tests/live/read-only.test.ts is what catches this class of drift.
     //The discrete attribution pair, written by option ID rather than title so a rename in Attio cannot quietly
     //break them. The DEAL's ids, which differ from the Person's for the same words - see attributionValues.
     ...attributionValues("deals", lead.provider),

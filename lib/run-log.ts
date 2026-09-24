@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createNote, type AttioObject, type AttioRecord } from "./attio.js";
 import { arrayValue, errorMessage, isJsonObject, numberValue, stringValue, type JsonObject } from "./json.js";
-import { providerDisplayName, type Provider } from "./providers.js";
+import { attributionOptionTitle, providerDisplayName, type Provider } from "./providers.js";
 
 //=============================================================================================================
 //A transcript of one interested run, written back to every record it touched.
@@ -146,9 +146,21 @@ function truncate(value: string): string {
   return value.length > MAX_VALUE_CHARS ? `${value.slice(0, MAX_VALUE_CHARS)}...` : value;
 }
 
-/** [LOGIC] Selects and statuses both nest their readable half one level down, under a differing key. */
+//---------------------------------------------------------------------------------------------------------
+//[LOGIC] The readable half of a select or status.
+//Two shapes reach here, because the transcript renders both sides of a change. A value Attio RETURNED nests
+//its title one level down - `{ option: { id, title } }` - while a value this run WROTE names the option
+//directly, and names it by ID: `{ option: "4dca8bb3-..." }`. Rendering only the first left the "after" half of
+//an attribution line as a raw JSON blob beside the "before" half's plain English.
+//A written option that is not one of ours is printed as sent, which is the title for any select written by
+//title elsewhere.
+//USES: attributionOptionTitle (lib/providers.ts); isJsonObject, stringValue (lib/json.ts). Pure.
+//---------------------------------------------------------------------------------------------------------
 function optionTitle(value: unknown): string | null {
-  return isJsonObject(value) ? stringValue(value.title) : null;
+  if (isJsonObject(value)) return stringValue(value.title);
+  const written = stringValue(value);
+  if (!written) return null;
+  return attributionOptionTitle(written) ?? written;
 }
 
 /** [LOGIC] A structured location, in the order it would be written on an envelope. Null unless something is set. */

@@ -54,7 +54,7 @@ message history into a note. Everything after that is one code path:
 | 0. Repeat check | An event repeating one already recorded for this Person is declined before anything is written - see [Repeated events are declined, not re-recorded](#repeated-events-are-declined-not-re-recorded) |
 | 1. Person | The provider's own lookup order, creating a Person from the lead when there is no match |
 | 2. Company | The Company already linked to the Person if there is one, else found by domain then by exact name, else created - but only when a name or domain exists to create it from |
-| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company>` - the deal carries no marker of how it was opened, because `lead_source` already does |
+| 3. Deal | Any Deal already linked to the Person is reused whatever its stage; a new one is opened only when there is none, named strictly `<company>` - the deal carries no marker of how it was opened, because `deal_source_discrete` already does |
 | 4. Notes | The provider's rendered history, on the Person and on the Deal |
 | 5. Attributes | `updateAttioAttributes` on the Person and the Deal |
 | 6. Suppression | The Attio DNC list plus every registered outbound platform |
@@ -222,6 +222,12 @@ one deleted and recreated in Attio, which mints a new ID while the old one keeps
 ID costs every interested record its attribution *silently*, since `updateAttioAttributes` salvages what it can
 and logs the rest rather than failing the event.
 
+**`lead_source` is a Person attribute only.** The deals object no longer has one - it was removed from Attio
+when `deal_source_discrete` replaced it. Writing it anyway cost every deal an extra round trip and a warning:
+`writeSalvagingRejections` sends one PATCH with everything, Attio rejects the whole batch over the single
+unknown slug, and each remaining attribute is then retried one at a time. The live schema test is what catches
+this class of drift, and it is the reason that test exists.
+
 **Not written:** the `notes` text attribute. Appending to it would mean reading the current value and
 concatenating, which races against anything else writing the same field; it was dropped deliberately rather than
 risk clobbering. The provider is already named in the note title and in `lead_source`.
@@ -289,10 +295,12 @@ Only fields that exist on both sides are mapped. The providers are not equally r
 | Person `description` | yes | - | yes | - |
 | Person `location` | - | yes | yes | country only |
 | Person `campaign_name`, `date_added`, `lead_source`, `company` | yes | yes | yes | yes |
+| Person `lead_source_discrete`, `lead_outbound_sub_source_discrete` | yes | yes | yes | yes |
 | Company `name` | yes | yes | yes | yes |
 | Company `domains`, `employee_range`, `estimated_arr_usd` | - | yes | - | yes |
 | Company `primary_location` | - | yes | - | - |
-| Deal `lead_source`, `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes | yes |
+| Deal `campaign_name`, `email`, `moved_to_interested_at` | yes | yes | yes | yes |
+| Deal `deal_source_discrete`, `outbound_sub_source_discrete` | yes | yes | yes | yes |
 | Deal `phone_number_7` | yes | yes | - | - |
 | Deal `linkedin` | - | yes | yes | yes |
 | Deal `website`, `industry`, `employees`, `revenue` | - | yes | - | yes |
