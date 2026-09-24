@@ -23,7 +23,6 @@ import {
 import { reportConfigValue, tunableEnv } from "./env.js";
 import { arrayValue, errorMessage, isJsonObject, stringValue } from "./json.js";
 import {
-  automatedSourceLabel,
   attributionSlugs,
   attributionValues,
   leadSourceLabel,
@@ -361,25 +360,25 @@ const MULTISELECT_READERS: Readonly<Record<string, ScalarReader>> = {
 //set is the deliberate exception to it, so the exception is one named list rather than a special case buried in
 //the loop.
 //
-//WHY LEAD SOURCE IS ON IT. Every other attribute here is a fact about the person - a job title, a location -
-//that a human may have corrected in the CRM and that a provider has no standing to contradict. Lead source is
-//not a fact about the person; it is a statement about THIS run: the channel that just produced the interested
+//WHY ATTRIBUTION IS ON IT. Every other attribute here is a fact about the person - a job title, a location -
+//that a human may have corrected in the CRM and that a provider has no standing to contradict. A source is not
+//a fact about the person; it is a statement about THIS run: the channel that just produced the interested
 //signal. Filling it only when blank meant a person first seen on one platform kept that platform's label
 //forever, and a later interested event on another channel was recorded everywhere except the field reporting
 //reads. The value the run carries is by definition the most recent truth, so it replaces what is there.
 //
-//COST: a person worked across channels no longer preserves the FIRST source, only the latest. The full history
-//is still recoverable - every interested event writes a note titled with its own leadSourceLabel, so the
-//sequence lives on the person's and the deal's notes even though the attribute holds only the newest.
+//It matters twice over on the Deal, because a deal is REUSED when the person already has one (see
+//ensureInterestedDeal): a lead first seen on Instantly and later replying on HeyReach keeps ONE deal, which
+//without this would still read Cold Email months after the LinkedIn reply. Latest touch wins was the explicit
+//call.
 //
-//Applies to the Person's `lead_source` and, through dealValuesFor, the Deal's. Both carry the same string,
-//automatedSourceLabel. Companies never receive this slug.
+//COST: a record worked across channels no longer preserves the FIRST source, only the latest. The full history
+//is still recoverable - every interested event writes a note titled with its own leadSourceLabel, so the
+//sequence lives on the person's and the deal's notes even though the attributes hold only the newest.
+//
+//All four slugs come from attributionSlugs(), so they are declared once. Companies receive none of them.
 //---------------------------------------------------------------------------------------------------------
-//The discrete attribution fields join lead_source here for the same reason and one more of their own: a deal
-//is REUSED when the person already has one (see ensureInterestedDeal), so a lead first seen on Instantly and
-//later replying on HeyReach keeps one deal. Latest touch wins was the explicit call - the deal's source
-//follows the most recent interested signal rather than freezing at whichever channel happened to be first.
-const ALWAYS_OVERWRITE: ReadonlySet<string> = new Set(["lead_source", ...attributionSlugs()]);
+const ALWAYS_OVERWRITE: ReadonlySet<string> = new Set(attributionSlugs());
 
 /**
  * [LOGIC] The scalars an attribute currently holds, or null if ANY entry could not be read. All-or-nothing on
@@ -589,7 +588,7 @@ export async function updateAttioAttributes(
 //A slug absent from these three objects is a slug these workflows never write.
 //---------------------------------------------------------------------------------------------------------
 
-/** [LOGIC] USES: automatedSourceLabel (lib/providers.ts); toDate, withoutEmpty (this module). Pure. */
+/** [LOGIC] USES: attributionValues (lib/providers.ts); toDate, withoutEmpty (this module). Pure. */
 export function personValuesFor(lead: InterestedLead, companyId: string | null = null): AttioValues {
   const values: Record<string, unknown> = {
     email_addresses: lead.emails,
@@ -600,8 +599,10 @@ export function personValuesFor(lead: InterestedLead, companyId: string | null =
     location: lead.location,
     campaign_name: lead.campaignName,
     date_added: toDate(lead.occurredAtMs),
-    //The same string the Deal carries - see automatedSourceLabel (lib/providers.ts).
-    lead_source: automatedSourceLabel(lead.provider),
+    //NO lead_source. It is deprecated on both objects, replaced by the discrete pair below - so writing it
+    //would be churn on a field nothing reads, and churn that OVERWRITES, since it used to sit in
+    //ALWAYS_OVERWRITE. Values already on existing records are left exactly as found; nothing writes the slug
+    //now, so nothing can clear it either. The deals object has already had the attribute removed outright.
     //The Person's own discrete pair. Same words as the Deal's, entirely different option IDs, which is why
     //the object is named here rather than the ids being reused - see attributionValues (lib/providers.ts).
     ...attributionValues("people", lead.provider),
@@ -633,14 +634,14 @@ export function companyValuesFor(lead: InterestedLead): AttioValues {
   });
 }
 
-/** [LOGIC] USES: automatedSourceLabel (lib/providers.ts); toTimestamp, withoutEmpty (this module). Pure. */
+/** [LOGIC] USES: attributionValues (lib/providers.ts); toTimestamp, withoutEmpty (this module). Pure. */
 export function dealValuesFor(lead: InterestedLead): AttioValues {
   return withoutEmpty({
-    //NO lead_source HERE. The deals object no longer has that attribute - it was removed from Attio when
-    //deal_source_discrete replaced it, and the Person kept its own. Writing it cost every deal an extra round
-    //trip and a warning: writeSalvagingRejections sends one PATCH with everything, Attio rejects the whole
-    //batch over the one unknown slug, and each remaining attribute is then retried individually. The live
-    //schema test in tests/live/read-only.test.ts is what catches this class of drift.
+    //NO lead_source HERE. The deals object no longer has that attribute at all - it was removed from Attio
+    //when deal_source_discrete replaced it. Writing it cost every deal an extra round trip and a warning:
+    //writeSalvagingRejections sends one PATCH with everything, Attio rejects the whole batch over the one
+    //unknown slug, and each remaining attribute is then retried individually. The live schema test in
+    //tests/live/read-only.test.ts is what catches this class of drift.
     //The discrete attribution pair, written by option ID rather than title so a rename in Attio cannot quietly
     //break them. The DEAL's ids, which differ from the Person's for the same words - see attributionValues.
     ...attributionValues("deals", lead.provider),
@@ -727,8 +728,8 @@ export async function resolveInterestedCompany(
 //"Unknown Company" is used when neither Attio nor the provider names one, which is honest and, more usefully,
 //greppable - those are exactly the deals needing a human to say who they are with.
 //The name carries no marker of how the deal was opened. It used to read "<company> - Interested", which made
-//these deals recognisable as a set from the name alone; that is now carried by the deal's `lead_source`
-//instead, which every one of them gets - see automatedSourceLabel (lib/providers.ts). Reporting reads the
+//these deals recognisable as a set from the name alone; that is now carried by `deal_source_discrete`
+//instead, which every one of them gets - see attributionValues (lib/providers.ts). Reporting reads the
 //attribute, and a human reading the pipeline sees the company they are dealing with rather than a suffix
 //repeated down the whole column.
 //Deals that already existed are never renamed - see ensureInterestedDeal.

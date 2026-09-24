@@ -217,26 +217,15 @@ export function providerDisplayName(provider: Provider): string {
 /**
  * [LOGIC] The bare channel name - "<Name> Cold Outreach". One derivation for every provider, so a fourth
  * inherits the convention rather than adding a fourth hand-written string that could disagree with the other
- * three. This is the note TITLE and the stem automatedSourceLabel builds on; nothing writes it to an attribute.
+ * three. This is the note TITLE, and nothing writes it to an attribute. It is also what the repeat check keys
+ * on - see recentlyNoted (lib/interested.ts) - so changing it changes which notes count as duplicates of each
+ * other, and a run under the old spelling will not recognise a note written under the new one.
  * USES: providerDisplayName (this module). Pure.
  */
 export function leadSourceLabel(provider: Provider): string {
   return `${providerDisplayName(provider)} Cold Outreach`;
 }
 
-/**
- * [LOGIC] The source string written into Attio, on the Person and on the Deal alike. Every record these
- * workflows touch was produced without a human, and the "- Automated" suffix is what distinguishes it in
- * reporting from the same channel worked by hand - which is as true of the Person as it is of the Deal, so both
- * carry this rather than the Person carrying the bare channel name.
- *
- * NOT the same as leadSourceLabel, which is now the bare channel and is used only to TITLE the notes. A note
- * heading is read by a human in context, where the suffix says nothing the surrounding note does not.
- * USES: leadSourceLabel (this module). Pure.
- */
-export function automatedSourceLabel(provider: Provider): string {
-  return `${leadSourceLabel(provider)} - Automated`;
-}
 //#endregion
 
 //#region suppression
