@@ -17,7 +17,7 @@ import {
   parseOutfoundEmail,
   parseOutfoundLead,
 } from "../../lib/outfound.js";
-import { dealAttribution, PROVIDERS } from "../../lib/providers.js";
+import { attributionOptionIds, attributionValues, PROVIDERS } from "../../lib/providers.js";
 import { dealValuesFor, interestedLead, personValuesFor } from "../../lib/interested.js";
 import { installFetchMock, jsonResponse } from "./test-utils.js";
 
@@ -522,44 +522,94 @@ describe("Outfound client", () => {
 });
 
 
+
 //=============================================================================================================
-//Deal attribution. The option IDs are opaque UUIDs, so a wrong one is invisible on inspection - these name the
+//Attribution. The option IDs are opaque UUIDs, so a wrong one is invisible on inspection - these name the
 //title each is supposed to mean. tests/live/read-only.test.ts checks the same IDs against Attio's live schema,
 //so between the two a wrong ID fails here and a deleted or renamed-away one fails there.
+//
+//THE TWO OBJECTS USE DIFFERENT IDS FOR THE SAME WORDS, which is the mistake most worth pinning: a Deal ID
+//written to a Person is rejected by Attio as an unknown option, logged, and carried past - leaving the record
+//unattributed while the run still reports success.
 //=============================================================================================================
-const COLD_EMAIL = "6cae752e-6395-478a-83aa-eb934479d7dd";
-const COLD_CALL = "0696a0fc-425c-4ba5-9afb-2897b61ca3aa";
-const LI_OUTBOUND = "9686ed43-60ba-454d-b5d4-70c0840f227f";
-const LEVANTA = "4763981c-5793-48dc-b878-c02e0231df13";
-const SAS = "2cbbadd4-dca8-47cd-a6fb-6af4ae0eddee";
+const DEAL_COLD_EMAIL = "6cae752e-6395-478a-83aa-eb934479d7dd";
+const DEAL_COLD_CALL = "0696a0fc-425c-4ba5-9afb-2897b61ca3aa";
+const DEAL_LI_OUTBOUND = "9686ed43-60ba-454d-b5d4-70c0840f227f";
+const DEAL_LEVANTA = "4763981c-5793-48dc-b878-c02e0231df13";
+const DEAL_SAS = "2cbbadd4-dca8-47cd-a6fb-6af4ae0eddee";
 
-describe("deal attribution", () => {
-  test("maps each provider to the source and sub-source the business asked for", () => {
-    expect(dealAttribution("instantly")).toEqual({ source: COLD_EMAIL, subSource: LEVANTA });
+const PERSON_COLD_EMAIL = "4dca8bb3-413a-4d13-984b-e391b6f71852";
+const PERSON_COLD_CALL = "56188ba9-821a-4878-99a2-333d338247a8";
+const PERSON_LI_OUTBOUND = "f853ad2b-0681-4f0a-8c66-73358406dab1";
+const PERSON_LEVANTA = "667ebae3-b820-4fc3-a12e-ebbfa4ce3cfb";
+const PERSON_SAS = "cba7bd62-52ea-41d3-a494-4fce947b8780";
+
+describe("attribution", () => {
+  test("maps each provider to the source and sub-source the business asked for, on the deal", () => {
+    expect(attributionValues("deals", "instantly")).toEqual({
+      deal_source_discrete: [{ option: DEAL_COLD_EMAIL }],
+      outbound_sub_source_discrete: [{ option: DEAL_LEVANTA }],
+    });
     //Outfound is the SAS platform - the one provider whose mail is not sent from Levanta's own tooling.
-    expect(dealAttribution("outfound")).toEqual({ source: COLD_EMAIL, subSource: SAS });
-    expect(dealAttribution("heyreach")).toEqual({ source: LI_OUTBOUND, subSource: LEVANTA });
-    expect(dealAttribution("aircall")).toEqual({ source: COLD_CALL, subSource: LEVANTA });
+    expect(attributionValues("deals", "outfound")).toEqual({
+      deal_source_discrete: [{ option: DEAL_COLD_EMAIL }],
+      outbound_sub_source_discrete: [{ option: DEAL_SAS }],
+    });
+    expect(attributionValues("deals", "heyreach")).toEqual({
+      deal_source_discrete: [{ option: DEAL_LI_OUTBOUND }],
+      outbound_sub_source_discrete: [{ option: DEAL_LEVANTA }],
+    });
+    expect(attributionValues("deals", "aircall")).toEqual({
+      deal_source_discrete: [{ option: DEAL_COLD_CALL }],
+      outbound_sub_source_discrete: [{ option: DEAL_LEVANTA }],
+    });
   });
 
-  test("attributes every registered provider, so a fifth cannot be added unattributed", () => {
+  test("uses the person's own slugs and IDs for the same four providers", () => {
+    expect(attributionValues("people", "instantly")).toEqual({
+      lead_source_discrete: [{ option: PERSON_COLD_EMAIL }],
+      lead_outbound_sub_source_discrete: [{ option: PERSON_LEVANTA }],
+    });
+    expect(attributionValues("people", "outfound")).toEqual({
+      lead_source_discrete: [{ option: PERSON_COLD_EMAIL }],
+      lead_outbound_sub_source_discrete: [{ option: PERSON_SAS }],
+    });
+    //Explicitly asked for: HeyReach and Aircall leads carry Levanta too, not just their deals.
+    expect(attributionValues("people", "heyreach")).toEqual({
+      lead_source_discrete: [{ option: PERSON_LI_OUTBOUND }],
+      lead_outbound_sub_source_discrete: [{ option: PERSON_LEVANTA }],
+    });
+    expect(attributionValues("people", "aircall")).toEqual({
+      lead_source_discrete: [{ option: PERSON_COLD_CALL }],
+      lead_outbound_sub_source_discrete: [{ option: PERSON_LEVANTA }],
+    });
+  });
+
+  test("shares no option ID between the two objects, which is the mix-up worth catching", () => {
+    const idsFor = (object: "people" | "deals") =>
+      new Set(attributionOptionIds().filter((c) => c.object === object).flatMap((c) => c.optionIds));
+    const people = idsFor("people");
+    for (const id of idsFor("deals")) expect(people.has(id)).toBe(false);
+  });
+
+  test("attributes every registered provider on both objects, so a fifth cannot be added unattributed", () => {
     for (const provider of PROVIDERS) {
-      expect(dealAttribution(provider).source).toMatch(/^[0-9a-f-]{36}$/);
+      for (const object of ["people", "deals"] as const) {
+        const values = Object.values(attributionValues(object, provider));
+        expect(values).toHaveLength(2);
+        for (const value of values) expect(value[0]?.option).toMatch(/^[0-9a-f-]{36}$/);
+      }
     }
   });
 
-  test("writes the pair onto the deal in the shape Attio accepts for a select", () => {
-    //Attio takes either the option title or its ID under an `option` key. The ID is used so a rename in the
-    //Attio UI cannot silently break the write - see the note above dealAttribution (lib/providers.ts).
-    const values = dealValuesFor(interestedLead("heyreach", { emails: ["ada@example.com"] }));
-    expect(values.deal_source_discrete).toEqual([{ option: LI_OUTBOUND }]);
-    expect(values.outbound_sub_source_discrete).toEqual([{ option: LEVANTA }]);
-  });
+  test("writes each object's pair into that object's values and nothing of the other's", () => {
+    const deal = dealValuesFor(interestedLead("heyreach", { emails: ["ada@example.com"] }));
+    expect(deal.deal_source_discrete).toEqual([{ option: DEAL_LI_OUTBOUND }]);
+    expect(deal.lead_source_discrete).toBeUndefined();
 
-  test("puts attribution on the Deal only, never on the Person", () => {
-    //The Person keeps lead_source alone; both discrete fields live on the deals object.
-    const person = personValuesFor(interestedLead("instantly", { emails: ["ada@example.com"] }));
+    const person = personValuesFor(interestedLead("heyreach", { emails: ["ada@example.com"] }));
+    expect(person.lead_source_discrete).toEqual([{ option: PERSON_LI_OUTBOUND }]);
+    expect(person.lead_outbound_sub_source_discrete).toEqual([{ option: PERSON_LEVANTA }]);
     expect(person.deal_source_discrete).toBeUndefined();
-    expect(person.outbound_sub_source_discrete).toBeUndefined();
   });
 });
