@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { companyCounterSlug, LISTS, personCounterSlug } from "../../lib/attio.js";
+import { attributionOptionIds } from "../../lib/providers.js";
 import type { Provider } from "../../lib/providers.js";
 import {
   AIRCALL_BASE,
@@ -37,7 +38,7 @@ async function expectOk(label: string, response: Response): Promise<void> {
   expect(response.ok).toBe(true);
 }
 
-/** Collects one string field from every element of an Attio `data` array. */
+/** Collects one string field from every element of an Attio `data` array. `option_id` is read from `id`. */
 async function valuesFrom(path: string, response: Response, field: string): Promise<ReadonlySet<string>> {
   await expectOk(`Attio ${path}`, response);
   const body = await responseJson(response);
@@ -45,7 +46,10 @@ async function valuesFrom(path: string, response: Response, field: string): Prom
   const values = new Set<string>();
   for (const entry of arrayValue(body, "data")) {
     if (!isJsonObject(entry)) continue;
-    const value = stringValue(entry[field]);
+    //Attio puts a record's own identifiers one level down, under `id` - option_id and attribute_id live there
+    //while title and api_slug sit at the top. Checking both is what lets one helper read either.
+    const nested = isJsonObject(entry.id) ? stringValue(entry.id[field]) : null;
+    const value = stringValue(entry[field]) ?? nested;
     if (value) values.add(value);
   }
   if (values.size === 0) throw new Error(`Attio ${path} returned no ${field} values`);
@@ -162,6 +166,29 @@ liveTest("the token can list notes, which the duplicate check reads before every
     throw new Error("Attio /notes did not return a data array, which is the shape listNotes (lib/attio.ts) parses");
   }
   expect(Array.isArray(body.data)).toBe(true);
+});
+
+liveTest("every deal-attribution option ID still exists on its attribute", async () => {
+  //dealValuesFor writes deal_source_discrete and outbound_sub_source_discrete by OPTION ID rather than title,
+  //so a rename in the Attio UI cannot break them. The cost of that choice is that the IDs are opaque: nothing
+  //about "6cae752e-..." says "Cold Email", and an option DELETED or recreated in Attio gets a new ID while the
+  //old one keeps parsing as a perfectly valid UUID. The unit tests pin which ID we send; only this can tell
+  //whether Attio still has it.
+  //
+  //Attio rejects a write naming an unknown option, so a stale ID here means every interested deal loses its
+  //attribution - silently, since updateAttioAttributes salvages what it can and logs the rest rather than
+  //failing the event.
+  for (const [slug, ids] of Object.entries(attributionOptionIds())) {
+    const live = await attioValues(`/objects/deals/attributes/${slug}/options`, "option_id");
+    for (const id of ids) {
+      if (!live.has(id)) {
+        throw new Error(
+          `lib/providers.ts writes option ${id} to the Attio deals attribute ${slug}, and no such option exists there any more. Either it was deleted and recreated in Attio - which mints a new ID - or the slug is wrong. Every interested deal is losing its attribution until this matches.`,
+        );
+      }
+      expect(live.has(id)).toBe(true);
+    }
+  }
 });
 
 liveTest("the configured deal owner is a workspace member", async () => {

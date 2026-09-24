@@ -41,6 +41,67 @@ const SOURCES = {
   outfound: { displayName: "Outfound" },
 } as const;
 
+//=============================================================================================================
+//Deal attribution: which discrete source each provider represents.
+//
+//WHY OPTION IDS AND NOT TITLES. Attio accepts either for a select - `[{ option: "Cold Email" }]` works just as
+//well as `[{ option: "6cae752e-..." }]`. The ID is used because it survives a rename: someone relabelling
+//"Cold Email" to "Cold Outbound Email" in the Attio UI keeps the same option_id, where a title write would
+//start failing silently from that moment on with nothing in the code to say why.
+//The trade is that these are unreadable, so each carries its title in a comment, and a live smoke test asserts
+//every one of them still exists on the attribute - see tests/live/read-only.test.ts.
+//
+//SUB-SOURCE IS ABOUT WHOSE PLATFORM SENT IT, not which tool. Instantly and HeyReach are Levanta's own; Outfound
+//is the SAS platform. Aircall is Levanta's dialler. A provider whose sub-source is null simply does not write
+//the attribute.
+//=============================================================================================================
+
+/** The `deal_source_discrete` options, by title. Only the four these workflows can produce are named. */
+const DEAL_SOURCE_OPTIONS = {
+  COLD_EMAIL: "6cae752e-6395-478a-83aa-eb934479d7dd",
+  COLD_CALL: "0696a0fc-425c-4ba5-9afb-2897b61ca3aa",
+  LI_OUTBOUND: "9686ed43-60ba-454d-b5d4-70c0840f227f",
+} as const;
+
+/** The `outbound_sub_source_discrete` options, by title. */
+const OUTBOUND_SUB_SOURCE_OPTIONS = {
+  LEVANTA: "4763981c-5793-48dc-b878-c02e0231df13",
+  SAS: "2cbbadd4-dca8-47cd-a6fb-6af4ae0eddee",
+} as const;
+
+export interface DealAttribution {
+  /** Option ID for `deal_source_discrete`. */
+  readonly source: string;
+  /** Option ID for `outbound_sub_source_discrete`, or null to leave the attribute alone. */
+  readonly subSource: string | null;
+}
+
+//[LOGIC] One entry per provider, checked against Provider so adding a fifth will not compile until it is
+//attributed. That is deliberate: a new provider silently writing no source is the failure this prevents.
+const DEAL_ATTRIBUTION: Readonly<Record<Provider, DealAttribution>> = {
+  //George's dialler. Levanta's own.
+  aircall: { source: DEAL_SOURCE_OPTIONS.COLD_CALL, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.LEVANTA },
+  //Levanta's own cold email.
+  instantly: { source: DEAL_SOURCE_OPTIONS.COLD_EMAIL, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.LEVANTA },
+  //LinkedIn outbound, Levanta's own.
+  heyreach: { source: DEAL_SOURCE_OPTIONS.LI_OUTBOUND, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.LEVANTA },
+  //Cold email arriving through the SAS platform rather than ours.
+  outfound: { source: DEAL_SOURCE_OPTIONS.COLD_EMAIL, subSource: OUTBOUND_SUB_SOURCE_OPTIONS.SAS },
+};
+
+/** [LOGIC] How a deal from this provider is attributed. USES: DEAL_ATTRIBUTION (this module). Pure. */
+export function dealAttribution(provider: Provider): DealAttribution {
+  return DEAL_ATTRIBUTION[provider];
+}
+
+/** [LOGIC] Every option ID this codebase writes, for the live schema check. Pure. */
+export function attributionOptionIds(): Readonly<Record<string, readonly string[]>> {
+  return {
+    deal_source_discrete: Object.values(DEAL_SOURCE_OPTIONS),
+    outbound_sub_source_discrete: Object.values(OUTBOUND_SUB_SOURCE_OPTIONS),
+  };
+}
+
 /** Derived from SOURCES, so appending an entry there is what adds a provider - there is no second list. */
 export type Provider = keyof typeof SOURCES;
 
